@@ -1,15 +1,291 @@
 import numpy as np
 import h5py
 import warnings
-from scipy.ndimage import gaussian_filter1d
+import matplotlib.pyplot as plt
+from functools import partial
 from sklearn.decomposition import non_negative_factorization as nmf
 from sklearn.utils.extmath import randomized_svd
+
+import torch
 
 
 # -----------------------------------------------------------------------
 # Hyperspectral Neutron Radiographic/Tomographic Data Denoising Functions
 # -----------------------------------------------------------------------
+def stable_nnal(X, T):
+    """
+    Compute a shifted form of the non-negative attentuation loss
+    that is much more numerically stable
+    """
+    positive = T > 0
+    Tsafe = torch.where(positive, T, torch.tensor(1.0, dtype=T.dtype, device=T.device))
 
+    Xp = X + torch.log(Tsafe)
+
+    phi = torch.where(
+        torch.abs(Xp) < 1e-3,
+        Xp * Xp * (0.5 + Xp * (-1.0 / 6.0 + Xp / 24.0)),
+        torch.expm1(-Xp) + Xp,
+    )
+
+    positive_loss = T * phi
+
+    zero_loss = torch.exp(-X)
+
+    return torch.sum(
+        torch.where(positive, positive_loss, zero_loss)
+    )
+
+
+def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor):
+    """
+    Given X = W @ H, compute
+
+        G = dL/dX = T - exp(-X)
+        Z = d^2L/dX^2 = exp(-X)
+
+    where L is the non-negative attenuation loss in a
+    numerically stable way that handles T = 0 appropriately.
+    """
+    positive = T > 0
+    Tsafe = torch.where(positive, T, torch.tensor(1.0, dtype=T.dtype, device=T.device))
+
+    Xp = X + torch.log(Tsafe)
+
+    G = torch.where(
+        positive,
+        -T * torch.expm1(-Xp),
+        -torch.exp(-X),
+    )
+
+    Z = torch.where(
+        positive,
+        T * torch.exp(-Xp),
+        torch.exp(-X),
+    )
+
+    return G, Z
+
+
+def nndsvda(X, n_components):
+    """NNDSVDA initialization for X ~= W @ H.
+
+    Args:
+        X: Nonnegative array of shape (n_samples, n_features).
+        n_components: Factorization rank.
+
+    Returns:
+        W: Shape (n_samples, n_components).
+        H: Shape (n_components, n_features).
+    """
+    if X.ndim != 2:
+        raise ValueError("X must be two-dimensional.")
+
+    U, singular_values, Vh = torch.linalg.svd(
+        X,
+        full_matrices=False,
+    )
+
+    n_components = min(
+        n_components,
+        U.shape[1],
+        Vh.shape[0],
+    )
+
+    W = torch.zeros((X.shape[0], n_components), dtype=X.dtype, device=X.device)
+    H = torch.zeros((n_components, X.shape[1]), dtype=X.dtype, device=X.device)
+
+    # First singular triplet.
+    scale = torch.sqrt(singular_values[0])
+    W[:, 0] = scale * torch.abs(U[:, 0])
+    H[0, :] = scale * torch.abs(Vh[0, :])
+
+    # Remaining components.
+    for component in range(1, n_components):
+        u = U[:, component]
+        v = Vh[component, :]
+
+        u_pos = torch.clip(u, min=0)
+        u_neg = torch.clip(-u, min=0)
+        v_pos = torch.clip(v, min=0)
+        v_neg = torch.clip(-v, min=0)
+
+        positive_strength = (
+            torch.linalg.norm(u_pos) * torch.linalg.norm(v_pos)
+        )
+        negative_strength = (
+            torch.linalg.norm(u_neg) * torch.linalg.norm(v_neg)
+        )
+
+        use_positive = positive_strength > negative_strength
+
+        selected_u = torch.where(use_positive, u_pos, u_neg)
+        selected_v = torch.where(use_positive, v_pos, v_neg)
+
+        selected_u /= torch.linalg.norm(selected_u) + torch.finfo(X.dtype).eps
+        selected_v /= torch.linalg.norm(selected_v) + torch.finfo(X.dtype).eps
+
+        scale = torch.sqrt(singular_values[component])
+        W[:, component] = scale * selected_u
+        H[component, :] = scale * selected_v
+
+    # NNDSVDA replaces zero entries with the mean of X.
+    fill_value = torch.mean(X)
+    W = torch.where(W == 0, fill_value, W)
+    H = torch.where(H == 0, fill_value, H)
+
+    return W, H
+
+
+def newton_update(W, H, T, lr_init, update_H=True):
+    """JAX-optimized Newton update with automatic differentiation and line search.
+
+    Args:
+        W: Feature matrix (spatial pixels × num_materials), JAX array
+        H: Spectral basis matrix (num_materials × spectral channels), JAX array
+        T: Data term matrix (spatial pixels × spectral channels), JAX array
+        lr_init: Initial learning rate for line search
+        update_H: If False, keep H fixed and only update W.
+
+    Returns:
+        Updated (W, H) pair as JAX arrays
+    """
+    X = W @ H
+    G, Z = stable_nnal_derivatives(X, T)
+    init_loss = stable_nnal(X, T)
+
+    # Compute gradients
+    grad_W = G @ H.T
+    grad_H = W.T @ G
+
+    # Compute Hessian diagonal approximation manually (kept explicit for numerical stability)
+    d2L_dW2 = Z @ H.T.pow(2)
+    d2L_dH2 = W.T.pow(2) @ Z
+
+    dW = grad_W / (d2L_dW2 + 1e-30)
+    dH = grad_H / (d2L_dH2 + 1e-30) if update_H else torch.zeros_like(H)
+
+    # Line search over learning rates (vectorized)
+    learning_rates = lr_init * torch.logspace(-10, 1, steps=13, base=2, dtype=T.dtype)
+
+    W_best, H_best, loss_best = W, H, init_loss
+    for lr in learning_rates:
+        W_temp = torch.clip(W - lr * dW, min=1e-30)
+        H_temp = torch.clip(H - lr * dH, min=1e-30) if update_H else H
+        X_temp = W_temp @ H_temp
+        temp_loss = stable_nnal(X_temp, T)
+
+        # Compute Armijo-Goldstein condition for line search
+        directional_derivative = (
+            torch.sum(grad_W * (W_temp - W))
+            + torch.sum(grad_H * (H_temp - H))
+        )
+        improved = temp_loss <= loss_best + 1e-4 * directional_derivative
+
+        if improved:
+            W_best = W_temp
+            H_best = H_temp
+            loss_best = temp_loss
+            lr_best = lr
+
+    return W_best, H_best, lr_best
+
+def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unused: torch.Tensor, update_H: bool = True):
+    """JAX-optimized multiplicative update for non-negative factorization.
+
+    Args:
+        W: Feature matrix (spatial pixels × num_materials), JAX array
+        H: Spectral basis matrix (num_materials × spectral channels), JAX array
+        T: Data term matrix (spatial pixels × spectral channels), JAX array
+        unused: Placeholder for auxiliary variables (not used in this implementation)
+        update_H: If False, keep H fixed and only update W.
+
+    Returns:
+        Updated (W, H) pair as JAX arrays
+    """
+    damping_factor = 0.5
+    Z = torch.exp(-W @ H)
+
+    W *= ((Z @ H.T) / torch.clip(T @ H.T, min=1e-30)) ** damping_factor
+    if update_H:
+        H *= ((W.T @ Z) / torch.clip(W.T @ T, min=1e-30)) ** damping_factor
+
+    return W, H, 0.0
+
+def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True, W_init: torch.Tensor = torch.tensor([]), H_init: torch.Tensor = torch.tensor([])) -> torch.Tensor:
+    """Factorize T into W and H by minimizing nonnegative attenuation loss."""
+
+    if W_init.numel() == 0 and H_init.numel() == 0:
+        W_init, H_init = nndsvda(T, n_components=num_materials)
+    elif W_init.numel() == 0:
+        W_init = torch.linalg.lstsq(H_init.T, T.T)[0].T
+    elif H_init.numel() == 0:
+        H_init = torch.linalg.lstsq(W_init, T)[0]
+
+    prev_loss = stable_nnal(W_init @ H_init, T)
+    W, H, prev_loss, i, converged, aux = (W_init, H_init, prev_loss, 0, False, 0.001)
+    while (i < max_steps) and not converged:
+        W, H, aux = update(W, H, T, aux, update_H=update_H)
+        loss_new = stable_nnal(W @ H, T)
+        # print(f"Iteration {i}: Initial Loss = {prev_loss}, New Loss = {loss_new}, Diff = {prev_loss - loss_new}")
+        converged = torch.abs(loss_new - prev_loss) / (prev_loss + 1e-30) < rel_tol
+        prev_loss = loss_new
+        i += 1
+
+    return W, H, i
+
+def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, max_steps=1000, rel_tol=1e-10, batch_size=None, **kwargs) -> torch.Tensor:
+    if method == 'quasi_newton':
+        update = newton_update
+    elif method == 'mann_multiplicative':
+        update = multiplicative_update
+    else:
+        raise ValueError("Invalid method. Choose 'quasi_newton' or 'mann_multiplicative'.")
+
+    kwargs.update({
+        'update': update,
+        'num_materials': num_materials,
+        'max_steps': max_steps,
+        'rel_tol': rel_tol
+    })
+
+    if batch_size is None:
+        return optimize(T, **kwargs)
+
+    num_pixels = T.shape[0]
+    num_batches = int(np.ceil(num_pixels / batch_size))
+
+    # Randomly permute the pixel indices for batching
+    batch_idxs = np.random.permutation(num_pixels)
+
+    # Factor a spectra for each batch
+    H_list = []
+    i_list = []
+    for batch in range(num_batches):
+        start_idx = batch * batch_size
+        end_idx = min((batch + 1) * batch_size, num_pixels)
+        T_batch = T[batch_idxs[start_idx:end_idx]]
+        _, H_batch, i = optimize(T_batch, **kwargs)
+        H_list.append(H_batch)
+        i_list.append(i)
+    i_total = sum(i_list)
+
+    # Factor the combined spectra to estimate a single spectra for all batches
+    H_combined = torch.stack(H_list)
+    _, H, i = nmf(H_combined, n_components=num_materials, max_iter=10000)
+    i_total += i
+
+    # Compute material coefficients for each batch using the unified spectra
+    W = torch.zeros((num_pixels, num_materials), dtype=T.dtype)
+    for batch in range(num_batches):
+        start_idx = batch * batch_size
+        end_idx = min((batch + 1) * batch_size, num_pixels)
+        T_batch = T[batch_idxs[start_idx:end_idx]]
+        W_batch, _, i = optimize(T_batch, **kwargs, update_H=False, H_init=H)
+        W[batch_idxs[start_idx:end_idx]] = W_batch
+        i_total += i
+
+    return W, H, i_total
 
 def hyper_denoise(data, dataset_type='attenuation', num_materials=None, safety_factor=2, beta_loss='frobenius',
                   max_iter=300, tolerance=1e-10, batch_size=2 ** 27, subspace_basis=None, random_state=None,
@@ -341,7 +617,6 @@ def _estimate_subspace_dimension(data, safety_factor=2, noise_fit_window=[25.0, 
     num_materials = int(np.sum(signal_flag[:start_idx]))
 
     if verbose > 1:
-        import matplotlib.pyplot as plt
         plt.figure()
         plt.semilogy(s, label='s: actual singular values from data (signal + noise)')
         plt.semilogy(s_pred, label='s_pred: predicted singular values from noise model')
@@ -610,7 +885,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         raise ValueError("material_basis should be non-negative attenuation coefficients.")
 
     # Set variable values
-    epsilon = 1e-8
+    epsilon = 1e-30
     number_of_materials = material_basis.shape[0]
     number_of_wavelengths = material_basis.shape[1]
     
@@ -621,7 +896,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     height = detector_rows // 3
     width = detector_columns // 2
     thickness = 20 * np.sqrt((width//2)**2 - np.linspace(-width // 2, width // 2, width)**2)/ width
-    material_projection = np.zeros((num_angles, detector_rows, detector_columns, number_of_materials)).astype(np.float32)
+    material_projection = np.zeros((num_angles, detector_rows, detector_columns, number_of_materials), dtype=material_basis.dtype)
     material_projection[:, :height, width // 2:width + width // 2, 0] = material_density["Ni"] * thickness
     material_projection[:, 2 * height:, width // 2:width + width // 2, 1] = material_density["Cu"] * thickness
     material_projection[:, height:2 * height, width // 2:width + width // 2, 2] = material_density["Al"] * thickness
@@ -630,16 +905,15 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     gt_hyper_projection = rehydrate([material_projection, material_basis, 'attenuation'])
 
     # Generate noiseless hyperspectral open beam data using the given dosage rate
-    noiseless_open_beam = dosage_rate * np.ones((detector_rows, detector_columns, number_of_wavelengths)).astype(
-        np.float32)
+    noiseless_open_beam = dosage_rate * np.ones((detector_rows, detector_columns, number_of_wavelengths), dtype=material_basis.dtype)
 
     # Generate noiseless raw hyperspectral neutron counts
     noiseless_object_scan = np.exp(-gt_hyper_projection) * noiseless_open_beam
     noiseless_object_scan = np.nan_to_num(noiseless_object_scan, nan=0, posinf=0, neginf=0)
 
     # Generate noisy neutron counts from Poisson distribution
-    noisy_open_beam = np.random.poisson(noiseless_open_beam).astype(np.float32)
-    noisy_object_scan = np.random.poisson(noiseless_object_scan).astype(np.float32)
+    noisy_open_beam = np.random.poisson(noiseless_open_beam)
+    noisy_object_scan = np.random.poisson(noiseless_object_scan)
 
     # Generate noisy hyperspectral projection data
     ratio = noisy_object_scan / noisy_open_beam
@@ -653,7 +927,6 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         print("   -Shape of hyperspectral data: ", noisy_hyper_projection.shape)
 
     if verbose > 1:
-        import matplotlib.pyplot as plt
         plt.figure()
         plt.plot(material_basis.T)  # each column is a basis function
         plt.xlabel("wavelength index")
@@ -662,3 +935,76 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         plt.legend(["Ni", "Cu", "Al"])
 
     return [noisy_hyper_projection, angles, gt_hyper_projection]
+
+
+def compare_spectra(spectra_groups, ground_truth=None, labels=None, subtitles=None, title=None, x_label=None, y_label=None, x_lim=None, y_lim=None, wavelengths=None, filename=None):
+    """
+    Function to display and save multiple 2D arrays as images.
+
+    Args:
+        spectra_groups(list): list of groups of spectra to display
+        ground_truth(list,optional): list of ground truth spectra for comparison
+        labels(list,optional): labels for different spectra
+        subtitles(list,optional): subtitles for different spectrum groups
+        title(str,optional): title for the image
+        x_label(str,optional): X axis label
+        y_label(str,optional): Y axis label
+        x_lim(tuple,optional): (x_min, x_max) to set x-axis display range
+        y_lim(tuple,optional): (y_min, y_max) to set y-axis display range
+        wavelengths(list,optional): list of wavelength values for the spectra
+        filename(str,optional): path to save the image
+        """
+    num_groups = len(spectra_groups)
+    if num_groups == 0:
+        raise ValueError("No spectra groups provided for comparison.")
+
+    num_spectra = len(spectra_groups[0])  # Assume all groups have the same number of spectra
+
+    if labels is None:
+        labels = ['Spectrum: ' + str(i+1) for i in range(num_spectra)]
+
+    if wavelengths is None:
+        wavelengths = np.arange(len(spectra_groups[0][0]))
+
+    plt.rcParams['figure.constrained_layout.use'] = True
+    plt.rc('font', size=20)
+    plt.figure(figsize=(12, 4 * num_groups))
+    plt.suptitle(title)
+
+    for group_idx, spectra in enumerate(spectra_groups):
+        ax = plt.subplot(num_groups, 1, group_idx + 1)
+
+        group_labels = labels.copy()
+        if ground_truth is not None:
+            for i, gt_spectrum in enumerate(ground_truth):
+                gt_label = "Ground Truth" if i == 0 else None
+                ax.plot(wavelengths, gt_spectrum, 'k--', label=gt_label)
+
+                # Add signal-to-noise ratio annotation
+                mse = np.linalg.norm(gt_spectrum - spectra[i])
+                snr = 20 * np.log10(np.linalg.norm(gt_spectrum) / mse)
+                group_labels[i] += f" (RMSE: {mse**0.5:2g}, SNR: {snr:.1f}dB)"
+
+        for i, spectrum in enumerate(spectra):
+            ax.plot(wavelengths, spectrum, label=group_labels[i])
+
+        if subtitles is not None:
+            ax.set_title(subtitles[group_idx])
+
+        # Only add x label on final group
+        if group_idx == num_groups - 1:
+            ax.set_xlabel(x_label)
+        else:
+            ax.set_xticklabels([])  # Remove x label
+        ax.set_ylabel(y_label)
+
+        ax.set_xlim(x_lim)
+        ax.set_ylim(y_lim)
+
+        ax.legend(loc='upper left', fontsize=12)
+
+    if filename is not None:
+        try:
+            plt.savefig(filename)
+        except:
+            warnings.warn("Can't write to file.")
