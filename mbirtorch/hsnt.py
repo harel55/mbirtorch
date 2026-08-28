@@ -32,9 +32,7 @@ def stable_nnal(X, T):
 
     zero_loss = torch.exp(-X)
 
-    return torch.sum(
-        torch.where(positive, positive_loss, zero_loss)
-    )
+    return torch.sum(torch.where(positive, positive_loss, zero_loss), dim=(-2, -1))
 
 
 def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor):
@@ -165,30 +163,30 @@ def newton_update(W, H, T, lr_init, update_H=True):
     dW = grad_W / (d2L_dW2 + 1e-30)
     dH = grad_H / (d2L_dH2 + 1e-30) if update_H else torch.zeros_like(H)
 
-    # Line search over learning rates (vectorized)
-    learning_rates = lr_init * torch.logspace(-10, 1, steps=13, base=2, dtype=T.dtype)
+    learning_rates = lr_init * torch.logspace(
+        -10, 1, steps=13, base=2, dtype=T.dtype, device=T.device
+    )
+    W_candidates = torch.clip(W[None] - learning_rates[:, None, None] * dW[None], min=1e-30)
+    if update_H:
+        H_candidates = torch.clip(H[None] - learning_rates[:, None, None] * dH[None], min=1e-30)
+    else:
+        H_candidates = H.expand(learning_rates.shape[0], -1, -1)
 
-    W_best, H_best, loss_best = W, H, init_loss
-    for lr in learning_rates:
-        W_temp = torch.clip(W - lr * dW, min=1e-30)
-        H_temp = torch.clip(H - lr * dH, min=1e-30) if update_H else H
-        X_temp = W_temp @ H_temp
-        temp_loss = stable_nnal(X_temp, T)
-
-        # Compute Armijo-Goldstein condition for line search
-        directional_derivative = (
-            torch.sum(grad_W * (W_temp - W))
-            + torch.sum(grad_H * (H_temp - H))
+    X_candidates = torch.bmm(W_candidates, H_candidates)
+    candidate_losses = stable_nnal(X_candidates, T)
+    directional_derivatives = (
+        torch.sum(grad_W[None] * (W_candidates - W[None]), dim=(1, 2))
+        + torch.sum(grad_H[None] * (H_candidates - H[None]), dim=(1, 2))
         )
-        improved = temp_loss <= loss_best + 1e-4 * directional_derivative
-
-        if improved:
-            W_best = W_temp
-            H_best = H_temp
-            loss_best = temp_loss
-            lr_best = lr
-
-    return W_best, H_best, lr_best
+    armijo = candidate_losses <= init_loss + 1e-4 * directional_derivatives
+    valid_losses = torch.where(armijo, candidate_losses, torch.full_like(candidate_losses, torch.inf))
+    best_index = torch.argmin(valid_losses)
+    best_index = best_index.reshape(1)
+    return (
+        W_candidates.index_select(0, best_index).squeeze(0),
+        H_candidates.index_select(0, best_index).squeeze(0),
+        learning_rates.index_select(0, best_index).squeeze(0),
+    )
 
 def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unused: torch.Tensor, update_H: bool = True):
     """JAX-optimized multiplicative update for non-negative factorization.
@@ -212,7 +210,9 @@ def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unu
 
     return W, H, 0.0
 
-def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True, W_init: torch.Tensor = torch.tensor([]), H_init: torch.Tensor = torch.tensor([])) -> torch.Tensor:
+def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True,
+             convergence_check_interval=1, W_init: torch.Tensor = torch.tensor([]),
+             H_init: torch.Tensor = torch.tensor([])) -> torch.Tensor:
     """Factorize T into W and H by minimizing nonnegative attenuation loss."""
 
     if W_init.numel() == 0 and H_init.numel() == 0:
@@ -223,24 +223,38 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         H_init = torch.linalg.lstsq(W_init, T)[0]
 
     prev_loss = stable_nnal(W_init @ H_init, T)
-    W, H, prev_loss, i, converged, aux = (W_init, H_init, prev_loss, 0, False, 0.001)
-    while (i < max_steps) and not converged:
+    W, H, prev_loss, aux = (W_init, H_init, prev_loss, 0.001)
+    for i in range(max_steps):
         W, H, aux = update(W, H, T, aux, update_H=update_H)
         loss_new = stable_nnal(W @ H, T)
-        # print(f"Iteration {i}: Initial Loss = {prev_loss}, New Loss = {loss_new}, Diff = {prev_loss - loss_new}")
+        # print(f"Iteration {i+1}: Initial Loss = {prev_loss}, New Loss = {loss_new}, Diff = {prev_loss - loss_new}")
+        if rel_tol > 0 and (i+1) % convergence_check_interval == 0:
         converged = torch.abs(loss_new - prev_loss) / (prev_loss + 1e-30) < rel_tol
+            if converged:
         prev_loss = loss_new
-        i += 1
+                break
+        prev_loss = loss_new
 
-    return W, H, i
+    return W, H, i+1
 
-def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, max_steps=1000, rel_tol=1e-10, batch_size=None, **kwargs) -> torch.Tensor:
+def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, max_steps=1000,
+                       rel_tol=1e-10, batch_size=None, compile_mode=None, **kwargs) -> torch.Tensor:
     if method == 'quasi_newton':
         update = newton_update
     elif method == 'mann_multiplicative':
         update = multiplicative_update
     else:
         raise ValueError("Invalid method. Choose 'quasi_newton' or 'mann_multiplicative'.")
+
+    if compile_mode is not None:
+        compile_options = {
+            "triton.cudagraphs": False,
+            "max_autotune": compile_mode == "max-autotune",
+        }
+        update = torch.compile(
+            update,
+            options=compile_options,
+        )
 
     kwargs.update({
         'update': update,
