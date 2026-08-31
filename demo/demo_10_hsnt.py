@@ -49,9 +49,10 @@ def main():
         detector_columns=detector_columns,
         dosage_rate=dosage_rate,
         material_density=material_density,
+        noisy=True,
         verbose=verbose
     )
-    noisy_hyper_projection = torch.tensor(noisy_hyper_projection, dtype=torch.float32, device=device)
+    noisy_hyper_projection = torch.tensor(noisy_hyper_projection, dtype=torch.float64, device=device)
     noisy_hyper_projection = torch.nan_to_num(noisy_hyper_projection, nan=0.0, posinf=0.0, neginf=0.0)  # Replace any NaNs or infs with zeros
     T = torch.exp(-noisy_hyper_projection).reshape(-1, noisy_hyper_projection.shape[-1])
     print(f"Range of T: {torch.min(T).item():.2g} to {torch.max(T).item():.2g}")

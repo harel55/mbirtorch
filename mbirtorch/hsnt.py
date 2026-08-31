@@ -197,7 +197,7 @@ def newton_update(W, H, T, lr_init, update_H=True):
     directional_derivatives = (
         torch.sum(grad_W[None] * (W_candidates - W[None]), dim=(1, 2))
         + torch.sum(grad_H[None] * (H_candidates - H[None]), dim=(1, 2))
-        )
+    )
     armijo = candidate_losses <= init_loss + 1e-4 * directional_derivatives
     valid_losses = torch.where(armijo, candidate_losses, torch.full_like(candidate_losses, torch.inf))
     best_index = torch.argmin(valid_losses)
@@ -249,9 +249,9 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         loss_new = stable_nnal(W @ H, T)
         # print(f"Iteration {i+1}: Initial Loss = {prev_loss}, New Loss = {loss_new}, Diff = {prev_loss - loss_new}")
         if rel_tol > 0 and (i+1) % convergence_check_interval == 0:
-        converged = torch.abs(loss_new - prev_loss) / (prev_loss + 1e-30) < rel_tol
+            converged = torch.abs(loss_new - prev_loss) / (prev_loss + 1e-30) < rel_tol
             if converged:
-        prev_loss = loss_new
+                prev_loss = loss_new
                 break
         prev_loss = loss_new
 
@@ -391,7 +391,7 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
     Args:
         data: Hyperspectral data array with arbitrary axes and a spectral axis of length :math:`N_k` in the last position.
         dataset_type: 'attenuation' or 'transmission' where attenuation = -log(transmission). Defaults to 'attenuation'.
-        num_materials: Number of materials in the sample :math:`N_m`. If None, the number is estimated automatically from 
+        num_materials: Number of materials in the sample :math:`N_m`. If None, the number is estimated automatically from
             the data. Defaults to None.
         safety_factor: A multiplier (≥ 1) applied to the number of materials to set the subspace dimension :math:`N_s`.
             Defaults to 2.
@@ -494,7 +494,7 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
                                                         max_iter=max(50, max_iter // num_batches),
                                                         random_state=random_state,
                                                         update_H=True)
-                
+
         # Estimate final subspace basis from batch estimations using NMF
         subspace_basis_batch = np.reshape(np.array(subspace_basis_batch), (-1, num_bands))
         with warnings.catch_warnings():
@@ -877,8 +877,8 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
 # -----------------------------------------------------------------------
 
 
-def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector_columns=64, dosage_rate=300, 
-                        material_density=None, verbose=1):
+def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector_columns=64, dosage_rate=300,
+                        material_density=None, noisy=True, verbose=1):
     """
     Simulate noisy hyperspectral neutron attenuation data for :math:`N_m=3` materials (Ni, Cu, Al) and :math:`N_k` wavelength bins.
 
@@ -889,6 +889,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         detector_columns: Number of columns in the detector :math:`(N_c)`. Defaults to 64.
         dosage_rate: Neutron dosage rate during hyperspectral data collection. Defaults to 300.
         material_density: Material density (vol. fraction) for Ni, Cu, and Al. Defaults to {"Ni": 0.2, "Cu": 0.2, "Al": 1.0}.
+        noisy: Whether to generate noisy data. Defaults to True.
         verbose: Verbosity level. If 0, prints nothing; if 1, prints details; if >1, also generates plots. Defaults to 1.
 
     Returns:
@@ -924,7 +925,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     epsilon = 1e-30
     number_of_materials = material_basis.shape[0]
     number_of_wavelengths = material_basis.shape[1]
-    
+
     # Generate view angles
     angles = np.linspace(0, np.pi, num_angles)
 
@@ -947,9 +948,14 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     noiseless_object_scan = np.exp(-gt_hyper_projection) * noiseless_open_beam
     noiseless_object_scan = np.nan_to_num(noiseless_object_scan, nan=0, posinf=0, neginf=0)
 
-    # Generate noisy neutron counts from Poisson distribution
-    noisy_open_beam = np.random.poisson(noiseless_open_beam)
-    noisy_object_scan = np.random.poisson(noiseless_object_scan)
+    if noisy:
+        # Generate noisy neutron counts from Poisson distribution
+        noisy_open_beam = np.random.poisson(noiseless_open_beam)
+        noisy_object_scan = np.random.poisson(noiseless_object_scan)
+    else:
+        # Do not generate noisy data
+        noisy_open_beam = noiseless_open_beam
+        noisy_object_scan = noiseless_object_scan
 
     # Generate noisy hyperspectral projection data
     ratio = noisy_object_scan / noisy_open_beam
