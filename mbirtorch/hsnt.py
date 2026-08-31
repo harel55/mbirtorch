@@ -135,18 +135,38 @@ def nndsvda(X, n_components):
     return W, H
 
 
-def newton_update(W, H, T, lr_init, update_H=True):
-    """JAX-optimized Newton update with automatic differentiation and line search.
+def quadratic_update(W, H, T, unused, update_H=True):
+    """PyTorch-optimized quadratic update with automatic differentiation.
 
     Args:
-        W: Feature matrix (spatial pixels × num_materials), JAX array
-        H: Spectral basis matrix (num_materials × spectral channels), JAX array
-        T: Data term matrix (spatial pixels × spectral channels), JAX array
+        W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
+        H: Spectral basis matrix (num_materials × spectral channels), PyTorch tensor
+        T: Data term matrix (spatial pixels × spectral channels), PyTorch tensor
+        update_H: If False, keep H fixed and only update W.
+
+    Returns:
+        Updated (W, H) pair as PyTorch tensors
+    """
+    TlnT = -T * torch.log(torch.clip(T, min=1e-30))
+
+    # We intentionally recompute W @ H here to perform an alternating update
+    W *= torch.clip((TlnT @ H.T) / torch.clip((T * (W @ H)) @ H.T, min=1e-30), min=1e-30)
+    H *= torch.clip((W.T @ TlnT) / torch.clip(W.T @ (T * (W @ H)), min=1e-30), min=1e-30) if update_H else H
+    return W, H, 0.0
+
+
+def newton_update(W, H, T, lr_init, update_H=True):
+    """PyTorch-optimized Newton update with automatic differentiation and line search.
+
+    Args:
+        W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
+        H: Spectral basis matrix (num_materials × spectral channels), PyTorch tensor
+        T: Data term matrix (spatial pixels × spectral channels), PyTorch tensor
         lr_init: Initial learning rate for line search
         update_H: If False, keep H fixed and only update W.
 
     Returns:
-        Updated (W, H) pair as JAX arrays
+        Updated (W, H) pair as PyTorch tensors
     """
     X = W @ H
     G, Z = stable_nnal_derivatives(X, T)
@@ -189,17 +209,17 @@ def newton_update(W, H, T, lr_init, update_H=True):
     )
 
 def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unused: torch.Tensor, update_H: bool = True):
-    """JAX-optimized multiplicative update for non-negative factorization.
+    """PyTorch-optimized multiplicative update for non-negative factorization.
 
     Args:
-        W: Feature matrix (spatial pixels × num_materials), JAX array
-        H: Spectral basis matrix (num_materials × spectral channels), JAX array
-        T: Data term matrix (spatial pixels × spectral channels), JAX array
+        W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
+        H: Spectral basis matrix (num_materials × spectral channels), PyTorch tensor
+        T: Data term matrix (spatial pixels × spectral channels), PyTorch tensor
         unused: Placeholder for auxiliary variables (not used in this implementation)
         update_H: If False, keep H fixed and only update W.
 
     Returns:
-        Updated (W, H) pair as JAX arrays
+        Updated (W, H) pair as PyTorch tensors
     """
     damping_factor = 0.5
     Z = torch.exp(-W @ H)
@@ -243,6 +263,8 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
         update = newton_update
     elif method == 'mann_multiplicative':
         update = multiplicative_update
+    elif method == 'quadratic':
+        update = quadratic_update
     else:
         raise ValueError("Invalid method. Choose 'quasi_newton' or 'mann_multiplicative'.")
 

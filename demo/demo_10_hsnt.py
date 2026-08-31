@@ -96,48 +96,41 @@ def main():
 
     # Perform hyperspectral denoising
     start_time = time.time()
-    W_newt1, H_newt1, i_newt = nnal_factorization(
+    W_newt, H_newt, i_newt = nnal_factorization(
         T, method='quasi_newton', **kwargs, W_init=W.clone(), H_init=H.clone()
     )
     print(f'Newton reconstruction completed in: {time.time() - start_time} seconds after {i_newt} iterations')
     start_time = time.time()
-    W_newt2, H_newt2, i_newt = nnal_factorization(
-        T, method='quasi_newton', **kwargs, W_init=material_projection.clone(), H_init=material_basis.clone()
-    )
-    print(f'Newton reconstruction completed in: {time.time() - start_time} seconds after {i_newt} iterations')
-    start_time = time.time()
-    W_mu1, H_mu1, i_mu = nnal_factorization(
+    W_mu, H_mu, i_mu = nnal_factorization(
         T, method='mann_multiplicative', **kwargs, W_init=W.clone(), H_init=H.clone()
     )
     print(f'Multiplicative reconstruction completed in: {time.time() - start_time} seconds after {i_mu} iterations')
     start_time = time.time()
-    W_mu2, H_mu2, i_mu = nnal_factorization(
-        T, method='mann_multiplicative', **kwargs, W_init=material_projection.clone(), H_init=material_basis.clone()
+    W_quad, H_quad, i_quad = nnal_factorization(
+        T, method='quadratic', **kwargs, W_init=W.clone(), H_init=H.clone()
     )
-    print(f'Multiplicative reconstruction completed in: {time.time() - start_time} seconds after {i_mu} iterations')
+    print(f'Quadratic reconstruction completed in: {time.time() - start_time} seconds after {i_quad} iterations')
 
-    print(f"attenuation loss L2:\t\t\t{stable_nnal(W @ H, T).item()}")
-    print(f"attenuation loss Newton (L2 loss init):\t{stable_nnal(W_newt1 @ H_newt1, T).item()}")
-    print(f"attenuation loss Mann (L2 loss init):\t{stable_nnal(W_mu1 @ H_mu1, T).item()}")
-    print(f"attenuation loss Newton (true init):\t{stable_nnal(W_newt2 @ H_newt2, T).item()}")
-    print(f"attenuation loss Mann (true init):\t{stable_nnal(W_mu2 @ H_mu2, T).item()}")
-    print(f"T-weighted L2 loss L2:\t\t\t\t{(T*((torch.log(T) + (W @ H))**2)).sum().item()}")
-    print(f"T-weighted L2 loss Newton (L2 loss init):\t{(T*((torch.log(T) + (W_newt1 @ H_newt1))**2)).sum().item()}")
-    print(f"T-weighted L2 loss Mann (L2 loss init):\t\t{(T*((torch.log(T) + (W_mu1 @ H_mu1))**2)).sum().item()}")
-    print(f"T-weighted L2 loss Newton (true init):\t\t{(T*((torch.log(T) + (W_newt2 @ H_newt2))**2)).sum().item()}")
-    print(f"T-weighted L2 loss Mann (true init):\t\t{(T*((torch.log(T) + (W_mu2 @ H_mu2))**2)).sum().item()}")
-    print(f"L2 loss L2:\t\t\t{torch.linalg.norm(torch.log(T) + (W @ H)).item()}")
-    print(f"L2 loss Newton (L2 loss init):\t{torch.linalg.norm(torch.log(T) + (W_newt1 @ H_newt1)).item()}")
-    print(f"L2 loss Mann (L2 loss init):\t{torch.linalg.norm(torch.log(T) + (W_mu1 @ H_mu1)).item()}")
-    print(f"L2 loss Newton (true init):\t{torch.linalg.norm(torch.log(T) + (W_newt2 @ H_newt2)).item()}")
-    print(f"L2 loss Mann (true init):\t{torch.linalg.norm(torch.log(T) + (W_mu2 @ H_mu2)).item()}")
+    print(f"attenuation loss Scipy:\t\t\t\t{stable_nnal(W @ H, T).item()}")
+    print(f"attenuation loss Newton (Scipy init):\t\t{stable_nnal(W_newt @ H_newt, T).item()}")
+    print(f"attenuation loss Mann (Scipy init):\t\t{stable_nnal(W_mu @ H_mu, T).item()}")
+    print(f"attenuation loss Quadratic (Scipy init):\t{stable_nnal(W_quad @ H_quad, T).item()}")
+    print()
+    print(f"T-weighted L2 loss Scipy:\t\t\t{(T*((torch.log(T) + (W @ H))**2)).sum().item()/2}")
+    print(f"T-weighted L2 loss Newton (Scipy init):\t\t{(T*((torch.log(T) + (W_newt @ H_newt))**2)).sum().item()/2}")
+    print(f"T-weighted L2 loss Mann (Scipy init):\t\t{(T*((torch.log(T) + (W_mu @ H_mu))**2)).sum().item()/2}")
+    print(f"T-weighted L2 loss Quadratic (Scipy init):\t{(T*((torch.log(T) + (W_quad @ H_quad))**2)).sum().item()/2}")
+    print()
+    print(f"L2 loss Scipy:\t\t\t{torch.linalg.norm(torch.log(T) + (W @ H)).item()}")
+    print(f"L2 loss Newton (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_newt @ H_newt)).item()}")
+    print(f"L2 loss Mann (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_mu @ H_mu)).item()}")
+    print(f"L2 loss Quadratic (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_quad @ H_quad)).item()}")
 
     # Compute least squares estimate of material coefficients for current projections
     theta_frob = torch.linalg.lstsq(H.T, material_basis.T)[0].T
-    theta_newt1 = torch.linalg.lstsq(H_newt1.T, material_basis.T)[0].T
-    theta_mu1 = torch.linalg.lstsq(H_mu1.T, material_basis.T)[0].T
-    theta_newt2 = torch.linalg.lstsq(H_newt2.T, material_basis.T)[0].T
-    theta_mu2 = torch.linalg.lstsq(H_mu2.T, material_basis.T)[0].T
+    theta_newt = torch.linalg.lstsq(H_newt.T, material_basis.T)[0].T
+    theta_mu = torch.linalg.lstsq(H_mu.T, material_basis.T)[0].T
+    theta_quad = torch.linalg.lstsq(H_quad.T, material_basis.T)[0].T
 
     # Move everything back to CPU for plotting
     material_projection = material_projection.cpu().numpy()
@@ -145,37 +138,32 @@ def main():
     W = W.cpu().numpy()
     H = H.cpu().numpy()
     T = T.cpu().numpy()
-    W_newt1 = W_newt1.cpu().numpy()
-    H_newt1 = H_newt1.cpu().numpy()
-    W_mu1 = W_mu1.cpu().numpy()
-    H_mu1 = H_mu1.cpu().numpy()
-    W_newt2 = W_newt2.cpu().numpy()
-    H_newt2 = H_newt2.cpu().numpy()
-    W_mu2 = W_mu2.cpu().numpy()
-    H_mu2 = H_mu2.cpu().numpy()
+    W_newt = W_newt.cpu().numpy()
+    H_newt = H_newt.cpu().numpy()
+    W_mu = W_mu.cpu().numpy()
+    H_mu = H_mu.cpu().numpy()
+    W_quad = W_quad.cpu().numpy()
+    H_quad = H_quad.cpu().numpy()
     theta_frob = theta_frob.cpu().numpy()
-    theta_newt1 = theta_newt1.cpu().numpy()
-    theta_mu1 = theta_mu1.cpu().numpy()
-    theta_newt2 = theta_newt2.cpu().numpy()
-    theta_mu2 = theta_mu2.cpu().numpy()
+    theta_newt = theta_newt.cpu().numpy()
+    theta_mu = theta_mu.cpu().numpy()
+    theta_quad = theta_quad.cpu().numpy()
 
     # Plot reconstructed spectra
     compare_spectra(
         spectra_groups=[
             theta_frob @ H,
-            theta_newt1 @ H_newt1,
-            theta_mu1 @ H_mu1,
-            theta_newt2 @ H_newt2,
-            theta_mu2 @ H_mu2,
+            theta_newt @ H_newt,
+            theta_mu @ H_mu,
+            theta_quad @ H_quad,
         ],
         ground_truth=material_basis,
         labels=['Ni', 'Cu', 'Al'],
         subtitles=[
             r'L$^2$ Loss',
-            'Quasi-Newton (random init)',
-            'Mann-Multiplicative (random init)',
-            'Quasi-Newton (true init)',
-            'Mann-Multiplicative (true init)',
+            'Quasi-Newton (scipy init)',
+            'Mann-Multiplicative (scipy init)',
+            'T-Weighted L$^2$ (scipy init)',
         ],
         title=f'Material attenuation spectra reconstructions',
         x_label='Wavelength index',
@@ -185,17 +173,18 @@ def main():
     )
 
     # Plot reconstructed material coefficient maps
-    plt.figure(figsize=(12, 12))
+    plt.figure(figsize=(18, 6))
     plt.suptitle(f'Material projection reconstructions')
     row_max = np.max(material_projection, axis=0).reshape(1, 1, num_materials_true)
     image_dims = (detector_rows, detector_columns, num_materials_true)
     for i, (image, title) in enumerate([
             (material_projection.reshape(image_dims) / row_max, 'Ground Truth'),
             ((W @ np.linalg.pinv(theta_frob)).reshape(image_dims) / row_max, 'L$^2$ Loss'),
-            ((W_newt1 @ np.linalg.pinv(theta_newt1)).reshape(image_dims) / row_max, 'Quasi-Newton'),
-            ((W_mu1 @ np.linalg.pinv(theta_mu1)).reshape(image_dims) / row_max, 'Mann-Multiplicative'),
+            ((W_newt @ np.linalg.pinv(theta_newt)).reshape(image_dims) / row_max, 'Quasi-Newton'),
+            ((W_mu @ np.linalg.pinv(theta_mu)).reshape(image_dims) / row_max, 'Mann-Multiplicative'),
+            ((W_quad @ np.linalg.pinv(theta_quad)).reshape(image_dims) / row_max, 'T-Weighted L$^2$'),
         ]):
-        ax = plt.subplot(2, 2, i + 1)
+        ax = plt.subplot(1, 5, i + 1)
         ax.set_title(title)
         ax.imshow(image)
     plt.savefig(f'example_1_material_maps.png')
