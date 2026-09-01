@@ -165,24 +165,63 @@ def nndsvda(X, n_components):
     return W, H
 
 
-def quadratic_update(W, H, T, unused, update_H=True):
-    """PyTorch-optimized quadratic update with automatic differentiation.
+def quadratic_update(W, H, T, prep=None, update_H=True):
+    """Iteratively reweighted multiplicative update for the NNAL.
+
+    The second-order model of the NNAL at the current iterate X is
+
+        L(X') ~ L(X) + G (X' - X) + (1/2) Z (X' - X)^2 = (1/2) Z (X' - V)^2 + c
+
+    with G = T - exp(-X), Z = exp(-X) and target V = X - G/Z. Reweighted least
+    squares on that model, relinearized every step, has the NNAL stationary point
+    as its fixed point.
+
+    Z V = Z X - G, which needs no exp(+X) and so stays bounded however large the
+    attenuation gets. Z V is signed, so the multiplicative update splits it into
+    positive and negative parts and puts each on the side of the ratio where it
+    keeps W and H nonnegative; at the fixed point the ratio is one, which gives
+    (exp(-X) - T) H^T = 0, exactly the NNAL stationarity condition.
+
+    This replaces an earlier update that minimized (1/2) sum T (X + log T)^2 --
+    the second-order model expanded about the noiseless solution rather than the
+    current iterate, and never relinearized. That objective weights every
+    zero-count measurement by exactly zero, so at low dose it discards a large
+    fraction of the data (17.7% at dosage_rate=3) and converges somewhere other
+    than the NNAL minimum. Here the weight is exp(-X) > 0 everywhere, so no
+    measurement is dropped.
+
+    Note this is a Gauss-Newton style surrogate, not a majorizer, so individual
+    steps are not guaranteed to decrease the loss.
 
     Args:
         W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
         H: Spectral basis matrix (num_materials × spectral channels), PyTorch tensor
         T: Data term matrix (spatial pixels × spectral channels), PyTorch tensor
+        prep: Optional tuple from _nnal_prep(T).
         update_H: If False, keep H fixed and only update W.
 
     Returns:
         Updated (W, H) pair as PyTorch tensors
     """
-    TlnT = -T * torch.log(torch.clip(T, min=1e-30))
+    prep = _nnal_prep(T) if not isinstance(prep, tuple) else prep
+    tiny = torch.finfo(T.dtype).tiny
 
-    # We intentionally recompute W @ H here to perform an alternating update
-    W *= torch.clip((TlnT @ H.T) / torch.clip((T * (W @ H)) @ H.T, min=1e-30), min=1e-30)
-    H *= torch.clip((W.T @ TlnT) / torch.clip(W.T @ (T * (W @ H)), min=1e-30), min=1e-30) if update_H else H
-    return W, H, 0.0
+    X = W @ H
+    G, Z = stable_nnal_derivatives(X, T, prep)
+    ZV = Z * X - G
+    W = W * ((ZV.clamp(min=0) @ H.T)
+             / ((Z * X) @ H.T + (-ZV).clamp(min=0) @ H.T).clamp(min=tiny))
+
+    if update_H:
+        # Relinearize before the H step: the model is only second order accurate
+        # at the iterate it was expanded about, and W has just moved.
+        X = W @ H
+        G, Z = stable_nnal_derivatives(X, T, prep)
+        ZV = Z * X - G
+        H = H * ((W.T @ ZV.clamp(min=0))
+                 / (W.T @ (Z * X) + W.T @ (-ZV).clamp(min=0)).clamp(min=tiny))
+
+    return W, H, prep
 
 
 def newton_update(W, H, T, lr_init, update_H=True):
