@@ -12,30 +12,59 @@ import torch
 # -----------------------------------------------------------------------
 # Hyperspectral Neutron Radiographic/Tomographic Data Denoising Functions
 # -----------------------------------------------------------------------
-def stable_nnal(X, T):
+def _nnal_prep(T):
+    """
+    Precompute the quantities that depend only on T.
+
+    These are constant for a whole solve, so hoisting them out of the iteration
+    removes a full log over T from every loss and derivative evaluation.
+
+    Returns:
+        (log_T, positive, all_positive, taylor_cutoff)
+    """
+    positive = T > 0
+    Tsafe = torch.where(positive, T, torch.ones((), dtype=T.dtype, device=T.device))
+    log_T = torch.log(Tsafe)
+    all_positive = bool(positive.all())
+    # Crossover for the phi series: truncation ~ |Xp|^3/24 against cancellation
+    # ~ eps/|Xp|^2. The old hard-coded 1e-3 is ~40x too small in float32.
+    taylor_cutoff = (24.0 * torch.finfo(T.dtype).eps) ** 0.25
+    return log_T, positive, all_positive, taylor_cutoff
+
+
+def stable_nnal(X, T, prep=None):
     """
     Compute a shifted form of the non-negative attentuation loss
     that is much more numerically stable
-    """
-    positive = T > 0
-    Tsafe = torch.where(positive, T, torch.tensor(1.0, dtype=T.dtype, device=T.device))
 
-    Xp = X + torch.log(Tsafe)
+    Args:
+        X: Attenuation estimate, broadcastable against T.
+        T: Measured transmission ratio (counts / open beam).
+        prep: Optional tuple from _nnal_prep(T). Pass it inside an iteration to
+            avoid recomputing log(T) on every call.
+    """
+    log_T, positive, all_positive, taylor_cutoff = _nnal_prep(T) if prep is None else prep
+
+    Xp = X + log_T
 
     phi = torch.where(
-        torch.abs(Xp) < 1e-3,
+        torch.abs(Xp) < taylor_cutoff,
         Xp * Xp * (0.5 + Xp * (-1.0 / 6.0 + Xp / 24.0)),
         torch.expm1(-Xp) + Xp,
     )
 
-    positive_loss = T * phi
+    loss = T * phi
 
-    zero_loss = torch.exp(-X)
+    if not all_positive:
+        # T == 0 means Xp == X, so the zero-count term is exp(-Xp). It must be a
+        # real exp: expm1(-Xp) saturates at exactly -1 for Xp above ~37 in
+        # float64, so reconstructing it as expm1(-Xp) + 1 underflows to zero.
+        loss = torch.where(positive, loss, torch.exp(-Xp))
 
-    return torch.sum(torch.where(positive, positive_loss, zero_loss), dim=(-2, -1))
+    return torch.sum(loss, dim=(-2, -1))
 
 
-def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor):
+def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
     """
     Given X = W @ H, compute
 
@@ -45,22 +74,23 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor):
     where L is the non-negative attenuation loss in a
     numerically stable way that handles T = 0 appropriately.
     """
-    positive = T > 0
-    Tsafe = torch.where(positive, T, torch.tensor(1.0, dtype=T.dtype, device=T.device))
+    log_T, positive, all_positive, _ = _nnal_prep(T) if prep is None else prep
 
-    Xp = X + torch.log(Tsafe)
+    Xp = X + log_T
 
-    G = torch.where(
-        positive,
-        -T * torch.expm1(-Xp),
-        -torch.exp(-X),
-    )
+    # Two transcendentals, not four: torch.where evaluates both of its branches,
+    # so the original form paid for four exponentials per call. expm1 is the
+    # accurate one near Xp = 0, where T - exp(-X) cancels; exp is the accurate
+    # one at large Xp, where expm1 saturates at -1 and expm1 + 1 underflows.
+    E = torch.expm1(-Xp)
+    eXp = torch.exp(-Xp)
 
-    Z = torch.where(
-        positive,
-        T * torch.exp(-Xp),
-        torch.exp(-X),
-    )
+    G = -T * E
+    Z = T * eXp
+
+    if not all_positive:
+        G = torch.where(positive, G, -eXp)
+        Z = torch.where(positive, Z, eXp)
 
     return G, Z
 
