@@ -423,6 +423,159 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     return W, H, num_steps
 
 
+def _joint_dot(a, b, c, d):
+    return (a * b).sum() + (c * d).sum()
+
+
+def _joint_blocks(flat, rows, cols, rank, free, jitter):
+    """(B,Q) upper triangle -> damped SPD (B,R,R) with frozen vars set to identity."""
+    M = flat.new_zeros(flat.shape[0], rank, rank)
+    M[:, rows, cols] = flat
+    M[:, cols, rows] = flat
+    eye = torch.eye(rank, dtype=M.dtype, device=M.device)
+    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
+    scale = torch.diagonal(M, dim1=-2, dim2=-1).amax(-1).clamp_min(torch.finfo(M.dtype).tiny)
+    M = M + (jitter * scale)[:, None, None] * eye
+    L, info = torch.linalg.cholesky_ex(M)
+    return torch.where((info > 0)[:, None, None], eye.expand_as(L), L)
+
+
+def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-12,
+                     precond_jitter=1e-8, prep=None, verbose=False):
+    prep = _nnal_prep(T) if prep is None else prep
+    W = W.clone(); H = H.clone()
+    rank = W.shape[1]
+    rows, cols = torch.triu_indices(rank, rank, device=W.device)
+    loss = stable_nnal(W @ H, T, prep)
+    lam = damping
+    total_cg = 0
+    step = 0
+    gnorm0 = None
+    stalled = 0
+    eps = torch.finfo(T.dtype).eps
+    for step in range(1, max_steps + 1):
+        X = W @ H
+        G, Z = stable_nnal_derivatives(X, T, prep)
+        gW, gH = G @ H.T, W.T @ G
+        fW = ~((W <= 0) & (gW > 0))
+        fH = ~((H <= 0) & (gH > 0))
+        gW, gH = gW * fW, gH * fH
+        gnorm2 = _joint_dot(gW, gW, gH, gH)
+        if not torch.isfinite(gnorm2) or gnorm2 == 0:
+            break
+        # Stop on the projected-gradient (KKT) residual, not on the relative change
+        # in the loss: this objective is shifted so its minimum is 0, so once the
+        # fit is near-exact the relative loss change stays O(1) forever and a
+        # loss-ratio test never fires.
+        gnorm = gnorm2.sqrt()
+        if gnorm0 is None:
+            gnorm0 = gnorm
+        elif rel_tol > 0 and gnorm <= rel_tol * gnorm0:
+            break
+
+        LW = _joint_blocks(Z @ (H[rows] * H[cols]).T, rows, cols, rank, fW, precond_jitter)
+        LH = _joint_blocks(((W[:, rows] * W[:, cols]).T @ Z).T, rows, cols, rank, fH.T, precond_jitter)
+
+        def precond(rW, rH):
+            zW = torch.cholesky_solve(rW.unsqueeze(-1), LW).squeeze(-1) * fW
+            zH = torch.cholesky_solve(rH.T.unsqueeze(-1), LH).squeeze(-1).T * fH
+            return zW, zH
+
+        def hvp(dW, dH):
+            dW, dH = dW * fW, dH * fH
+            dX = dW @ H + W @ dH
+            ZdX = Z * dX
+            return ((ZdX @ H.T + G @ dH.T) * fW + lam * dW,
+                    (W.T @ ZdX + dW.T @ G) * fH + lam * dH)
+
+        xW = torch.zeros_like(gW); xH = torch.zeros_like(gH)
+        rW, rH = -gW, -gH
+        zW, zH = precond(rW, rH)
+        pW, pH = zW.clone(), zH.clone()
+        rz = _joint_dot(rW, zW, rH, zH)
+        r0 = _joint_dot(rW, rW, rH, rH)
+        tol2 = (torch.clamp(gnorm2.sqrt().sqrt(), max=0.5) ** 2) * r0
+        ncg = 0
+        for ncg in range(1, cg_max + 1):
+            ApW, ApH = hvp(pW, pH)
+            pAp = _joint_dot(pW, ApW, pH, ApH)
+            if pAp <= 0:
+                if ncg == 1: xW, xH = zW, zH
+                break
+            a = rz / pAp
+            xW = xW + a * pW; xH = xH + a * pH
+            rW = rW - a * ApW; rH = rH - a * ApH
+            if _joint_dot(rW, rW, rH, rH) <= tol2:
+                break
+            zW, zH = precond(rW, rH)
+            rz_new = _joint_dot(rW, zW, rH, zH)
+            b = rz_new / rz
+            pW = zW + b * pW; pH = zH + b * pH
+            rz = rz_new
+        total_cg += ncg
+
+        slope = _joint_dot(gW, xW, gH, xH)
+        if slope >= 0:
+            xW, xH = -gW, -gH
+            slope = -gnorm2
+        a, accepted = 1.0, False
+        for _ in range(30):
+            Wn = (W + a * xW).clamp_(min=0)
+            Hn = (H + a * xH).clamp_(min=0)
+            new_loss = stable_nnal(Wn @ Hn, T, prep)
+            if torch.isfinite(new_loss) and new_loss <= loss + 1e-4 * a * slope:
+                accepted = True; break
+            a *= 0.5
+        if not accepted:
+            lam = lam * 10.0 if lam > 0 else 1e-12
+            if lam > 1e6: break
+            continue
+        lam = max(lam * 0.3, 1e-14)
+        # Stagnation: the step bought less than the roundoff of the loss itself.
+        # Three in a row means we are at the precision floor, whatever the KKT
+        # residual says (the scale ambiguity W -> WM, H -> M^-1 H leaves an
+        # R^2-dimensional null space, so the gradient need not vanish outright).
+        stalled = stalled + 1 if (loss - new_loss) <= 8 * eps * torch.abs(new_loss) else 0
+        W, H, loss = Wn, Hn, new_loss
+        if verbose:
+            print(f'  step {step:3d} cg {ncg:3d} a {a:.3g} loss {loss.item():.6e}', flush=True)
+        if stalled >= 3:
+            break
+    return W, H, step, total_cg
+
+
+def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
+                          convergence_check_interval=1, W_init=None, H_init=None,
+                          warmup_steps=10, cg_max=20):
+    """Block-Newton warm-up followed by a joint (W,H) preconditioned Newton solve.
+
+    Alternating methods stall at a linear rate once the fit is good, because they
+    discard the W<->H coupling block of the Hessian; on a problem where an exact
+    factorization exists, block-Newton alone plateaus around 1e-7. Solving for both
+    factors jointly restores fast convergence to machine precision. The alternating
+    method is still the right way to get into the basin, so it runs first.
+
+    update_H=False is not supported here (the joint step updates both factors);
+    it falls back to block-Newton alone.
+    """
+    prep = _nnal_prep(T)
+    W, H = W_init, H_init
+    X = W @ H
+    for _ in range(min(warmup_steps, max_steps)):
+        X = W @ H
+        W, X, _ = block_newton_step(W, H, X, T, prep, 0)
+        if update_H:
+            H, X, _ = block_newton_step(H, W, X, T, prep, 1)
+    if not update_H:
+        return W, H, min(warmup_steps, max_steps)
+    remaining = max(0, max_steps - warmup_steps)
+    if remaining == 0:
+        return W, H, min(warmup_steps, max_steps)
+    W, H, steps, _ = _joint_newton_pcg(T, W, H, max_steps=remaining, cg_max=cg_max,
+                                       rel_tol=rel_tol, prep=prep)
+    return W, H, warmup_steps + steps
+
+
 def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True,
              convergence_check_interval=1, W_init: torch.Tensor = torch.tensor([]),
              H_init: torch.Tensor = torch.tensor([])) -> torch.Tensor:
@@ -436,10 +589,10 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
     elif H_init.numel() == 0:
         H_init = torch.linalg.lstsq(W_init, T)[0].clamp(min=0)
 
-    if update is block_newton_optimize:
-        return block_newton_optimize(T, num_materials, max_steps, rel_tol,
-                                     update_H=update_H, W_init=W_init, H_init=H_init,
-                                     convergence_check_interval=convergence_check_interval)
+    if update in (block_newton_optimize, joint_newton_optimize):
+        return update(T, num_materials, max_steps, rel_tol,
+                      update_H=update_H, W_init=W_init, H_init=H_init,
+                      convergence_check_interval=convergence_check_interval)
 
     prep = _nnal_prep(T)
     W, H, aux = (W_init, H_init, 0.001)
@@ -469,11 +622,14 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
         update = quadratic_update
     elif method == 'block_newton':
         update = block_newton_optimize
+    elif method == 'joint_newton':
+        update = joint_newton_optimize
     else:
-        raise ValueError("Invalid method. Choose 'block_newton', 'quasi_newton', "
-                         "'mann_multiplicative' or 'quadratic'.")
+        raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton', "
+                         "'quasi_newton', 'mann_multiplicative' or 'quadratic'.")
 
-    if compile_mode is not None and update is not block_newton_optimize:
+    if compile_mode is not None and update not in (block_newton_optimize,
+                                                   joint_newton_optimize):
         compile_options = {
             "triton.cudagraphs": False,
             "max_autotune": compile_mode == "max-autotune",
