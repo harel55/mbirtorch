@@ -382,7 +382,8 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
         axis: 0 to update W, 1 to update H.
 
     Returns:
-        (V_new, X_new, num_backtracks)
+        (V_new, X_new, (num_backtracks, projected_gradient_norm_squared)). The
+        gradient norm is measured at the incoming iterate, before the step.
     """
     log_T, positive, all_positive, taylor_cutoff = prep
     G, Z = stable_nnal_derivatives(X, T, prep)
@@ -406,6 +407,10 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
     # Two-metric projection: freeze the variables sitting on the V >= 0 boundary
     # whose gradient pushes them further out, and Newton-step the rest.
     free = ~((V <= 0) & (grad > 0))
+    # The projected gradient is the KKT residual for this block, and it is already
+    # in hand here; returning it lets the driver test convergence without paying
+    # for a second derivative evaluation.
+    projected_gnorm2 = ((grad * free) ** 2).sum()
     eye = torch.eye(rank, dtype=V.dtype, device=V.device)
     M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
     rhs = torch.where(free, grad, torch.zeros_like(grad))
@@ -468,7 +473,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
     X_new = X - expand(accepted) * B
     if axis == 1:
         V_new = V_new.T.contiguous()
-    return V_new, X_new, num_backtracks
+    return V_new, X_new, (num_backtracks, projected_gnorm2)
 
 
 def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
@@ -478,26 +483,39 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     prep = _nnal_prep(T)
     W, H = W_init, H_init
     X = W @ H
-    prev_loss = _nnal_rowwise(X, T, prep, 1).sum()
+    gnorm0 = None
     num_steps = 0
     for step in range(max_steps):
         X = W @ H                      # resynchronize against incremental drift
-        W, X, _ = block_newton_step(W, H, X, T, prep, 0, jitter_rel=jitter_rel)
+        W, X, info_W = block_newton_step(W, H, X, T, prep, 0, jitter_rel=jitter_rel)
+        gnorm2 = info_W[1]
         if update_H:
-            H, X, _ = block_newton_step(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
+            H, X, info_H = block_newton_step(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
+            gnorm2 = gnorm2 + info_H[1]
         num_steps = step + 1
         if rel_tol > 0 and num_steps % convergence_check_interval == 0:
-            loss = _nnal_rowwise(X, T, prep, 1).sum()   # free: X is already in hand
-            # Guard the denominator against prev_loss -> 0: on data that a rank
-            # `num_materials` model fits exactly, the shifted loss goes to zero and
-            # dividing by it makes the relative change diverge, so the test would
-            # never fire. Fall back to an absolute roundoff floor there.
-            floor = 8 * torch.finfo(T.dtype).eps * torch.abs(loss)
-            change = torch.abs(loss - prev_loss)
-            converged = bool(change <= floor) or bool(change <= rel_tol * torch.abs(prev_loss))
-            prev_loss = loss
-            if converged:
+            # Same KKT test joint_newton uses, so rel_tol means the same thing in
+            # both: the projected gradient relative to where it started. A test on
+            # the relative change in the loss cannot work here, because the NNAL is
+            # shifted so its minimum is zero -- on data a rank `num_materials`
+            # model fits exactly the denominator collapses and the ratio stays O(1)
+            # forever.
+            gnorm = gnorm2.sqrt()
+            if gnorm0 is None:
+                gnorm0 = gnorm
+            elif bool(gnorm <= rel_tol * gnorm0):
                 break
+            # Deliberately no stagnation heuristic here. A loss-based one is
+            # unusable: in float32 the loss sums about 5e6 elements to ~9e5, so its
+            # roundoff is around 0.9 -- coarser than the per-step progress from
+            # roughly step 70 onward, while the method is still genuinely
+            # descending (NNAL 898,854 -> 898,535 between steps 70 and 300). A
+            # gradient-based one is no better, because the projected gradient is
+            # not monotone: it rose from 1.44e-2 to 1.50e-2 between steps 100 and
+            # 150 before falling to 5.99e-3 by step 300, so any "no progress for k
+            # checks" rule fires on a plateau the method later escapes.
+            # This method converges linearly, so rel_tol and max_steps are the
+            # honest controls: a tight rel_tol will use the whole budget.
     return W, H, num_steps
 
 
@@ -529,8 +547,6 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
     total_cg = 0
     step = 0
     gnorm0 = None
-    stalled = 0
-    eps = torch.finfo(T.dtype).eps
     for step in range(1, max_steps + 1):
         X = W @ H
         G, Z = stable_nnal_derivatives(X, T, prep)
@@ -614,16 +630,13 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
             if lam > 1e6: break
             continue
         lam = max(lam * 0.3, 1e-14)
-        # Stagnation: the step bought less than the roundoff of the loss itself.
-        # Three in a row means we are at the precision floor, whatever the KKT
-        # residual says (the scale ambiguity W -> WM, H -> M^-1 H leaves an
-        # R^2-dimensional null space, so the gradient need not vanish outright).
-        stalled = stalled + 1 if (loss - new_loss) <= 8 * eps * torch.abs(new_loss) else 0
+        # No stagnation heuristic here either. At the precision floor the line
+        # search stops finding an acceptable step, which escalates the damping and
+        # terminates through the lam > 1e6 path above -- a real signal rather than
+        # a threshold on a quantity too noisy to threshold.
         W, H, loss = Wn, Hn, new_loss
         if verbose:
             print(f'  step {step:3d} cg {ncg:3d} a {a:.3g} loss {loss.item():.6e}', flush=True)
-        if stalled >= 3:
-            break
     return W, H, step, total_cg
 
 
@@ -665,7 +678,16 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
     """Factorize T into W and H by minimizing nonnegative attenuation loss."""
 
     if W_init.numel() == 0 and H_init.numel() == 0:
-        W_init, H_init = nndsvda(T, n_components=num_materials)
+        # Initialize in the ATTENUATION domain. The model is X = W @ H with
+        # X = -log(T), so seeding from a nonnegative factorization of T itself
+        # approximates the wrong quantity: T is not low rank when its logarithm
+        # is. Zero counts have unbounded attenuation, so they are floored at the
+        # most attenuated value actually observed rather than at the dtype limit,
+        # which would otherwise dominate the leading singular vectors.
+        positive = T > 0
+        floor = T[positive].min() if bool(positive.any()) else torch.ones((), dtype=T.dtype, device=T.device)
+        W_init, H_init = nndsvda(-torch.log(torch.where(positive, T, floor)),
+                                 n_components=num_materials)
     elif W_init.numel() == 0:
         # lstsq is unconstrained, so clamp before handing it to a nonnegative solver
         W_init = torch.linalg.lstsq(H_init.T, T.T)[0].T.clamp(min=0)
