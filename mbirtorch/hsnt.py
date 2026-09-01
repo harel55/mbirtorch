@@ -950,15 +950,13 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
 
     if noisy:
         # Generate noisy neutron counts from Poisson distribution
-        noisy_open_beam = np.random.poisson(noiseless_open_beam)
         noisy_object_scan = np.random.poisson(noiseless_object_scan)
     else:
         # Do not generate noisy data
-        noisy_open_beam = noiseless_open_beam
         noisy_object_scan = noiseless_object_scan
 
     # Generate noisy hyperspectral projection data
-    ratio = noisy_object_scan / noisy_open_beam
+    ratio = noisy_object_scan / noiseless_open_beam
     ratio[ratio < epsilon] = epsilon
     noisy_hyper_projection = -np.log(ratio)
 
