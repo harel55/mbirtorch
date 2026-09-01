@@ -95,6 +95,26 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
     return G, Z
 
 
+def _randomized_svd(X, n_components, n_oversamples=10, n_iter=4, seed=0):
+    """Truncated SVD via a randomized range finder.
+
+    A full SVD of an (n_samples, n_features) matrix is wasted work when only a
+    handful of components are wanted, and here n_components is the material count
+    -- rarely above 20 against a thousand or more wavelength bins. Seeded so the
+    result is reproducible.
+    """
+    n_rows, n_cols = X.shape
+    rank = min(n_components + n_oversamples, n_rows, n_cols)
+    generator = torch.Generator(device=X.device).manual_seed(seed)
+    Q, _ = torch.linalg.qr(X @ torch.randn(n_cols, rank, generator=generator,
+                                           dtype=X.dtype, device=X.device))
+    for _ in range(n_iter):                      # power iterations sharpen the range
+        Q, _ = torch.linalg.qr(X.T @ Q)
+        Q, _ = torch.linalg.qr(X @ Q)
+    U, singular_values, Vh = torch.linalg.svd(Q.T @ X, full_matrices=False)
+    return Q @ U, singular_values, Vh
+
+
 def nndsvda(X, n_components):
     """NNDSVDA initialization for X ~= W @ H.
 
@@ -109,10 +129,10 @@ def nndsvda(X, n_components):
     if X.ndim != 2:
         raise ValueError("X must be two-dimensional.")
 
-    U, singular_values, Vh = torch.linalg.svd(
-        X,
-        full_matrices=False,
-    )
+    if n_components + 10 < min(X.shape):
+        U, singular_values, Vh = _randomized_svd(X, n_components)
+    else:
+        U, singular_values, Vh = torch.linalg.svd(X, full_matrices=False)
 
     n_components = min(
         n_components,
@@ -716,27 +736,14 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
     # Randomly permute the pixel indices for batching
     batch_idxs = np.random.permutation(num_pixels)
 
-    # Factor a spectra for each batch
-    H_list = []
-    i_list = []
-    for batch in range(num_batches):
-        start_idx = batch * batch_size
-        end_idx = min((batch + 1) * batch_size, num_pixels)
-        T_batch = T[batch_idxs[start_idx:end_idx]]
-        _, H_batch, i = optimize(T_batch, **kwargs)
-        H_list.append(H_batch)
-        i_list.append(i)
-    i_total = sum(i_list)
-
-    # Factor the combined spectra to estimate a single spectra for all batches.
-    # sklearn needs a 2-D nonnegative numpy array, so stack along the row axis and
-    # bring it across; torch.stack would produce a 3-D tensor and sklearn raises.
-    H_combined = torch.cat(H_list, dim=0).clamp(min=0)
-    _, H, i = nmf(H_combined.detach().cpu().numpy().astype(np.float64),
-                  n_components=num_materials, max_iter=10000)
-    # sklearn hands back numpy; optimize() needs a tensor on T's device
-    H = torch.as_tensor(H, dtype=T.dtype, device=T.device)
-    i_total += i
+    # H is shared by every pixel and holds only num_materials * N_k values, so one
+    # batch determines it about as well as all of them do. Fit it once on a random
+    # subsample, then solve the per-pixel coefficients batch by batch with H held
+    # fixed -- that part is separable across pixels, so batching costs nothing but
+    # the loop. The previous version instead factored every batch, then factored
+    # the stacked spectra again with sklearn to reconcile them, which cost one full
+    # solve per batch and a host round trip.
+    _, H, i_total = optimize(T[batch_idxs[:batch_size]], **kwargs)
 
     # Compute material coefficients for each batch using the unified spectra
     W = torch.zeros((num_pixels, num_materials), dtype=T.dtype, device=T.device)
