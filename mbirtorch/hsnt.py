@@ -260,6 +260,169 @@ def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unu
 
     return W, H, 0.0
 
+def _nnal_rowwise(X, T, prep, dim):
+    """NNAL summed over `dim` only: per-pixel (dim=1) or per-wavelength (dim=0)."""
+    log_T, positive, all_positive, taylor_cutoff = prep
+    Xp = X + log_T
+    phi = torch.where(
+        torch.abs(Xp) < taylor_cutoff,
+        Xp * Xp * (0.5 + Xp * (-1.0 / 6.0 + Xp / 24.0)),
+        torch.expm1(-Xp) + Xp,
+    )
+    loss = T * phi
+    if not all_positive:
+        loss = torch.where(positive, loss, torch.exp(-Xp))
+    return loss.sum(dim=dim)
+
+
+def _batched_spd_solve(M, g, jitter_rel=1e-9):
+    """Solve M[b] d[b] = g[b] for a batch of small SPD matrices.
+
+    Tikhonov damping scaled to each matrix keeps the factorization well posed when
+    Z is near zero (heavily attenuated pixels), and the fallback is branch-free so
+    no host synchronization is introduced inside the iteration.
+    """
+    rank = M.shape[-1]
+    eye = torch.eye(rank, dtype=M.dtype, device=M.device)
+    diag = torch.diagonal(M, dim1=-2, dim2=-1)
+    lam = jitter_rel * diag.amax(-1).clamp_min(torch.finfo(M.dtype).tiny)
+    A = M + lam[:, None, None] * eye
+    L, info = torch.linalg.cholesky_ex(A)
+    failed = (info > 0)[:, None, None]
+    L = torch.where(failed, eye.expand_as(L), L)
+    d = torch.cholesky_solve(g.unsqueeze(-1), L).squeeze(-1)
+    diag_A = torch.diagonal(A, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny)
+    return torch.where(failed[:, :, 0], g / diag_A, d)
+
+
+def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
+    """One exact projected-Newton step on a single factor.
+
+    The NNAL is convex in X and X = W @ H is linear in each factor, so each block
+    subproblem is convex. It is also separable: with H fixed the problem splits
+    into one independent rank-dimensional problem per pixel, and with W fixed into
+    one per wavelength bin. That makes the full (not diagonal) Hessian affordable:
+    it is a batch of rank x rank matrices assembled by a single matmul against the
+    Khatri-Rao product of the fixed factor with itself.
+
+    Args:
+        V: Factor being updated. axis=0 -> W (pixels x rank); axis=1 -> H (rank x bins).
+        other: The fixed factor.
+        X: Current W @ H, kept incrementally so no extra matmul is needed.
+        T: Transmission ratio.
+        prep: Tuple from _nnal_prep(T).
+        axis: 0 to update W, 1 to update H.
+
+    Returns:
+        (V_new, X_new, num_backtracks)
+    """
+    log_T, positive, all_positive, taylor_cutoff = prep
+    G, Z = stable_nnal_derivatives(X, T, prep)
+
+    if axis == 0:
+        rank = V.shape[1]
+        grad = G @ other.T
+        rows, cols = torch.triu_indices(rank, rank, device=V.device)
+        flat = Z @ (other[rows] * other[cols]).T
+    else:
+        rank = V.shape[0]
+        rows, cols = torch.triu_indices(rank, rank, device=V.device)
+        flat = ((other[:, rows] * other[:, cols]).T @ Z).T
+        grad = (other.T @ G).T
+        V = V.T
+
+    M = flat.new_zeros(flat.shape[0], rank, rank)
+    M[:, rows, cols] = flat
+    M[:, cols, rows] = flat
+
+    # Two-metric projection: freeze the variables sitting on the V >= 0 boundary
+    # whose gradient pushes them further out, and Newton-step the rest.
+    free = ~((V <= 0) & (grad > 0))
+    eye = torch.eye(rank, dtype=V.dtype, device=V.device)
+    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
+    rhs = torch.where(free, grad, torch.zeros_like(grad))
+
+    d = _batched_spd_solve(M, rhs, jitter_rel)
+    d = torch.where(free, d, torch.zeros_like(d))
+
+    slope = (grad * d).sum(-1)
+    not_descent = (slope <= 0)[:, None]
+    diag = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
+    d = torch.where(not_descent, rhs / diag, d)
+    slope = (grad * d).sum(-1)
+
+    # Largest step that keeps V >= 0 exactly, so no projection is needed afterwards.
+    ratio = torch.where(d > 0, V / d.clamp_min(torch.finfo(V.dtype).tiny),
+                        torch.full_like(d, float('inf')))
+    alpha = torch.clamp(ratio.amin(-1), max=1.0)
+
+    # X(alpha) along the step is exactly X - alpha * B, so the line search is
+    # elementwise: no candidate factors and no extra matmuls are materialised.
+    if axis == 0:
+        B = d @ other
+        base = _nnal_rowwise(X, T, prep, 1)
+        expand = lambda a: a[:, None]
+    else:
+        B = other @ d.T
+        base = _nnal_rowwise(X, T, prep, 0)
+        expand = lambda a: a[None, :]
+
+    accepted = torch.zeros_like(alpha)
+    done = torch.zeros_like(alpha, dtype=torch.bool)
+    num_backtracks = 0
+    for _ in range(ls_max):
+        trial = torch.where(done, torch.zeros_like(alpha), alpha)
+        dim = 1 if axis == 0 else 0
+        # The Armijo decrease can fall below the roundoff of `base` itself,
+        # which in float32 makes the test fail spuriously and backtrack to the
+        # cap. Accept anything that is not measurably worse than the target.
+        noise = 8.0 * torch.finfo(V.dtype).eps * base.abs()
+        ok = (_nnal_rowwise(X - expand(trial) * B, T, prep, dim)
+              <= base - 1e-4 * trial * slope + noise) | (trial == 0)
+        accepted = torch.where(ok & ~done, trial, accepted)
+        done = done | ok
+        if bool(done.all()):
+            break
+        alpha = alpha * 0.5
+        num_backtracks += 1
+
+    V_new = (V - accepted[:, None] * d).clamp_(min=0.0)
+    X_new = X - expand(accepted) * B
+    if axis == 1:
+        V_new = V_new.T.contiguous()
+    return V_new, X_new, num_backtracks
+
+
+def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
+                          convergence_check_interval=1, W_init=None, H_init=None,
+                          jitter_rel=1e-9):
+    """Alternating exact projected-Newton minimization of the NNAL."""
+    prep = _nnal_prep(T)
+    W, H = W_init, H_init
+    X = W @ H
+    prev_loss = _nnal_rowwise(X, T, prep, 1).sum()
+    num_steps = 0
+    for step in range(max_steps):
+        X = W @ H                      # resynchronize against incremental drift
+        W, X, _ = block_newton_step(W, H, X, T, prep, 0, jitter_rel=jitter_rel)
+        if update_H:
+            H, X, _ = block_newton_step(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
+        num_steps = step + 1
+        if rel_tol > 0 and num_steps % convergence_check_interval == 0:
+            loss = _nnal_rowwise(X, T, prep, 1).sum()   # free: X is already in hand
+            # Guard the denominator against prev_loss -> 0: on data that a rank
+            # `num_materials` model fits exactly, the shifted loss goes to zero and
+            # dividing by it makes the relative change diverge, so the test would
+            # never fire. Fall back to an absolute roundoff floor there.
+            floor = 8 * torch.finfo(T.dtype).eps * torch.abs(loss)
+            change = torch.abs(loss - prev_loss)
+            converged = bool(change <= floor) or bool(change <= rel_tol * torch.abs(prev_loss))
+            prev_loss = loss
+            if converged:
+                break
+    return W, H, num_steps
+
+
 def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True,
              convergence_check_interval=1, W_init: torch.Tensor = torch.tensor([]),
              H_init: torch.Tensor = torch.tensor([])) -> torch.Tensor:
@@ -272,6 +435,11 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         W_init = torch.linalg.lstsq(H_init.T, T.T)[0].T.clamp(min=0)
     elif H_init.numel() == 0:
         H_init = torch.linalg.lstsq(W_init, T)[0].clamp(min=0)
+
+    if update is block_newton_optimize:
+        return block_newton_optimize(T, num_materials, max_steps, rel_tol,
+                                     update_H=update_H, W_init=W_init, H_init=H_init,
+                                     convergence_check_interval=convergence_check_interval)
 
     prep = _nnal_prep(T)
     W, H, aux = (W_init, H_init, 0.001)
@@ -299,10 +467,13 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
         update = multiplicative_update
     elif method == 'quadratic':
         update = quadratic_update
+    elif method == 'block_newton':
+        update = block_newton_optimize
     else:
-        raise ValueError("Invalid method. Choose 'quasi_newton' or 'mann_multiplicative'.")
+        raise ValueError("Invalid method. Choose 'block_newton', 'quasi_newton', "
+                         "'mann_multiplicative' or 'quadratic'.")
 
-    if compile_mode is not None:
+    if compile_mode is not None and update is not block_newton_optimize:
         compile_options = {
             "triton.cudagraphs": False,
             "max_autotune": compile_mode == "max-autotune",
