@@ -185,7 +185,7 @@ def nndsvda(X, n_components):
     return W, H
 
 
-def quadratic_update(W, H, T, prep=None, update_H=True):
+def quadratic_update(W, H, T, unused=None, update_H=True, prep=None):
     """Iteratively reweighted multiplicative update for the NNAL.
 
     The second-order model of the NNAL at the current iterate X is
@@ -217,13 +217,14 @@ def quadratic_update(W, H, T, prep=None, update_H=True):
         W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
         H: Spectral basis matrix (num_materials × spectral channels), PyTorch tensor
         T: Data term matrix (spatial pixels × spectral channels), PyTorch tensor
-        prep: Optional tuple from _nnal_prep(T).
+        unused: Placeholder for auxiliary state (not used by this method).
         update_H: If False, keep H fixed and only update W.
+        prep: Optional tuple from _nnal_prep(T).
 
     Returns:
         Updated (W, H) pair as PyTorch tensors
     """
-    prep = _nnal_prep(T) if not isinstance(prep, tuple) else prep
+    prep = _nnal_prep(T) if prep is None else prep
     tiny = torch.finfo(T.dtype).tiny
 
     X = W @ H
@@ -241,10 +242,10 @@ def quadratic_update(W, H, T, prep=None, update_H=True):
         H = H * ((W.T @ ZV.clamp(min=0))
                  / (W.T @ (Z * X) + W.T @ (-ZV).clamp(min=0)).clamp(min=tiny))
 
-    return W, H, prep
+    return W, H, 0.0
 
 
-def newton_update(W, H, T, lr_init, update_H=True):
+def newton_update(W, H, T, lr_init, update_H=True, prep=None):
     """PyTorch-optimized Newton update with automatic differentiation and line search.
 
     Args:
@@ -258,8 +259,8 @@ def newton_update(W, H, T, lr_init, update_H=True):
         Updated (W, H) pair as PyTorch tensors
     """
     X = W @ H
-    G, Z = stable_nnal_derivatives(X, T)
-    init_loss = stable_nnal(X, T)
+    G, Z = stable_nnal_derivatives(X, T, prep)
+    init_loss = stable_nnal(X, T, prep)
 
     # Compute gradients
     grad_W = G @ H.T
@@ -282,7 +283,7 @@ def newton_update(W, H, T, lr_init, update_H=True):
         H_candidates = H.expand(learning_rates.shape[0], -1, -1)
 
     X_candidates = torch.bmm(W_candidates, H_candidates)
-    candidate_losses = stable_nnal(X_candidates, T)
+    candidate_losses = stable_nnal(X_candidates, T, prep)
     directional_derivatives = (
         torch.sum(grad_W[None] * (W_candidates - W[None]), dim=(1, 2))
         + torch.sum(grad_H[None] * (H_candidates - H[None]), dim=(1, 2))
@@ -297,7 +298,8 @@ def newton_update(W, H, T, lr_init, update_H=True):
         learning_rates.index_select(0, best_index).squeeze(0),
     )
 
-def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unused: torch.Tensor, update_H: bool = True):
+def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unused: torch.Tensor = None,
+                          update_H: bool = True, prep=None):
     """PyTorch-optimized multiplicative update for non-negative factorization.
 
     Args:
@@ -680,7 +682,10 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
     prev_loss = stable_nnal(W @ H, T, prep)
     num_steps = 0
     for i in range(max_steps):
-        W, H, aux = update(W, H, T, aux, update_H=update_H)
+        # prep is threaded in rather than rebuilt inside `update`: it holds a
+        # Python bool, and recomputing it inside a torch.compile region forces a
+        # graph break on the .all() that produces it.
+        W, H, aux = update(W, H, T, aux, update_H=update_H, prep=prep)
         num_steps = i + 1
         # Only evaluate the loss when it is actually needed: it costs a
         # (pixels x rank x bins) matmul plus a full elementwise pass.
