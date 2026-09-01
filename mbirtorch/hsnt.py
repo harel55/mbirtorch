@@ -331,7 +331,14 @@ def _batched_spd_solve(M, g, jitter_rel=1e-9):
     L = torch.where(failed, eye.expand_as(L), L)
     d = torch.cholesky_solve(g.unsqueeze(-1), L).squeeze(-1)
     diag_A = torch.diagonal(A, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny)
-    return torch.where(failed[:, :, 0], g / diag_A, d)
+    d = torch.where(failed[:, :, 0], g / diag_A, d)
+    # A row carrying no curvature at all -- Z underflowed to zero across the whole
+    # row, which happens in float32 once the attenuation exceeds ~88 -- leaves the
+    # damping underflowed too, so the fallback divides by `tiny` and overflows.
+    # There is no second-order information to act on there, so take no step and
+    # let the gradient-driven steps of later iterations bring the iterate back
+    # into range.
+    return torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
@@ -384,10 +391,20 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
     d = _batched_spd_solve(M, rhs, jitter_rel)
     d = torch.where(free, d, torch.zeros_like(d))
 
+    # Trust region, per row. The feasibility clamp below only bounds directions
+    # that drive a factor toward zero; nothing bounds one that grows it. A row
+    # whose Z has underflowed to zero (float32 loses exp(-X) past X ~ 88) carries
+    # no curvature, so the damped solve returns a direction of order 1/tiny --
+    # large but finite, so it survives every non-finite check and only overflows
+    # on the next matmul. Keeping the step within the scale of the row itself
+    # costs nothing when the Hessian is healthy.
+    limit = 16.0 * V.abs().amax(-1, keepdim=True).clamp_min(torch.finfo(V.dtype).eps)
+    d = torch.clamp(d, min=-limit, max=limit)
+
     slope = (grad * d).sum(-1)
     not_descent = (slope <= 0)[:, None]
     diag = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
-    d = torch.where(not_descent, rhs / diag, d)
+    d = torch.where(not_descent, torch.clamp(rhs / diag, min=-limit, max=limit), d)
     slope = (grad * d).sum(-1)
 
     # Largest step that keeps V >= 0 exactly, so no projection is needed afterwards.
@@ -518,6 +535,11 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         def precond(rW, rH):
             zW = torch.cholesky_solve(rW.unsqueeze(-1), LW).squeeze(-1) * fW
             zH = torch.cholesky_solve(rH.T.unsqueeze(-1), LH).squeeze(-1).T * fH
+            # Same degeneracy as in _batched_spd_solve: rows with no curvature can
+            # make the preconditioner overflow. Fall back to the unpreconditioned
+            # residual there rather than poisoning CG with a non-finite direction.
+            zW = torch.where(torch.isfinite(zW), zW, rW)
+            zH = torch.where(torch.isfinite(zH), zH, rH)
             return zW, zH
 
         def hvp(dW, dH):
