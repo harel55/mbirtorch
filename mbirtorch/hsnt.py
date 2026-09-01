@@ -268,24 +268,28 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
     if W_init.numel() == 0 and H_init.numel() == 0:
         W_init, H_init = nndsvda(T, n_components=num_materials)
     elif W_init.numel() == 0:
-        W_init = torch.linalg.lstsq(H_init.T, T.T)[0].T
+        # lstsq is unconstrained, so clamp before handing it to a nonnegative solver
+        W_init = torch.linalg.lstsq(H_init.T, T.T)[0].T.clamp(min=0)
     elif H_init.numel() == 0:
-        H_init = torch.linalg.lstsq(W_init, T)[0]
+        H_init = torch.linalg.lstsq(W_init, T)[0].clamp(min=0)
 
-    prev_loss = stable_nnal(W_init @ H_init, T)
-    W, H, prev_loss, aux = (W_init, H_init, prev_loss, 0.001)
+    prep = _nnal_prep(T)
+    W, H, aux = (W_init, H_init, 0.001)
+    prev_loss = stable_nnal(W @ H, T, prep)
+    num_steps = 0
     for i in range(max_steps):
         W, H, aux = update(W, H, T, aux, update_H=update_H)
-        loss_new = stable_nnal(W @ H, T)
-        # print(f"Iteration {i+1}: Initial Loss = {prev_loss}, New Loss = {loss_new}, Diff = {prev_loss - loss_new}")
-        if rel_tol > 0 and (i+1) % convergence_check_interval == 0:
+        num_steps = i + 1
+        # Only evaluate the loss when it is actually needed: it costs a
+        # (pixels x rank x bins) matmul plus a full elementwise pass.
+        if rel_tol > 0 and num_steps % convergence_check_interval == 0:
+            loss_new = stable_nnal(W @ H, T, prep)
             converged = torch.abs(loss_new - prev_loss) / (prev_loss + 1e-30) < rel_tol
+            prev_loss = loss_new
             if converged:
-                prev_loss = loss_new
                 break
-        prev_loss = loss_new
 
-    return W, H, i+1
+    return W, H, num_steps
 
 def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, max_steps=1000,
                        rel_tol=1e-10, batch_size=None, compile_mode=None, **kwargs) -> torch.Tensor:
@@ -336,13 +340,18 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
         i_list.append(i)
     i_total = sum(i_list)
 
-    # Factor the combined spectra to estimate a single spectra for all batches
-    H_combined = torch.stack(H_list)
-    _, H, i = nmf(H_combined, n_components=num_materials, max_iter=10000)
+    # Factor the combined spectra to estimate a single spectra for all batches.
+    # sklearn needs a 2-D nonnegative numpy array, so stack along the row axis and
+    # bring it across; torch.stack would produce a 3-D tensor and sklearn raises.
+    H_combined = torch.cat(H_list, dim=0).clamp(min=0)
+    _, H, i = nmf(H_combined.detach().cpu().numpy().astype(np.float64),
+                  n_components=num_materials, max_iter=10000)
+    # sklearn hands back numpy; optimize() needs a tensor on T's device
+    H = torch.as_tensor(H, dtype=T.dtype, device=T.device)
     i_total += i
 
     # Compute material coefficients for each batch using the unified spectra
-    W = torch.zeros((num_pixels, num_materials), dtype=T.dtype)
+    W = torch.zeros((num_pixels, num_materials), dtype=T.dtype, device=T.device)
     for batch in range(num_batches):
         start_idx = batch * batch_size
         end_idx = min((batch + 1) * batch_size, num_pixels)
