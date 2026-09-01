@@ -185,7 +185,35 @@ def nndsvda(X, n_components):
     return W, H
 
 
-def quadratic_update(W, H, T, unused=None, update_H=True, prep=None):
+def _shifted(V, ratio, shift, mode, mean_dim):
+    """V <- max((V + d) * ratio - d, 0), the shifted multiplicative step.
+
+    A plain multiplicative update cannot revive an entry that reaches exactly
+    zero, since 0 * anything = 0. On the demo problem 5.5% of W starts at zero
+    and that fraction never moves over 6000 iterations, even though 1.77% of all
+    entries are zero with a NEGATIVE gradient -- not KKT points, just frozen.
+
+    The offset does not bias the answer. Expanding gives V*ratio + d*(ratio - 1),
+    so an interior fixed point needs (ratio - 1)(V + d) = 0, and V + d > 0 forces
+    ratio = 1; a zero entry stays zero only while d*(ratio - 1) <= 0, i.e.
+    ratio <= 1. Both updates are built so ratio > 1 exactly when the gradient is
+    negative, so the fixed-point set is {V >= 0, grad >= 0, V*grad = 0} -- the KKT
+    set -- for every d > 0. No decay schedule is needed for correctness.
+
+    mode='boundary' offsets only entries currently at zero, leaving the interior
+    step bit-for-bit the original update. mode='const' offsets everything, which
+    converges faster but rides on the raw ratio, so an undamped ratio needs a cap.
+    """
+    if shift <= 0:
+        return V * ratio
+    scale = shift * V.mean(dim=mean_dim, keepdim=True).clamp_min(torch.finfo(V.dtype).tiny)
+    if mode == 'boundary':
+        scale = torch.where(V <= 0, scale.expand_as(V), torch.zeros_like(V))
+    return (V * ratio + scale * (ratio - 1.0)).clamp_(min=0)
+
+
+def quadratic_update(W, H, T, unused=None, update_H=True, prep=None,
+                     shift=1e-1, shift_mode='boundary', ratio_max=2.0):
     """Iteratively reweighted multiplicative update for the NNAL.
 
     The second-order model of the NNAL at the current iterate X is
@@ -230,8 +258,14 @@ def quadratic_update(W, H, T, unused=None, update_H=True, prep=None):
     X = W @ H
     G, Z = stable_nnal_derivatives(X, T, prep)
     ZV = Z * X - G
-    W = W * ((ZV.clamp(min=0) @ H.T)
+    # This ratio is undamped and can be very large. shift_mode='const' rides on it
+    # for every entry and diverges to NaN within a few hundred iterations without a
+    # cap; 'boundary' only offsets entries already at zero and is safe uncapped, so
+    # the cap is applied only where it is needed and never alters the plain update.
+    cap = ratio_max if (shift > 0 and shift_mode == 'const') else float('inf')
+    ratio = ((ZV.clamp(min=0) @ H.T)
              / ((Z * X) @ H.T + (-ZV).clamp(min=0) @ H.T).clamp(min=tiny))
+    W = _shifted(W, ratio.clamp(max=cap), shift, shift_mode, 0)
 
     if update_H:
         # Relinearize before the H step: the model is only second order accurate
@@ -239,8 +273,9 @@ def quadratic_update(W, H, T, unused=None, update_H=True, prep=None):
         X = W @ H
         G, Z = stable_nnal_derivatives(X, T, prep)
         ZV = Z * X - G
-        H = H * ((W.T @ ZV.clamp(min=0))
+        ratio = ((W.T @ ZV.clamp(min=0))
                  / (W.T @ (Z * X) + W.T @ (-ZV).clamp(min=0)).clamp(min=tiny))
+        H = _shifted(H, ratio.clamp(max=cap), shift, shift_mode, 1)
 
     return W, H, 0.0
 
@@ -299,7 +334,7 @@ def newton_update(W, H, T, lr_init, update_H=True, prep=None):
     )
 
 def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unused: torch.Tensor = None,
-                          update_H: bool = True, prep=None):
+                          update_H: bool = True, prep=None, shift=1e-2, shift_mode='const'):
     """PyTorch-optimized multiplicative update for non-negative factorization.
 
     Args:
@@ -315,9 +350,12 @@ def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unu
     damping_factor = 0.5
     Z = torch.exp(-W @ H)
 
-    W *= ((Z @ H.T) / torch.clip(T @ H.T, min=1e-30)) ** damping_factor
+    # The damped ratio is well behaved, so no cap is needed here.
+    W = _shifted(W, ((Z @ H.T) / torch.clip(T @ H.T, min=1e-30)) ** damping_factor,
+                 shift, shift_mode, 0)
     if update_H:
-        H *= ((W.T @ Z) / torch.clip(W.T @ T, min=1e-30)) ** damping_factor
+        H = _shifted(H, ((W.T @ Z) / torch.clip(W.T @ T, min=1e-30)) ** damping_factor,
+                     shift, shift_mode, 1)
 
     return W, H, 0.0
 
