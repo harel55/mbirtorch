@@ -472,8 +472,16 @@ def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unu
 
     return W, H, 0.0
 
-def _nnal_rowwise(X, T, prep, dim):
-    """NNAL summed over `dim` only: per-pixel (dim=1) or per-wavelength (dim=0)."""
+def _nnal_rowwise(X, T, prep, dim, dtype=None):
+    """NNAL summed over `dim` only: per-pixel (dim=1) or per-wavelength (dim=0).
+
+    dtype is the accumulation dtype of the sum. A per-bin sum over P pixels in
+    float32 has an ulp of 0.06 near 1e6 and 8 near 1e8, so an H step that improves
+    a bin's loss by less than that is invisible to a line search -- a ceiling on H
+    accuracy that worsens linearly with P. Summing in float64 removes it. What
+    remains is the float32 truncation of the elementwise terms, which the line
+    search's noise floor (_ARMIJO_FLOOR) accounts for.
+    """
     log_T, positive, all_positive, taylor_cutoff = prep
     Xp = X + log_T
     phi = torch.where(
@@ -484,7 +492,7 @@ def _nnal_rowwise(X, T, prep, dim):
     loss = T * phi
     if not all_positive:
         loss = torch.where(positive, loss, torch.exp(-Xp))
-    return loss.sum(dim=dim)
+    return loss.sum(dim=dim, dtype=dtype)
 
 
 def _batched_spd_solve(M, g, jitter_rel=1e-9):
@@ -515,6 +523,18 @@ def _batched_spd_solve(M, g, jitter_rel=1e-9):
 
 
 _COMPILED_KERNELS = {}
+# Armijo noise floor, as a multiple of eps32 * |row loss|. A decrease smaller than
+# this is not trusted, because elements whose step alpha*B falls below ulp(X) do
+# not move at all in float32, so the measured decrease is a biased truncation that
+# scales linearly with the row length (NOT a random walk: dividing by sqrt(n)
+# re-created the spurious-backtracking pathology, 757 backtracks per 60 steps).
+# With the row sums accumulated in float64 the constant can drop from 8 to 4:
+# backtracks per 60 block steps at c = 0.5/1/2/4/8 were 650/468/160/27/15 at
+# P=4096 and 543/473/236/48/15 at P=16384, with the converged loss identical to
+# the last digit in every case. Halving the floor halves the loss slop the H-step
+# is allowed at large P -- the noise ball in which H wandered at 43.8 dB on 9.4M
+# pixels -- for about half an extra loss evaluation per step.
+_ARMIJO_FLOOR = 4.0
 
 
 def _kernels(compile_mode):
@@ -650,11 +670,11 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     # elementwise: no candidate factors and no extra matmuls are materialised.
     if axis == 0:
         B = d @ other
-        base = rowwise(X, T, prep, 1)
+        base = rowwise(X, T, prep, 1, dtype=torch.float64)
         expand = lambda a: a[:, None]
     else:
         B = other @ d.T
-        base = rowwise(X, T, prep, 0)
+        base = rowwise(X, T, prep, 0, dtype=torch.float64)
         expand = lambda a: a[None, :]
 
     accepted = torch.zeros_like(alpha)
@@ -663,11 +683,12 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     for _ in range(ls_max):
         trial = torch.where(done, torch.zeros_like(alpha), alpha)
         dim = 1 if axis == 0 else 0
-        # The Armijo decrease can fall below the roundoff of `base` itself,
-        # which in float32 makes the test fail spuriously and backtrack to the
-        # cap. Accept anything that is not measurably worse than the target.
-        noise = 8.0 * torch.finfo(V.dtype).eps * base.abs()
-        ok = (rowwise(X - expand(trial) * B, T, prep, dim)
+        # The Armijo decrease can fall below the float32 resolution of the row
+        # loss, which makes the test fail spuriously and backtrack to the cap.
+        # Accept anything that is not measurably worse than the target; the
+        # size of "measurably" is discussed at _ARMIJO_FLOOR.
+        noise = _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * base.abs()
+        ok = (rowwise(X - expand(trial) * B, T, prep, dim, dtype=torch.float64)
               <= base - 1e-4 * trial * slope + noise) | (trial == 0)
         accepted = torch.where(ok & ~done, trial, accepted)
         done = done | ok
@@ -691,7 +712,7 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     prep = _nnal_prep(T)
     W, H = W_init, H_init
     X = W @ H
-    prev_loss = rowwise(X, T, prep, 1).sum(dtype=torch.float64)
+    prev_loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
     gnorm0 = None
     num_steps = 0
     for step in range(max_steps):
@@ -718,7 +739,7 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
             # relative to the gradient at the START, so a better initialization
             # makes the same rel_tol a stricter target: at dosage 100 the default
             # init ran 4x longer than a poor one for an identical loss.
-            loss = rowwise(X, T, prep, 1).sum(dtype=torch.float64)
+            loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
             gnorm = gnorm2.sqrt()
             if gnorm0 is None:
                 gnorm0 = gnorm
@@ -917,7 +938,7 @@ def _h_stats_accumulate(W, H, T, prep, rows, cols, deriv, rowwise):
     """
     X = W @ H
     G, Z = deriv(X, T, prep)
-    return W.T @ G, (W[:, rows] * W[:, cols]).T @ Z, rowwise(X, T, prep, 0)
+    return W.T @ G, (W[:, rows] * W[:, cols]).T @ Z, rowwise(X, T, prep, 0, dtype=torch.float64)
 
 
 def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
@@ -953,7 +974,7 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
 
 def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384,
                          w_rel_tol=1e-8, w_max_steps=300, ls_trials=4, device='cuda',
-                         compile_mode=None, random_state=0, verbose=False):
+                         compile_mode=None, random_state=0, verbose=False, polish_dtype=None):
     """Factorize a dataset too large for device memory, one chunk at a time.
 
     Args:
@@ -966,6 +987,12 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         rel_tol: Stop polishing when a pass changes the total loss by less than
             this, relatively (float64 sum).
         warmup_pixels: Pixels drawn from the leading chunks to fit H initially.
+        polish_dtype: If set (e.g. torch.float64), the polish passes run in that
+            dtype -- chunks, W and H are cast on the way in -- while the warm-up
+            stays in the chunks' native dtype. On an H100, whose kernels here are
+            memory-bound, float64 costs about 2x; it is insurance against a
+            float32 elementwise ceiling on H at very large P. The accumulated
+            statistics are float64 regardless.
 
     Returns:
         (W_chunks, H, passes): W as a list of CPU tensors aligned with `chunks`.
@@ -999,25 +1026,31 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
     _, H, _ = nnal_factorization(T_sub, method='joint_newton', num_materials=R, max_steps=300,
                                  rel_tol=1e-6, compile_mode=compile_mode, random_state=random_state)
     del T_sub
+    if polish_dtype is not None:
+        H = H.to(polish_dtype)
     rows, cols = torch.triu_indices(R, R, device=H.device)
     prev_loss = None
     passes = 0
 
     def to_device(c):
-        return c.pin_memory().to(device, non_blocking=True) if c.device.type == 'cpu' else c
+        c = c.pin_memory().to(device, non_blocking=True) if c.device.type == 'cpu' else c
+        return c if polish_dtype is None else c.to(polish_dtype)
 
     for p in range(max_passes + 1):
         # ---- pass A: solve W per chunk with H fixed, accumulate H statistics
-        grad = torch.zeros_like(H)
-        flat = H.new_zeros(rows.numel(), H.shape[1])
-        base = H.new_zeros(H.shape[1])
+        # Accumulate across chunks in float64 whatever the working dtype: these are
+        # sums over every pixel, and the per-bin loss in particular must resolve
+        # H improvements far smaller than the float32 ulp of a sum near 1e8.
+        grad = torch.zeros(H.shape, dtype=torch.float64, device=H.device)
+        flat = torch.zeros(rows.numel(), H.shape[1], dtype=torch.float64, device=H.device)
+        base = torch.zeros(H.shape[1], dtype=torch.float64, device=H.device)
         nxt = to_device(chunks[0])
         for i in range(len(chunks)):
             Tc = nxt
             if i + 1 < len(chunks):
                 nxt = to_device(chunks[i + 1])            # prefetch overlaps the solve below
             prep = _nnal_prep(Tc)
-            kw = dict(W_init=W_chunks[i].to(device)) if W_chunks[i] is not None else {}
+            kw = dict(W_init=W_chunks[i].to(device=device, dtype=H.dtype)) if W_chunks[i] is not None else {}
             W, _, _ = nnal_factorization(Tc, method='block_newton', num_materials=R, max_steps=w_max_steps,
                                          rel_tol=w_rel_tol, update_H=False, H_init=H.clone(),
                                          compile_mode=compile_mode, **kw)
@@ -1035,11 +1068,11 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             break
 
         # ---- one exact Newton step on H from the accumulated statistics
-        d, slope, alpha_max = _h_direction(H, grad, flat, rows, cols)
+        d, slope, alpha_max = _h_direction(H, grad.to(H.dtype), flat.to(H.dtype), rows, cols)
         alphas = alpha_max[None, :] * (0.5 ** torch.arange(ls_trials, dtype=H.dtype, device=H.device))[:, None]
 
         # ---- pass B: per-bin loss at every trial step, accumulated over chunks
-        trial = H.new_zeros(ls_trials, H.shape[1])
+        trial = torch.zeros(ls_trials, H.shape[1], dtype=torch.float64, device=H.device)
         nxt = to_device(chunks[0])
         for i in range(len(chunks)):
             Tc = nxt
@@ -1050,10 +1083,12 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             X = W @ H
             B = W @ d.T
             for t in range(ls_trials):
-                trial[t] += rowwise(X - alphas[t][None, :] * B, Tc, prep, 0)
+                trial[t] += rowwise(X - alphas[t][None, :] * B, Tc, prep, 0, dtype=torch.float64)
             del Tc, W, X, B
-        noise = 8.0 * torch.finfo(H.dtype).eps * base.abs()
-        ok = trial <= base[None, :] - 1e-4 * alphas * slope[None, :] + noise[None, :]   # Armijo, per bin and trial
+        # Same floor as block_newton_step (see _ARMIJO_FLOOR): the float32 sums are
+        # gone, but elements whose step falls below ulp(X) still do not move.
+        noise = _ARMIJO_FLOOR * torch.finfo(H.dtype).eps * base.abs()
+        ok = trial <= base[None, :] - 1e-4 * alphas.double() * slope.double()[None, :] + noise[None, :]   # Armijo, per bin and trial
         # largest accepted trial per bin, else zero
         accepted = torch.where(ok.any(0), alphas.gather(0, ok.float().argmax(0, keepdim=True)).squeeze(0), torch.zeros_like(alpha_max))
         H = (H.T - accepted[:, None] * d).clamp_(min=0).T.contiguous()
