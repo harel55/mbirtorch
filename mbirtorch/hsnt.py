@@ -613,6 +613,18 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     d = _batched_spd_solve(M, rhs, jitter_rel)
     d = torch.where(free, d, torch.zeros_like(d))
 
+    # An entry sitting at zero with a NEGATIVE gradient violates KKT and must move
+    # inward. It is in the free set, but the coupled Newton direction for it can
+    # still point outward (d > 0 here means V decreases), and the max-feasible-step
+    # rule below would then zero the step for the whole row -- one such entry
+    # pins all R of its neighbours, and a component that lands there stays dead.
+    # Two-metric projection proper uses the scaled gradient for bound-adjacent
+    # variables, so do that: d = grad / diag(M) < 0 moves the entry off the
+    # bound. Interior entries keep the full Newton direction.
+    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
+    inward = (V <= 0) & (grad < 0)
+    d = torch.where(inward, grad / diag_M, d)
+
     # Trust region, per row. The feasibility clamp below only bounds directions
     # that drive a factor toward zero; nothing bounds one that grows it. A row
     # whose Z has underflowed to zero (float32 loses exp(-X) past X ~ 88) carries
@@ -689,6 +701,10 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
         if update_H:
             H, X, info_H = step_fn(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
             gnorm2 = gnorm2 + info_H[1]
+            # A component dead in BOTH factors has a zero Hessian block and zero
+            # gradient in either step -- no Newton or gradient move reaches it.
+            # Same remedy as the multiplicative update: re-seed it.
+            W, H = _reseed_dead(W, H)
         num_steps = step + 1
         if rel_tol > 0 and num_steps % convergence_check_interval == 0:
             # rel_tol is the relative change in the loss between checks, the same
