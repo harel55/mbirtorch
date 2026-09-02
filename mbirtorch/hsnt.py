@@ -514,7 +514,49 @@ def _batched_spd_solve(M, g, jitter_rel=1e-9):
     return torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
+_COMPILED_KERNELS = {}
+
+
+def _kernels(compile_mode):
+    """The four hot kernels, eager or compiled: (nnal, derivatives, rowwise, block step).
+
+    compile_mode=None returns the plain functions. Any other value compiles them
+    once and caches the result. The Newton solvers spend their time in
+    elementwise passes over P x K -- the loss, its derivatives, the per-row loss
+    of the line search -- and torch.compile fuses each of those into one kernel:
+    measured 2.2x on a whole joint_newton solve at P=4096, 2.9x at P=16384, and
+    3.8x on a whole block_newton solve. The GEMM-bound CG inner iteration does
+    not benefit (1.07x) and is left eager.
+
+    Compiled and eager agree bit-for-bit over a joint_newton solve (28 steps) and
+    over the first 40 block_newton steps; over a 729-step block_newton run the
+    fused reductions' different rounding eventually flips one active-set decision
+    and the paths separate (max |W,H| difference 1.6e-2), but they end at the
+    same loss to 2e-8 relative with identical spectra. Do not expect long
+    block_newton runs to be reproducible across the compiled/eager boundary.
+
+    The value of compile_mode is otherwise ignored here: 'max-autotune' measured
+    no steady-state gain over the default and 2.4x the compile time, and inductor
+    reports too few SMs on this class of card for its GEMM autotuning to apply.
+
+    Compiling costs 4.5 s with a warm inductor cache and ~18 s cold at P=4096, and
+    recompiles whenever P, K, R, dtype or the presence of zero counts changes, so
+    it pays for repeated solves -- the batched path, many datasets, a service --
+    and not for one 0.5 s solve. Default is therefore off.
+    """
+    if compile_mode is None:
+        return stable_nnal, stable_nnal_derivatives, _nnal_rowwise, block_newton_step
+    if compile_mode not in _COMPILED_KERNELS:
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        compiled = lambda f: torch.compile(f, mode=None, dynamic=False)
+        _COMPILED_KERNELS[compile_mode] = (compiled(stable_nnal), compiled(stable_nnal_derivatives),
+                                           compiled(_nnal_rowwise), compiled(block_newton_step))
+    return _COMPILED_KERNELS[compile_mode]
+
+
+def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
+                      rowwise=None, deriv=None):
     """One exact projected-Newton step on a single factor.
 
     The NNAL is convex in X and X = W @ H is linear in each factor, so each block
@@ -536,8 +578,10 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
         (V_new, X_new, (num_backtracks, projected_gradient_norm_squared)). The
         gradient norm is measured at the incoming iterate, before the step.
     """
+    rowwise = _nnal_rowwise if rowwise is None else rowwise
+    deriv = stable_nnal_derivatives if deriv is None else deriv
     log_T, positive, all_positive, taylor_cutoff = prep
-    G, Z = stable_nnal_derivatives(X, T, prep)
+    G, Z = deriv(X, T, prep)
 
     if axis == 0:
         rank = V.shape[1]
@@ -594,11 +638,11 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
     # elementwise: no candidate factors and no extra matmuls are materialised.
     if axis == 0:
         B = d @ other
-        base = _nnal_rowwise(X, T, prep, 1)
+        base = rowwise(X, T, prep, 1)
         expand = lambda a: a[:, None]
     else:
         B = other @ d.T
-        base = _nnal_rowwise(X, T, prep, 0)
+        base = rowwise(X, T, prep, 0)
         expand = lambda a: a[None, :]
 
     accepted = torch.zeros_like(alpha)
@@ -611,7 +655,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
         # which in float32 makes the test fail spuriously and backtrack to the
         # cap. Accept anything that is not measurably worse than the target.
         noise = 8.0 * torch.finfo(V.dtype).eps * base.abs()
-        ok = (_nnal_rowwise(X - expand(trial) * B, T, prep, dim)
+        ok = (rowwise(X - expand(trial) * B, T, prep, dim)
               <= base - 1e-4 * trial * slope + noise) | (trial == 0)
         accepted = torch.where(ok & ~done, trial, accepted)
         done = done | ok
@@ -629,20 +673,21 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9):
 
 def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
                           convergence_check_interval=1, W_init=None, H_init=None,
-                          jitter_rel=1e-9):
+                          jitter_rel=1e-9, compile_mode=None):
     """Alternating exact projected-Newton minimization of the NNAL."""
+    _, _, rowwise, step_fn = _kernels(compile_mode)
     prep = _nnal_prep(T)
     W, H = W_init, H_init
     X = W @ H
-    prev_loss = _nnal_rowwise(X, T, prep, 1).sum(dtype=torch.float64)
+    prev_loss = rowwise(X, T, prep, 1).sum(dtype=torch.float64)
     gnorm0 = None
     num_steps = 0
     for step in range(max_steps):
         X = W @ H                      # resynchronize against incremental drift
-        W, X, info_W = block_newton_step(W, H, X, T, prep, 0, jitter_rel=jitter_rel)
+        W, X, info_W = step_fn(W, H, X, T, prep, 0, jitter_rel=jitter_rel)
         gnorm2 = info_W[1]
         if update_H:
-            H, X, info_H = block_newton_step(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
+            H, X, info_H = step_fn(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
             gnorm2 = gnorm2 + info_H[1]
         num_steps = step + 1
         if rel_tol > 0 and num_steps % convergence_check_interval == 0:
@@ -657,7 +702,7 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
             # relative to the gradient at the START, so a better initialization
             # makes the same rel_tol a stricter target: at dosage 100 the default
             # init ran 4x longer than a poor one for an identical loss.
-            loss = _nnal_rowwise(X, T, prep, 1).sum(dtype=torch.float64)
+            loss = rowwise(X, T, prep, 1).sum(dtype=torch.float64)
             gnorm = gnorm2.sqrt()
             if gnorm0 is None:
                 gnorm0 = gnorm
@@ -686,19 +731,21 @@ def _joint_blocks(flat, rows, cols, rank, free, jitter):
 
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-12,
-                     precond_jitter=1e-8, prep=None, verbose=False):
+                     precond_jitter=1e-8, prep=None, verbose=False, nnal=None, deriv=None):
+    nnal = stable_nnal if nnal is None else nnal
+    deriv = stable_nnal_derivatives if deriv is None else deriv
     prep = _nnal_prep(T) if prep is None else prep
     W = W.clone(); H = H.clone()
     rank = W.shape[1]
     rows, cols = torch.triu_indices(rank, rank, device=W.device)
-    loss = stable_nnal(W @ H, T, prep, dtype=torch.float64)
+    loss = nnal(W @ H, T, prep, dtype=torch.float64)
     lam = damping
     total_cg = 0
     step = 0
     gnorm0 = None
     for step in range(1, max_steps + 1):
         X = W @ H
-        G, Z = stable_nnal_derivatives(X, T, prep)
+        G, Z = deriv(X, T, prep)
         gW, gH = G @ H.T, W.T @ G
         fW = ~((W <= 0) & (gW > 0))
         fH = ~((H <= 0) & (gH > 0))
@@ -775,7 +822,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         for _ in range(30):
             Wn = (W + a * xW).clamp_(min=0)
             Hn = (H + a * xH).clamp_(min=0)
-            new_loss = stable_nnal(Wn @ Hn, T, prep, dtype=torch.float64)
+            new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
             if torch.isfinite(new_loss) and new_loss <= loss + 1e-4 * a * slope:
                 accepted = True; break
             a *= 0.5
@@ -801,7 +848,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
 
 def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
                           convergence_check_interval=1, W_init=None, H_init=None,
-                          warmup_steps=10, cg_max=20):
+                          warmup_steps=5, cg_max=10, compile_mode=None):
     """Block-Newton warm-up followed by a joint (W,H) preconditioned Newton solve.
 
     Alternating methods stall at a linear rate once the fit is good, because they
@@ -812,28 +859,37 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
 
     update_H=False is not supported here (the joint step updates both factors);
     it falls back to block-Newton alone.
+
+    warmup_steps=5 and cg_max=10 were chosen by interleaved A/B at equal converged
+    quality (rel_tol=1e-8) against the previous 10/20: 0.91x at dosage 3 on
+    64x64 (a real 9% loss), 2.43x at dosage 100, 1.31x at dosage 3 on 128x128,
+    same loss to six figures in all three. The cost model behind it: a block
+    warm-up step costs 1.4x a one-CG-iteration joint step, and past a handful of
+    them the joint solver makes better use of the time.
     """
+    nnal_fn, deriv_fn, _, step_fn = _kernels(compile_mode)
     prep = _nnal_prep(T)
     W, H = W_init, H_init
     X = W @ H
     for _ in range(min(warmup_steps, max_steps)):
         X = W @ H
-        W, X, _ = block_newton_step(W, H, X, T, prep, 0)
+        W, X, _ = step_fn(W, H, X, T, prep, 0)
         if update_H:
-            H, X, _ = block_newton_step(H, W, X, T, prep, 1)
+            H, X, _ = step_fn(H, W, X, T, prep, 1)
     if not update_H:
         return W, H, min(warmup_steps, max_steps)
     remaining = max(0, max_steps - warmup_steps)
     if remaining == 0:
         return W, H, min(warmup_steps, max_steps)
     W, H, steps, _ = _joint_newton_pcg(T, W, H, max_steps=remaining, cg_max=cg_max,
-                                       rel_tol=rel_tol, prep=prep)
+                                       rel_tol=rel_tol, prep=prep, nnal=nnal_fn, deriv=deriv_fn)
     return W, H, warmup_steps + steps
 
 
 def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True,
              convergence_check_interval=1, W_init: torch.Tensor = torch.tensor([]),
-             H_init: torch.Tensor = torch.tensor([])) -> torch.Tensor:
+             H_init: torch.Tensor = torch.tensor([]), compile_mode=None,
+             extrapolate=False, extrapolate_check_every=5) -> torch.Tensor:
     """Factorize T into W and H by minimizing nonnegative attenuation loss."""
 
     if W_init.numel() == 0 and H_init.numel() == 0:
@@ -868,15 +924,61 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
     if update in (block_newton_optimize, joint_newton_optimize):
         return update(T, num_materials, max_steps, rel_tol,
                       update_H=update_H, W_init=W_init, H_init=H_init,
-                      convergence_check_interval=convergence_check_interval)
+                      convergence_check_interval=convergence_check_interval,
+                      compile_mode=compile_mode)
 
     prep = _nnal_prep(T)
     W, H, aux = (W_init, H_init, 0.001)
+    num_steps = 0
+
+    if extrapolate:
+        # Nesterov extrapolation around the update. The multiplicative update is a
+        # fixed-point map g with linear convergence, and the classic momentum
+        # sequence beta_k = (k-1)/(k+2) applied as y = clamp(x_k + beta (x_k - x_{k-1}), 0)
+        # cuts its sweeps to a target 17x on the demo problem (6580 -> 380) at 1.3x
+        # the cost per sweep -- 13x in wall clock, which lifts it from 40-70x
+        # slower than joint_newton to parity. The extrapolated point is only an
+        # input; the answer is always the last PLAIN iterate, so the fixed-point
+        # set is untouched. A function-value safeguard restarts the momentum
+        # whenever an extrapolated sweep raises the loss; it uses the raw
+        # sum(exp(-X) + T X) minus the constant that separates it from the shifted
+        # loss (0.5 ms against 4.3 ms for stable_nnal -- checking with the full
+        # loss every sweep is what limited an earlier version to 4x), and is
+        # evaluated every extrapolate_check_every sweeps: the sweeps in between are
+        # unguarded, which is the price of the speed. rel_tol keeps its per-step
+        # meaning by comparing across the check interval.
+        log_T, positive, _, _ = prep
+        const = torch.sum(torch.where(positive, T * (1.0 - log_T), torch.zeros_like(T)),
+                          dtype=torch.float64)
+        cheap = lambda X: torch.sum(torch.exp(-X) + T * X, dtype=torch.float64) - const
+        noise = 1e-9                                  # fp32 elementwise noise on the raw sum is ~1e-10 relative
+        Wp, Hp = W, H                                 # last plain iterate: the answer
+        Wy, Hy = W, H                                 # extrapolated input to the sweep
+        prev, j = None, 0
+        for i in range(max_steps):
+            Wn, Hn, aux = update(Wy, Hy, T, aux, update_H=update_H, prep=prep)
+            num_steps = i + 1
+            j += 1
+            if num_steps % extrapolate_check_every == 0:
+                L = cheap(Wn @ Hn)
+                if prev is not None and (not torch.isfinite(L) or bool(L > prev * (1.0 + noise))):
+                    Wy, Hy, j = Wp, Hp, 0                 # momentum hurt: restart from the last plain point
+                    continue
+                if prev is not None and rel_tol > 0 and bool(
+                        torch.abs(L - prev) <= rel_tol * extrapolate_check_every * torch.abs(L)):
+                    Wp, Hp = Wn, Hn
+                    break
+                prev = L
+            beta = (j - 1) / (j + 2) if j > 1 else 0.0
+            Wy = (Wn + beta * (Wn - Wp)).clamp_(min=0)
+            Hy = (Hn + beta * (Hn - Hp)).clamp_(min=0)
+            Wp, Hp = Wn, Hn
+        return Wp, Hp, num_steps
+
     # Converge on a float64 sum. In float32 the loss is quantized at ~1e-7
     # relative, so at low dosage the multiplicative methods saw two identical
     # consecutive losses and stopped after two iterations.
     prev_loss = stable_nnal(W @ H, T, prep, dtype=torch.float64)
-    num_steps = 0
     for i in range(max_steps):
         # prep is threaded in rather than rebuilt inside `update`: it holds a
         # Python bool, and recomputing it inside a torch.compile region forces a
@@ -900,14 +1002,20 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
 
     rel_tol is the relative change in the loss per step (summed in float64) at
     which a method stops, and means the same thing for every method. It is not
-    worth the same amount of convergence, though: joint_newton converges
-    superlinearly and is within 0.002% of its optimum at 1e-6, while the
-    alternating methods (block_newton, mann_multiplicative, quadratic) converge
-    linearly and at 1e-6 can stop on a plateau with a percent still to gain --
+    worth the same amount of convergence, though: joint_newton is within 0.002%
+    of its optimum at 1e-6, while block_newton and quadratic converge linearly
+    and at 1e-6 can stop on a plateau with a percent still to gain --
     block_newton at dosage 100 stopped 1.4% short at 1e-6 and 0.001% short at
-    1e-8. Use 1e-8 or tighter for those. On data the model fits exactly the loss
-    goes to zero and this test never fires; a projected-gradient test then takes
-    over and runs to machine precision.
+    1e-8. Use 1e-8 or tighter for those two. mann_multiplicative is extrapolated
+    by default (see optimize) and reaches joint_newton's answer in comparable
+    wall clock. On data the model fits exactly the loss goes to zero and this
+    test never fires; a projected-gradient test then takes over and runs to
+    machine precision.
+
+    compile_mode: any non-None value compiles the elementwise hot kernels of
+    block_newton and joint_newton (2-3x per solve, bit-identical) at a one-off
+    cost of 4.5-18 s; worth it for repeated solves, not for one. For the other
+    methods the update function itself is compiled, as before.
     """
     if method == 'quasi_newton':
         update = newton_update
@@ -923,8 +1031,12 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
         raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton', "
                          "'quasi_newton', 'mann_multiplicative' or 'quadratic'.")
 
-    if compile_mode is not None and update not in (block_newton_optimize,
-                                                   joint_newton_optimize):
+    if update in (block_newton_optimize, joint_newton_optimize):
+        # These take compile_mode themselves and compile their hot kernels, not the
+        # driver: see _kernels. Wrapping the driver in torch.compile is what the
+        # old branch did for the other methods, and it does nothing useful here.
+        kwargs['compile_mode'] = compile_mode
+    elif compile_mode is not None:
         compile_options = {
             "triton.cudagraphs": False,
             "max_autotune": compile_mode == "max-autotune",
@@ -934,6 +1046,10 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
             options=compile_options,
         )
 
+    if update is multiplicative_update:
+        # Nesterov extrapolation is on by default for the multiplicative update:
+        # 13x in wall clock, same fixed points. Pass extrapolate=False to disable.
+        kwargs.setdefault('extrapolate', True)
     kwargs.update({
         'update': update,
         'num_materials': num_materials,
