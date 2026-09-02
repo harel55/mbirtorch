@@ -334,7 +334,8 @@ def newton_update(W, H, T, lr_init, update_H=True, prep=None):
     )
 
 def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unused: torch.Tensor = None,
-                          update_H: bool = True, prep=None, shift=1e-2, shift_mode='const'):
+                          update_H: bool = True, prep=None, shift=1e-2, shift_mode='const',
+                          ratio_max=2.0):
     """PyTorch-optimized multiplicative update for non-negative factorization.
 
     Args:
@@ -350,11 +351,16 @@ def multiplicative_update(W: torch.Tensor, H: torch.Tensor, T: torch.Tensor, unu
     damping_factor = 0.5
     Z = torch.exp(-W @ H)
 
-    # The damped ratio is well behaved, so no cap is needed here.
-    W = _shifted(W, ((Z @ H.T) / torch.clip(T @ H.T, min=1e-30)) ** damping_factor,
+    # Damping alone does not bound this ratio. At very low dosage T is almost all
+    # zeros, so T @ H.T reaches the 1e-30 clip and the ratio reaches ~1e15; the
+    # shifted step's offset term d*(ratio - 1) then overflows to NaN within one
+    # iteration. Cap it wherever the shifted step rides on the raw ratio. shift=0
+    # is left uncapped so it stays bit-for-bit the original update.
+    cap = ratio_max if (shift > 0 and shift_mode == 'const') else float('inf')
+    W = _shifted(W, (((Z @ H.T) / torch.clip(T @ H.T, min=1e-30)) ** damping_factor).clamp(max=cap),
                  shift, shift_mode, 0)
     if update_H:
-        H = _shifted(H, ((W.T @ Z) / torch.clip(W.T @ T, min=1e-30)) ** damping_factor,
+        H = _shifted(H, (((W.T @ Z) / torch.clip(W.T @ T, min=1e-30)) ** damping_factor).clamp(max=cap),
                      shift, shift_mode, 1)
 
     return W, H, 0.0
