@@ -997,7 +997,8 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
     return W, H, num_steps
 
 def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, max_steps=1000,
-                       rel_tol=1e-10, batch_size=None, compile_mode=None, **kwargs) -> torch.Tensor:
+                       rel_tol=1e-10, batch_size=None, compile_mode=None, random_state=0,
+                       **kwargs) -> torch.Tensor:
     """Factorize T ~= exp(-W @ H), W, H >= 0, by minimizing the non-negative attenuation loss.
 
     rel_tol is the relative change in the loss per step (summed in float64) at
@@ -1016,6 +1017,12 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
     block_newton and joint_newton (2-3x per solve, bit-identical) at a one-off
     cost of 4.5-18 s; worth it for repeated solves, not for one. For the other
     methods the update function itself is compiled, as before.
+
+    random_state seeds the pixel permutation the batched path uses to choose the
+    subsample H is fitted on. It defaults to 0 so two batched runs on the same
+    data give the same answer; pass None for fresh entropy each call. Left
+    unseeded, block_newton took 318 steps in one run and 565 in the next on
+    identical data, which made the batched path impossible to benchmark.
     """
     if method == 'quasi_newton':
         update = newton_update
@@ -1063,8 +1070,8 @@ def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, 
     num_pixels = T.shape[0]
     num_batches = int(np.ceil(num_pixels / batch_size))
 
-    # Randomly permute the pixel indices for batching
-    batch_idxs = np.random.permutation(num_pixels)
+    # Randomly permute the pixel indices for batching, reproducibly by default
+    batch_idxs = np.random.default_rng(random_state).permutation(num_pixels)
 
     # H is shared by every pixel and holds only num_materials * N_k values, so one
     # batch determines it about as well as all of them do. Fit it once on a random
