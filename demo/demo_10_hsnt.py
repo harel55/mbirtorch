@@ -60,7 +60,7 @@ def main():
     # Spoof simulated projection data which is not returned by generate_hyper_data
     height = detector_rows // 3
     width = detector_columns // 2
-    thickness = 20 * np.sqrt((width//2)**2 - np.linspace(-width // 2, width // 2, width)**2)/ width
+    thickness = 20 * np.sqrt((width//2)**2 - np.linspace(-(width // 2), width // 2, width)**2)/ width
     material_projection = np.zeros((num_angles, detector_rows, detector_columns, num_materials_true))
     material_projection[:, :height, width // 2:width + width // 2, 0] = material_density["Ni"] * thickness
     material_projection[:, 2 * height:, width // 2:width + width // 2, 1] = material_density["Cu"] * thickness

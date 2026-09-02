@@ -1696,7 +1696,10 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     # Generate simulated projection data for 3 materials (Ni, Cu, and Al)
     height = detector_rows // 3
     width = detector_columns // 2
-    thickness = 20 * np.sqrt((width//2)**2 - np.linspace(-width // 2, width // 2, width)**2)/ width
+    # -(width // 2), not -width // 2: Python floors, so for odd width the latter
+    # is one further from zero than width // 2, the range is asymmetric, and the
+    # square root goes negative at one end (NaN -> zeroed thickness). Bit at 91x91.
+    thickness = 20 * np.sqrt((width//2)**2 - np.linspace(-(width // 2), width // 2, width)**2)/ width
     material_projection = np.zeros((num_angles, detector_rows, detector_columns, number_of_materials), dtype=material_basis.dtype)
     material_projection[:, :height, width // 2:width + width // 2, 0] = material_density["Ni"] * thickness
     material_projection[:, 2 * height:, width // 2:width + width // 2, 1] = material_density["Cu"] * thickness
