@@ -535,6 +535,15 @@ _COMPILED_KERNELS = {}
 # is allowed at large P -- the noise ball in which H wandered at 43.8 dB on 9.4M
 # pixels -- for about half an extra loss evaluation per step.
 _ARMIJO_FLOOR = 4.0
+# Trust-region floor as a fraction of the mean row scale (0 -> machine epsilon, the old behaviour).
+_TRUST_FLOOR = 1e-3
+# epsilon-active set (Bertsekas): a component within this fraction of the mean row
+# scale of zero, with a gradient pushing it out, is treated as AT the bound and
+# snapped to exactly zero. Without it a component that hit the feasibility limit
+# lands at V - (V/d)*d, a residue of ~1e-17 V in float64 (1e-112 later) that is
+# formally free: the row's shared step length min(V/d) is then ~0 and the whole
+# row freezes at a non-stationary point. float32 rounds the same residue to 0.
+_ACTIVE_TOL = 1e-6
 
 
 def _kernels(compile_mode):
@@ -621,7 +630,9 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
 
     # Two-metric projection: freeze the variables sitting on the V >= 0 boundary
     # whose gradient pushes them further out, and Newton-step the rest.
-    free = ~((V <= 0) & (grad > 0))
+    eps_active = _ACTIVE_TOL * V.abs().amax(-1, keepdim=True).mean()
+    bound = (V <= eps_active) & (grad > 0)
+    free = ~bound
     # The projected gradient is the KKT residual for this block, and it is already
     # in hand here; returning it lets the driver test convergence without paying
     # for a second derivative evaluation.
@@ -642,7 +653,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     # variables, so do that: d = grad / diag(M) < 0 moves the entry off the
     # bound. Interior entries keep the full Newton direction.
     diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
-    inward = (V <= 0) & (grad < 0)
+    inward = (V <= eps_active) & (grad < 0)
     d = torch.where(inward, grad / diag_M, d)
 
     # Trust region, per row. The feasibility clamp below only bounds directions
@@ -652,7 +663,15 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     # large but finite, so it survives every non-finite check and only overflows
     # on the next matmul. Keeping the step within the scale of the row itself
     # costs nothing when the Hessian is healthy.
-    limit = 16.0 * V.abs().amax(-1, keepdim=True).clamp_min(torch.finfo(V.dtype).eps)
+    # The floor is at the problem's scale, not machine epsilon. A row pinned
+    # near zero -- values of 1e-112 occur in float64 -- can only grow 16x per
+    # step, and the loss-based stopping rule fires during that crawl: a float64
+    # W solve stopped with a projected gradient 3e5 times the float32 one. In
+    # float32 eps (1.2e-7 against rows of 0.08) happened to be a workable floor.
+    # From 1e-3 of the mean row scale any row recovers in two or three steps.
+    row_max = V.abs().amax(-1, keepdim=True)
+    floor = torch.clamp(_TRUST_FLOOR * row_max.mean(), min=torch.finfo(V.dtype).eps)
+    limit = 16.0 * torch.maximum(row_max, floor)
     d = torch.clamp(d, min=-limit, max=limit)
 
     slope = (grad * d).sum(-1)
@@ -698,6 +717,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
         num_backtracks += 1
 
     V_new = (V - accepted[:, None] * d).clamp_(min=0.0)
+    V_new = torch.where(bound, torch.zeros_like(V_new), V_new)
     X_new = X - expand(accepted) * B
     if axis == 1:
         V_new = V_new.T.contiguous()
@@ -955,15 +975,19 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
     M = flat.new_zeros(flat.shape[1], rank, rank)
     M[:, rows, cols] = flat.T
     M[:, cols, rows] = flat.T
-    free = ~((V <= 0) & (g > 0))
+    eps_active = _ACTIVE_TOL * V.abs().amax(-1, keepdim=True).mean()
+    bound = (V <= eps_active) & (g > 0)
+    free = ~bound
     eye = torch.eye(rank, dtype=V.dtype, device=V.device)
     M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
     rhs = torch.where(free, g, torch.zeros_like(g))
     d = _batched_spd_solve(M, rhs, jitter_rel)
     d = torch.where(free, d, torch.zeros_like(d))
     diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
-    d = torch.where((V <= 0) & (g < 0), g / diag_M, d)
-    limit = 16.0 * V.abs().amax(-1, keepdim=True).clamp_min(torch.finfo(V.dtype).eps)
+    d = torch.where((V <= eps_active) & (g < 0), g / diag_M, d)
+    row_max = V.abs().amax(-1, keepdim=True)
+    floor = torch.clamp(_TRUST_FLOOR * row_max.mean(), min=torch.finfo(V.dtype).eps)   # same floor as block_newton_step
+    limit = 16.0 * torch.maximum(row_max, floor)
     d = torch.clamp(d, min=-limit, max=limit)
     slope = (g * d).sum(-1)
     d = torch.where((slope <= 0)[:, None], torch.clamp(rhs / diag_M, min=-limit, max=limit), d)
@@ -974,7 +998,8 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
 
 def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384,
                          w_rel_tol=1e-8, w_max_steps=300, ls_trials=4, device='cuda',
-                         compile_mode=None, random_state=0, verbose=False, polish_dtype=None):
+                         compile_mode=None, random_state=0, verbose=False, polish_dtype=None,
+                         kkt_tol=None, stats=None):
     """Factorize a dataset too large for device memory, one chunk at a time.
 
     Args:
@@ -993,6 +1018,15 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             memory-bound, float64 costs about 2x; it is insurance against a
             float32 elementwise ceiling on H at very large P. The accumulated
             statistics are float64 regardless.
+        kkt_tol: If set, also stop once the relative KKT residual of H,
+            ||P(grad_H L)||_F / ||W^T T||_F with P the projection onto the
+            feasible directions, falls below it. The residual is scale-free and
+            independent of the initialization. rel_tol alone can stop inside a
+            precision plateau: at millions of pixels per bin the line search
+            cannot accept an improvement below its noise floor, the loss stops
+            changing, and H is still measurably non-stationary. The residual
+            tells the two apart, and the run says so when it stops that way.
+        stats: Optional dict; receives 'loss' and 'kkt' lists, one entry per pass.
 
     Returns:
         (W_chunks, H, passes): W as a list of CPU tensors aligned with `chunks`.
@@ -1044,6 +1078,7 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         grad = torch.zeros(H.shape, dtype=torch.float64, device=H.device)
         flat = torch.zeros(rows.numel(), H.shape[1], dtype=torch.float64, device=H.device)
         base = torch.zeros(H.shape[1], dtype=torch.float64, device=H.device)
+        scale = torch.zeros(H.shape, dtype=torch.float64, device=H.device)     # W^T T, the gradient's natural scale
         nxt = to_device(chunks[0])
         for i in range(len(chunks)):
             Tc = nxt
@@ -1056,12 +1091,24 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
                                          compile_mode=compile_mode, **kw)
             W_chunks[i] = W.cpu()
             g_c, f_c, b_c = _h_stats_accumulate(W, H, Tc, prep, rows, cols, deriv, rowwise)
-            grad += g_c; flat += f_c; base += b_c
+            grad += g_c; flat += f_c; base += b_c; scale += (W.T @ Tc).to(torch.float64)
             del Tc, W
         loss = base.sum(dtype=torch.float64)
+        # Projected gradient: where H is zero only a negative gradient (a wish to grow) counts.
+        pg = torch.where(H > 0, grad, grad.clamp(max=0))
+        kkt = (pg.norm() / scale.norm()).item()
+        if stats is not None:
+            stats.setdefault('loss', []).append(loss.item()); stats.setdefault('kkt', []).append(kkt)
         if verbose:
-            print(f'  pass {p}: full-data loss {loss.item():.6e}', flush=True)
+            print(f'  pass {p}: full-data loss {loss.item():.6e}  KKT residual {kkt:.2e}', flush=True)
+        if kkt_tol is not None and kkt <= kkt_tol:
+            if verbose:
+                print(f'  H is stationary to {kkt_tol:g}', flush=True)
+            break
         if prev_loss is not None and rel_tol > 0 and bool(torch.abs(loss - prev_loss) <= rel_tol * torch.abs(loss)):
+            if verbose and kkt_tol is not None:
+                print(f'  loss stalled with KKT residual {kkt:.2e} > {kkt_tol:g}: the line search is at its '
+                      f'precision floor in {H.dtype}; polish_dtype=torch.float64 lowers it', flush=True)
             break
         prev_loss = loss
         if p == max_passes:
@@ -1091,7 +1138,12 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         ok = trial <= base[None, :] - 1e-4 * alphas.double() * slope.double()[None, :] + noise[None, :]   # Armijo, per bin and trial
         # largest accepted trial per bin, else zero
         accepted = torch.where(ok.any(0), alphas.gather(0, ok.float().argmax(0, keepdim=True)).squeeze(0), torch.zeros_like(alpha_max))
-        H = (H.T - accepted[:, None] * d).clamp_(min=0).T.contiguous()
+        Ht = (H.T - accepted[:, None] * d).clamp_(min=0)
+        # Same epsilon-active snap as block_newton_step: a bin component at the
+        # bound with an outward gradient becomes exactly zero, not a residue.
+        eps_active = _ACTIVE_TOL * Ht.abs().amax(-1, keepdim=True).mean()
+        Ht = torch.where((Ht <= eps_active) & (grad.T.to(Ht.dtype) > 0), torch.zeros_like(Ht), Ht)
+        H = Ht.T.contiguous()
         passes = p + 1
     return W_chunks, H, passes
 
