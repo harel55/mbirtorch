@@ -32,7 +32,7 @@ def _nnal_prep(T):
     return log_T, positive, all_positive, taylor_cutoff
 
 
-def stable_nnal(X, T, prep=None):
+def stable_nnal(X, T, prep=None, dtype=None):
     """
     Compute a shifted form of the non-negative attentuation loss
     that is much more numerically stable
@@ -42,6 +42,11 @@ def stable_nnal(X, T, prep=None):
         T: Measured transmission ratio (counts / open beam).
         prep: Optional tuple from _nnal_prep(T). Pass it inside an iteration to
             avoid recomputing log(T) on every call.
+        dtype: Accumulation dtype for the final sum. Defaults to X's dtype. Pass
+            torch.float64 when the value drives a convergence test: in float32 a
+            loss near 3e6 has a resolution of 0.25, so two consecutive losses that
+            differ by less than that compare equal and a relative-change test
+            fires spuriously.
     """
     log_T, positive, all_positive, taylor_cutoff = _nnal_prep(T) if prep is None else prep
 
@@ -61,7 +66,7 @@ def stable_nnal(X, T, prep=None):
         # float64, so reconstructing it as expm1(-Xp) + 1 underflows to zero.
         loss = torch.where(positive, loss, torch.exp(-Xp))
 
-    return torch.sum(loss, dim=(-2, -1))
+    return torch.sum(loss, dim=(-2, -1), dtype=dtype)
 
 
 def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
@@ -115,12 +120,26 @@ def _randomized_svd(X, n_components, n_oversamples=10, n_iter=4, seed=0):
     return Q @ U, singular_values, Vh
 
 
-def nndsvda(X, n_components):
-    """NNDSVDA initialization for X ~= W @ H.
+def nndsvda(X, n_components, fill='small'):
+    """NNDSVD initialization for X ~= W @ H, with zeros filled.
+
+    Every component after the first is one sign-half of a singular vector pair,
+    so roughly half its entries are zero. Zeros are poison for multiplicative
+    updates, which can never move an entry off zero, so they are filled.
+
+    Classic NNDSVDA fills them with the mean of X. That is only sensible when the
+    zeros are few and X is well scaled; when a component is essentially noise --
+    its singular value sits in the noise tail -- half its entries are zero, and
+    the fill dominates it. If X also carries a handful of huge entries the mean
+    is huge and the fill puts mean^2 into the product for every such component.
+    The default here fills with a hundredth of the mean instead (sklearn's
+    'nndsvdar' without the randomness), which keeps entries nonzero for the
+    multiplicative updates without letting the fill carry weight of its own.
 
     Args:
         X: Nonnegative array of shape (n_samples, n_features).
         n_components: Factorization rank.
+        fill: 'small' (default) fills zeros with mean(X)/100; 'mean' is classic NNDSVDA.
 
     Returns:
         W: Shape (n_samples, n_components).
@@ -177,8 +196,7 @@ def nndsvda(X, n_components):
         W[:, component] = scale * selected_u
         H[component, :] = scale * selected_v
 
-    # NNDSVDA replaces zero entries with the mean of X.
-    fill_value = torch.mean(X)
+    fill_value = torch.mean(X) * (1.0 if fill == 'mean' else 1e-2)
     W = torch.where(W == 0, fill_value, W)
     H = torch.where(H == 0, fill_value, H)
 
@@ -789,13 +807,25 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         # Initialize in the ATTENUATION domain. The model is X = W @ H with
         # X = -log(T), so seeding from a nonnegative factorization of T itself
         # approximates the wrong quantity: T is not low rank when its logarithm
-        # is. Zero counts have unbounded attenuation, so they are floored at the
-        # most attenuated value actually observed rather than at the dtype limit,
-        # which would otherwise dominate the leading singular vectors.
-        positive = T > 0
-        floor = T[positive].min() if bool(positive.any()) else torch.ones((), dtype=T.dtype, device=T.device)
-        W_init, H_init = nndsvda(-torch.log(torch.where(positive, T, floor)),
-                                 n_components=num_materials)
+        # is.
+        #
+        # Zero counts need a floor, and it matters what it is. A zero count only
+        # says the attenuation exceeds that of the faintest pixel that did
+        # register -- so it is floored at half a count relative to the smallest
+        # genuine transmission, i.e. -log(T_min_real) + log 2. Upstream code
+        # marks zero counts with a tiny positive value (1e-30), and flooring THERE
+        # gives attenuation 69: at dosage_rate=1 half the entries are then 69 and
+        # the mean is 34.5, which the initialization's zero-fill smears into every
+        # component, putting X above 2000 where no attenuation exceeds 1. Any
+        # transmission below 1e-12 is treated as a zero count; no real measurement
+        # gets anywhere near that.
+        real = T > 1e-12
+        if bool(real.any()) and not bool(real.all()):
+            floor = 0.5 * T[real].min()
+            T_for_init = torch.where(real, T, floor)
+        else:
+            T_for_init = T.clamp_min(torch.finfo(T.dtype).tiny)
+        W_init, H_init = nndsvda(-torch.log(T_for_init), n_components=num_materials)
     elif W_init.numel() == 0:
         # lstsq is unconstrained, so clamp before handing it to a nonnegative solver
         W_init = torch.linalg.lstsq(H_init.T, T.T)[0].T.clamp(min=0)
@@ -809,7 +839,10 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
 
     prep = _nnal_prep(T)
     W, H, aux = (W_init, H_init, 0.001)
-    prev_loss = stable_nnal(W @ H, T, prep)
+    # Converge on a float64 sum. In float32 the loss is quantized at ~1e-7
+    # relative, so at low dosage the multiplicative methods saw two identical
+    # consecutive losses and stopped after two iterations.
+    prev_loss = stable_nnal(W @ H, T, prep, dtype=torch.float64)
     num_steps = 0
     for i in range(max_steps):
         # prep is threaded in rather than rebuilt inside `update`: it holds a
@@ -820,7 +853,7 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         # Only evaluate the loss when it is actually needed: it costs a
         # (pixels x rank x bins) matmul plus a full elementwise pass.
         if rel_tol > 0 and num_steps % convergence_check_interval == 0:
-            loss_new = stable_nnal(W @ H, T, prep)
+            loss_new = stable_nnal(W @ H, T, prep, dtype=torch.float64)
             converged = torch.abs(loss_new - prev_loss) / (prev_loss + 1e-30) < rel_tol
             prev_loss = loss_new
             if converged:
