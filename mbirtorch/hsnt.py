@@ -120,26 +120,45 @@ def _randomized_svd(X, n_components, n_oversamples=10, n_iter=4, seed=0):
     return Q @ U, singular_values, Vh
 
 
-def nndsvda(X, n_components, fill='small'):
+def nndsvda(X, n_components, fill='sqrt', fill_scale=1.0):
     """NNDSVD initialization for X ~= W @ H, with zeros filled.
 
     Every component after the first is one sign-half of a singular vector pair,
     so roughly half its entries are zero. Zeros are poison for multiplicative
     updates, which can never move an entry off zero, so they are filled.
 
-    Classic NNDSVDA fills them with the mean of X. That is only sensible when the
-    zeros are few and X is well scaled; when a component is essentially noise --
-    its singular value sits in the noise tail -- half its entries are zero, and
-    the fill dominates it. If X also carries a handful of huge entries the mean
-    is huge and the fill puts mean^2 into the product for every such component.
-    The default here fills with a hundredth of the mean instead (sklearn's
-    'nndsvdar' without the randomness), which keeps entries nonzero for the
-    multiplicative updates without letting the fill carry weight of its own.
+    The fill value has to be chosen at the scale of a FACTOR entry, not of X.
+    Each factor carries sqrt(s_k), so a typical W or H entry is of order
+    sqrt(mean X) and their product is of order mean X. A fill of f in both
+    factors therefore contributes f^2 to the product where both were filled.
+
+      fill = mean X       (classic NNDSVDA)  -> f^2 = (mean X)^2, which only
+                          matches the data when mean X ~ 1. At mean X = 34.5
+                          it put 1190 into every noise component.
+      fill = mean X / 100                    -> f^2 = (mean X)^2 / 1e4. Safe
+                          against overshoot but so small that block_newton's
+                          two-metric projection froze the filled entries at
+                          zero and converged in a reduced subspace, 0.6% worse.
+      fill = c * sqrt(mean X)  (default)     -> f^2 = c^2 * mean X: a fixed
+                          fraction c^2 of a typical entry, whatever the scale of
+                          X. Dimensionally right and scale-free.
+
+    c = 1 was chosen by measurement, not by taste. block_newton's two-metric
+    projection freezes any entry it drives to zero, and a fill it can push there
+    in one step costs a component: at dosage_rate=3 the loss it reaches improves
+    monotonically with the fill, 904,026 at mean/100, 902,547 at c=0.1, 900,323
+    at c=0.3, 898,850 at classic mean, 898,514 at c=1 -- the last within 0.001% of
+    the joint solver. The multiplicative and joint solvers are indifferent to c
+    across that whole range. The price is an initial X that can exceed the data
+    by up to 2x where fills coincide; that is bounded and scale-free, unlike the
+    35x of classic NNDSVDA on a badly floored matrix, and no solver minds it.
 
     Args:
         X: Nonnegative array of shape (n_samples, n_features).
         n_components: Factorization rank.
-        fill: 'small' (default) fills zeros with mean(X)/100; 'mean' is classic NNDSVDA.
+        fill: 'sqrt' (default) fills zeros with fill_scale * sqrt(mean X);
+            'mean' is classic NNDSVDA; 'small' is mean X / 100.
+        fill_scale: multiplier for the 'sqrt' fill. Defaults to 1.0.
 
     Returns:
         W: Shape (n_samples, n_components).
@@ -196,7 +215,13 @@ def nndsvda(X, n_components, fill='small'):
         W[:, component] = scale * selected_u
         H[component, :] = scale * selected_v
 
-    fill_value = torch.mean(X) * (1.0 if fill == 'mean' else 1e-2)
+    mean = torch.mean(X)
+    if fill == 'mean':
+        fill_value = mean
+    elif fill == 'small':
+        fill_value = mean * 1e-2
+    else:
+        fill_value = fill_scale * torch.sqrt(mean.clamp_min(0))
     W = torch.where(W == 0, fill_value, W)
     H = torch.where(H == 0, fill_value, H)
 
@@ -609,6 +634,7 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     prep = _nnal_prep(T)
     W, H = W_init, H_init
     X = W @ H
+    prev_loss = _nnal_rowwise(X, T, prep, 1).sum(dtype=torch.float64)
     gnorm0 = None
     num_steps = 0
     for step in range(max_steps):
@@ -620,28 +646,25 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
             gnorm2 = gnorm2 + info_H[1]
         num_steps = step + 1
         if rel_tol > 0 and num_steps % convergence_check_interval == 0:
-            # Same KKT test joint_newton uses, so rel_tol means the same thing in
-            # both: the projected gradient relative to where it started. A test on
-            # the relative change in the loss cannot work here, because the NNAL is
-            # shifted so its minimum is zero -- on data a rank `num_materials`
-            # model fits exactly the denominator collapses and the ratio stays O(1)
-            # forever.
+            # rel_tol is the relative change in the loss between checks, the same
+            # meaning it has for every other method. The sum is accumulated in
+            # float64: in float32 a loss near 9e5 is quantized at ~0.06, coarser
+            # than the per-step progress here, and the test would fire on noise.
+            # The projected-gradient (KKT) test is kept as a fallback for data a
+            # rank-`num_materials` model fits exactly -- the shifted loss then goes
+            # to zero and its relative change stays O(1) forever, while the
+            # gradient still vanishes. A KKT test alone is not enough because it is
+            # relative to the gradient at the START, so a better initialization
+            # makes the same rel_tol a stricter target: at dosage 100 the default
+            # init ran 4x longer than a poor one for an identical loss.
+            loss = _nnal_rowwise(X, T, prep, 1).sum(dtype=torch.float64)
             gnorm = gnorm2.sqrt()
             if gnorm0 is None:
                 gnorm0 = gnorm
-            elif bool(gnorm <= rel_tol * gnorm0):
+            if (bool(torch.abs(loss - prev_loss) <= rel_tol * torch.abs(loss))
+                    or bool(gnorm <= max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps) * gnorm0)):
                 break
-            # Deliberately no stagnation heuristic here. A loss-based one is
-            # unusable: in float32 the loss sums about 5e6 elements to ~9e5, so its
-            # roundoff is around 0.9 -- coarser than the per-step progress from
-            # roughly step 70 onward, while the method is still genuinely
-            # descending (NNAL 898,854 -> 898,535 between steps 70 and 300). A
-            # gradient-based one is no better, because the projected gradient is
-            # not monotone: it rose from 1.44e-2 to 1.50e-2 between steps 100 and
-            # 150 before falling to 5.99e-3 by step 300, so any "no progress for k
-            # checks" rule fires on a plateau the method later escapes.
-            # This method converges linearly, so rel_tol and max_steps are the
-            # honest controls: a tight rel_tol will use the whole budget.
+            prev_loss = loss
     return W, H, num_steps
 
 
@@ -668,7 +691,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
     W = W.clone(); H = H.clone()
     rank = W.shape[1]
     rows, cols = torch.triu_indices(rank, rank, device=W.device)
-    loss = stable_nnal(W @ H, T, prep)
+    loss = stable_nnal(W @ H, T, prep, dtype=torch.float64)
     lam = damping
     total_cg = 0
     step = 0
@@ -683,14 +706,19 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         gnorm2 = _joint_dot(gW, gW, gH, gH)
         if not torch.isfinite(gnorm2) or gnorm2 == 0:
             break
-        # Stop on the projected-gradient (KKT) residual, not on the relative change
-        # in the loss: this objective is shifted so its minimum is 0, so once the
-        # fit is near-exact the relative loss change stays O(1) forever and a
-        # loss-ratio test never fires.
+        # KKT fallback: for data a rank-`num_materials` model fits exactly, the
+        # shifted loss goes to zero and its relative change stays O(1) forever, but
+        # the projected gradient still vanishes. The primary test is on the loss,
+        # below, because this one is relative to the gradient at the start and so
+        # tightens with a better initialization. Since this test only ever fires in
+        # the loss -> 0 regime, it is set tight there: in a quadratic basin
+        # loss ~ g^2, so a gradient ratio of rel_tol is a loss ratio of only
+        # rel_tol^2 -- 3e-14 from a warm-up loss of 286 -- and machine precision
+        # needs a gradient ratio of a few tens of eps.
         gnorm = gnorm2.sqrt()
         if gnorm0 is None:
             gnorm0 = gnorm
-        elif rel_tol > 0 and gnorm <= rel_tol * gnorm0:
+        elif rel_tol > 0 and gnorm <= max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps) * gnorm0:
             break
 
         LW = _joint_blocks(Z @ (H[rows] * H[cols]).T, rows, cols, rank, fW, precond_jitter)
@@ -747,7 +775,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         for _ in range(30):
             Wn = (W + a * xW).clamp_(min=0)
             Hn = (H + a * xH).clamp_(min=0)
-            new_loss = stable_nnal(Wn @ Hn, T, prep)
+            new_loss = stable_nnal(Wn @ Hn, T, prep, dtype=torch.float64)
             if torch.isfinite(new_loss) and new_loss <= loss + 1e-4 * a * slope:
                 accepted = True; break
             a *= 0.5
@@ -760,7 +788,12 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         # search stops finding an acceptable step, which escalates the damping and
         # terminates through the lam > 1e6 path above -- a real signal rather than
         # a threshold on a quantity too noisy to threshold.
+        # rel_tol is the relative change in the loss per accepted step, summed in
+        # float64, the same meaning it has for every other method.
+        rel_change = torch.abs(loss - new_loss) / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny)
         W, H, loss = Wn, Hn, new_loss
+        if rel_tol > 0 and bool(rel_change <= rel_tol):
+            break
         if verbose:
             print(f'  step {step:3d} cg {ncg:3d} a {a:.3g} loss {loss.item():.6e}', flush=True)
     return W, H, step, total_cg
@@ -863,6 +896,19 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
 
 def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, max_steps=1000,
                        rel_tol=1e-10, batch_size=None, compile_mode=None, **kwargs) -> torch.Tensor:
+    """Factorize T ~= exp(-W @ H), W, H >= 0, by minimizing the non-negative attenuation loss.
+
+    rel_tol is the relative change in the loss per step (summed in float64) at
+    which a method stops, and means the same thing for every method. It is not
+    worth the same amount of convergence, though: joint_newton converges
+    superlinearly and is within 0.002% of its optimum at 1e-6, while the
+    alternating methods (block_newton, mann_multiplicative, quadratic) converge
+    linearly and at 1e-6 can stop on a plateau with a percent still to gain --
+    block_newton at dosage 100 stopped 1.4% short at 1e-6 and 0.001% short at
+    1e-8. Use 1e-8 or tighter for those. On data the model fits exactly the loss
+    goes to zero and this test never fires; a projected-gradient test then takes
+    over and runs to machine precision.
+    """
     if method == 'quasi_newton':
         update = newton_update
     elif method == 'mann_multiplicative':
