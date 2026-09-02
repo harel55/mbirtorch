@@ -902,6 +902,165 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     return W, H, warmup_steps + steps
 
 
+# -----------------------------------------------------------------------
+# Streaming factorization for data that does not fit in memory
+# -----------------------------------------------------------------------
+def _h_stats_accumulate(W, H, T, prep, rows, cols, deriv, rowwise):
+    """Per-chunk sufficient statistics for one Newton step on H.
+
+    The H-step of block_newton needs, for every wavelength bin, the gradient
+    W^T G[:, k] and the Hessian W^T diag(Z[:, k]) W. Both are sums over pixels, so
+    they accumulate across chunks: this returns one chunk's share, and the caller
+    adds. The Hessian's upper triangle for all K bins comes out of a single GEMM
+    against the Khatri-Rao product (W[:, rows] * W[:, cols]), exactly as in
+    block_newton_step. The per-bin loss is the line search's baseline.
+    """
+    X = W @ H
+    G, Z = deriv(X, T, prep)
+    return W.T @ G, (W[:, rows] * W[:, cols]).T @ Z, rowwise(X, T, prep, 0)
+
+
+def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
+    """Projected-Newton direction on H from accumulated statistics.
+
+    Mirrors the H axis of block_newton_step -- two-metric projection, KKT release
+    of bound entries with an inward gradient, trust region, descent safeguard,
+    feasibility bound -- operating on the (K, R) transpose. Returns (d, slope,
+    alpha_max) with one row/entry per bin.
+    """
+    V = H.T
+    g = grad.T
+    rank = V.shape[1]
+    M = flat.new_zeros(flat.shape[1], rank, rank)
+    M[:, rows, cols] = flat.T
+    M[:, cols, rows] = flat.T
+    free = ~((V <= 0) & (g > 0))
+    eye = torch.eye(rank, dtype=V.dtype, device=V.device)
+    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
+    rhs = torch.where(free, g, torch.zeros_like(g))
+    d = _batched_spd_solve(M, rhs, jitter_rel)
+    d = torch.where(free, d, torch.zeros_like(d))
+    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
+    d = torch.where((V <= 0) & (g < 0), g / diag_M, d)
+    limit = 16.0 * V.abs().amax(-1, keepdim=True).clamp_min(torch.finfo(V.dtype).eps)
+    d = torch.clamp(d, min=-limit, max=limit)
+    slope = (g * d).sum(-1)
+    d = torch.where((slope <= 0)[:, None], torch.clamp(rhs / diag_M, min=-limit, max=limit), d)
+    slope = (g * d).sum(-1)
+    ratio = torch.where(d > 0, V / d.clamp_min(torch.finfo(V.dtype).tiny), torch.full_like(d, float('inf')))
+    return d, slope, torch.clamp(ratio.amin(-1), max=1.0)
+
+
+def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384,
+                         w_rel_tol=1e-8, w_max_steps=300, ls_trials=4, device='cuda',
+                         compile_mode=None, random_state=0, verbose=False):
+    """Factorize a dataset too large for device memory, one chunk at a time.
+
+    Args:
+        chunks: A sequence of CPU tensors, each (pixels, bins), together making
+            up T. Any indexable sequence works, so chunks may be lazily loaded
+            (e.g. views into a memory-mapped array or an HDF5 dataset).
+        num_materials: Factorization rank R.
+        max_passes: Full passes over the data for polishing H. 0 stops after
+            the subsample fit, which is the existing batched path.
+        rel_tol: Stop polishing when a pass changes the total loss by less than
+            this, relatively (float64 sum).
+        warmup_pixels: Pixels drawn from the leading chunks to fit H initially.
+
+    Returns:
+        (W_chunks, H, passes): W as a list of CPU tensors aligned with `chunks`.
+
+    The two factors are asymmetric in a way that makes this work. W is per-pixel
+    and separable: with H fixed each pixel's problem is independent, so W is
+    solved chunk by chunk and never held whole on the device. H is shared by
+    every pixel but holds only R * K values, and its Newton step needs only sums
+    over pixels -- gradient, R x R Hessian per bin, per-bin loss -- which
+    accumulate across chunks. One full pass therefore delivers one exact
+    block-Newton step on H from all the data; a second pass evaluates the line
+    search at a few trial step lengths at once. H starts from a joint_newton
+    fit on a subsample, which is already within a few hundredths of a percent
+    of the full-data optimum, so a handful of passes polish it.
+
+    joint_newton is deliberately not streamed: each of its CG iterations would
+    be a full pass, and at 10 or more per step that is hundreds of passes.
+    """
+    nnal_fn, deriv, rowwise, _ = _kernels(compile_mode)
+    R = num_materials
+    rows, cols = None, None
+    W_chunks = [None] * len(chunks)
+
+    # ---- H from a subsample of the leading chunks
+    parts, n = [], 0
+    for c in chunks:
+        parts.append(c[: warmup_pixels - n]); n += parts[-1].shape[0]
+        if n >= warmup_pixels:
+            break
+    T_sub = torch.cat(parts, 0).to(device)
+    _, H, _ = nnal_factorization(T_sub, method='joint_newton', num_materials=R, max_steps=300,
+                                 rel_tol=1e-6, compile_mode=compile_mode, random_state=random_state)
+    del T_sub
+    rows, cols = torch.triu_indices(R, R, device=H.device)
+    prev_loss = None
+    passes = 0
+
+    def to_device(c):
+        return c.pin_memory().to(device, non_blocking=True) if c.device.type == 'cpu' else c
+
+    for p in range(max_passes + 1):
+        # ---- pass A: solve W per chunk with H fixed, accumulate H statistics
+        grad = torch.zeros_like(H)
+        flat = H.new_zeros(rows.numel(), H.shape[1])
+        base = H.new_zeros(H.shape[1])
+        nxt = to_device(chunks[0])
+        for i in range(len(chunks)):
+            Tc = nxt
+            if i + 1 < len(chunks):
+                nxt = to_device(chunks[i + 1])            # prefetch overlaps the solve below
+            prep = _nnal_prep(Tc)
+            kw = dict(W_init=W_chunks[i].to(device)) if W_chunks[i] is not None else {}
+            W, _, _ = nnal_factorization(Tc, method='block_newton', num_materials=R, max_steps=w_max_steps,
+                                         rel_tol=w_rel_tol, update_H=False, H_init=H.clone(),
+                                         compile_mode=compile_mode, **kw)
+            W_chunks[i] = W.cpu()
+            g_c, f_c, b_c = _h_stats_accumulate(W, H, Tc, prep, rows, cols, deriv, rowwise)
+            grad += g_c; flat += f_c; base += b_c
+            del Tc, W
+        loss = base.sum(dtype=torch.float64)
+        if verbose:
+            print(f'  pass {p}: full-data loss {loss.item():.6e}', flush=True)
+        if prev_loss is not None and rel_tol > 0 and bool(torch.abs(loss - prev_loss) <= rel_tol * torch.abs(loss)):
+            break
+        prev_loss = loss
+        if p == max_passes:
+            break
+
+        # ---- one exact Newton step on H from the accumulated statistics
+        d, slope, alpha_max = _h_direction(H, grad, flat, rows, cols)
+        alphas = alpha_max[None, :] * (0.5 ** torch.arange(ls_trials, dtype=H.dtype, device=H.device))[:, None]
+
+        # ---- pass B: per-bin loss at every trial step, accumulated over chunks
+        trial = H.new_zeros(ls_trials, H.shape[1])
+        nxt = to_device(chunks[0])
+        for i in range(len(chunks)):
+            Tc = nxt
+            if i + 1 < len(chunks):
+                nxt = to_device(chunks[i + 1])
+            prep = _nnal_prep(Tc)
+            W = W_chunks[i].to(device)
+            X = W @ H
+            B = W @ d.T
+            for t in range(ls_trials):
+                trial[t] += rowwise(X - alphas[t][None, :] * B, Tc, prep, 0)
+            del Tc, W, X, B
+        noise = 8.0 * torch.finfo(H.dtype).eps * base.abs()
+        ok = trial <= base[None, :] - 1e-4 * alphas * slope[None, :] + noise[None, :]   # Armijo, per bin and trial
+        # largest accepted trial per bin, else zero
+        accepted = torch.where(ok.any(0), alphas.gather(0, ok.float().argmax(0, keepdim=True)).squeeze(0), torch.zeros_like(alpha_max))
+        H = (H.T - accepted[:, None] * d).clamp_(min=0).T.contiguous()
+        passes = p + 1
+    return W_chunks, H, passes
+
+
 def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True,
              convergence_check_interval=1, W_init: torch.Tensor = torch.tensor([]),
              H_init: torch.Tensor = torch.tensor([]), compile_mode=None,
