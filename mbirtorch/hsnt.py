@@ -585,7 +585,7 @@ def _kernels(compile_mode):
     return _COMPILED_KERNELS[compile_mode]
 
 
-def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
+def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, nonneg=True,
                       rowwise=None, deriv=None):
     """One exact projected-Newton step on a single factor.
 
@@ -632,7 +632,9 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     # Two-metric projection: freeze the variables sitting on the V >= 0 boundary
     # whose gradient pushes them further out, and Newton-step the rest.
     eps_active = _ACTIVE_TOL * V.abs().amax(-1, keepdim=True).mean()
-    bound = (V <= eps_active) & (grad > 0)
+    # nonneg=False drops the bound on V: no active set, no feasibility limit on
+    # the step, no clamp. Used for the unconstrained estimate of the spectra.
+    bound = ((V <= eps_active) & (grad > 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
     free = ~bound
     # The projected gradient is the KKT residual for this block, and it is already
     # in hand here; returning it lets the driver test convergence without paying
@@ -654,7 +656,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     # variables, so do that: d = grad / diag(M) < 0 moves the entry off the
     # bound. Interior entries keep the full Newton direction.
     diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
-    inward = (V <= eps_active) & (grad < 0)
+    inward = ((V <= eps_active) & (grad < 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
     d = torch.where(inward, grad / diag_M, d)
 
     # Trust region, per row. The feasibility clamp below only bounds directions
@@ -684,7 +686,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
     # Largest step that keeps V >= 0 exactly, so no projection is needed afterwards.
     ratio = torch.where(d > 0, V / d.clamp_min(torch.finfo(V.dtype).tiny),
                         torch.full_like(d, float('inf')))
-    alpha = torch.clamp(ratio.amin(-1), max=1.0)
+    alpha = torch.clamp(ratio.amin(-1), max=1.0) if nonneg else torch.ones_like(ratio.amin(-1))
 
     # X(alpha) along the step is exactly X - alpha * B, so the line search is
     # elementwise: no candidate factors and no extra matmuls are materialised.
@@ -717,8 +719,10 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
         alpha = alpha * 0.5
         num_backtracks += 1
 
-    V_new = (V - accepted[:, None] * d).clamp_(min=0.0)
-    V_new = torch.where(bound, torch.zeros_like(V_new), V_new)
+    V_new = V - accepted[:, None] * d
+    if nonneg:
+        V_new = V_new.clamp_(min=0.0)
+        V_new = torch.where(bound, torch.zeros_like(V_new), V_new)
     X_new = X - expand(accepted) * B
     if axis == 1:
         V_new = V_new.T.contiguous()
@@ -727,7 +731,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9,
 
 def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
                           convergence_check_interval=1, W_init=None, H_init=None,
-                          jitter_rel=1e-9, compile_mode=None):
+                          jitter_rel=1e-9, compile_mode=None, nonneg_W=True):
     """Alternating exact projected-Newton minimization of the NNAL."""
     _, _, rowwise, step_fn = _kernels(compile_mode)
     prep = _nnal_prep(T)
@@ -738,7 +742,7 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     num_steps = 0
     for step in range(max_steps):
         X = W @ H                      # resynchronize against incremental drift
-        W, X, info_W = step_fn(W, H, X, T, prep, 0, jitter_rel=jitter_rel)
+        W, X, info_W = step_fn(W, H, X, T, prep, 0, jitter_rel=jitter_rel, nonneg=nonneg_W)
         gnorm2 = info_W[1]
         if update_H:
             H, X, info_H = step_fn(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
@@ -790,7 +794,9 @@ def _joint_blocks(flat, rows, cols, rank, free, jitter):
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-12,
                      precond_jitter=1e-8, prep=None, verbose=False, nnal=None, deriv=None, tilt_H=None,
-                     nonneg_W=True):
+                     nonneg_W=True, w_mask=None):
+    # w_mask (bool, W's shape): coefficients outside the mask are held at their
+    # current value (zero, for a selected support) and take no part in the step.
     # nonneg_W=False drops the W >= 0 constraint: every coefficient is free and
     # the line search does not clamp W. The pixel problem stays strictly convex in
     # w for any real w. Used to estimate H without the truncation bias that the
@@ -820,6 +826,8 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         if tilt_H is not None:
             gH = gH + tilt_H
         fW = ~((W <= 0) & (gW > 0)) if nonneg_W else torch.ones_like(W, dtype=torch.bool)
+        if w_mask is not None:
+            fW = fW & w_mask
         fH = ~((H <= 0) & (gH > 0))
         gW, gH = gW * fW, gH * fH
         gnorm2 = _joint_dot(gW, gW, gH, gH)
@@ -1014,7 +1022,7 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
 def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384,
                          w_rel_tol=1e-8, w_max_steps=300, ls_trials=4, device='cuda',
                          compile_mode=None, random_state=0, verbose=False, polish_dtype=None,
-                         kkt_tol=None, stats=None):
+                         kkt_tol=None, stats=None, nonneg_W=True):
     """Factorize a dataset too large for device memory, one chunk at a time.
 
     Args:
@@ -1042,6 +1050,11 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             changing, and H is still measurably non-stationary. The residual
             tells the two apart, and the run says so when it stops that way.
         stats: Optional dict; receives 'loss' and 'kkt' lists, one entry per pass.
+        nonneg_W: False estimates H with the bound on the pixel coefficients dropped
+            during the polish passes (see unconstrained_spectra: it removes the
+            truncation bias that capped H at 43.8 dB on 10M pixels in float64 as
+            in float32), then re-solves W >= 0 for every chunk in one final pass.
+            The warm-up fit stays constrained, since it finds the basin.
 
     Returns:
         (W_chunks, H, passes): W as a list of CPU tensors aligned with `chunks`.
@@ -1100,10 +1113,12 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             if i + 1 < len(chunks):
                 nxt = to_device(chunks[i + 1])            # prefetch overlaps the solve below
             prep = _nnal_prep(Tc)
-            kw = dict(W_init=W_chunks[i].to(device=device, dtype=H.dtype)) if W_chunks[i] is not None else {}
-            W, _, _ = nnal_factorization(Tc, method='block_newton', num_materials=R, max_steps=w_max_steps,
-                                         rel_tol=w_rel_tol, update_H=False, H_init=H.clone(),
-                                         compile_mode=compile_mode, **kw)
+            if W_chunks[i] is not None:
+                W0 = W_chunks[i].to(device=device, dtype=H.dtype)
+            else:                                            # optimize()'s initialization for a fixed H
+                W0 = torch.linalg.lstsq(H.T, Tc.T)[0].T.clamp(min=0)
+            W, _, _ = block_newton_optimize(Tc, R, w_max_steps, w_rel_tol, update_H=False, W_init=W0,
+                                            H_init=H.clone(), compile_mode=compile_mode, nonneg_W=nonneg_W)
             W_chunks[i] = W.cpu()
             g_c, f_c, b_c = _h_stats_accumulate(W, H, Tc, prep, rows, cols, deriv, rowwise)
             grad += g_c; flat += f_c; base += b_c; scale += (W.T @ Tc).to(torch.float64)
@@ -1160,6 +1175,15 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         Ht = torch.where((Ht <= eps_active) & (grad.T.to(Ht.dtype) > 0), torch.zeros_like(Ht), Ht)
         H = Ht.T.contiguous()
         passes = p + 1
+    if not nonneg_W:
+        # The physical coefficients: one more pass, W >= 0 given the final H.
+        for i in range(len(chunks)):
+            Tc = to_device(chunks[i])
+            W, _, _ = block_newton_optimize(Tc, R, w_max_steps, w_rel_tol, update_H=False,
+                                            W_init=W_chunks[i].to(device=device, dtype=H.dtype).clamp(min=0),
+                                            H_init=H.clone(), compile_mode=compile_mode)
+            W_chunks[i] = W.cpu()
+            del Tc, W
     return W_chunks, H, passes
 
 
@@ -2256,7 +2280,16 @@ def _bootstrap_score_bias(T, W, H, dose, n_sim, seed, chunk, w_steps, compile_mo
 def bias_corrected_spectra(T, W, H, dose, correction='bootstrap', max_outer=20, rel_tol=1e-8, h_tol=1e-3,
                            joint_steps=None, cg_max=10, chunk=8192, n_sim=8, seed=0, w_steps=30,
                            relax=1.0, callback=None, compile_mode=None, verbose=False):
-    """Move a converged ML factorization to the maximizer of the modified profile likelihood.
+    """Move a converged ML factorization to the root of a bias-corrected estimating equation.
+
+    STATUS: none of these corrections helped on the phantom. The dominant bias of
+    the ML spectra is the truncation of pixel coefficients at zero, which the
+    curvature adjustments ('cox_reid', 'barndorff_nielsen') cannot see and the
+    parametric bootstrap underestimates (its simulated truth, the fitted W, has
+    far fewer exact zeros than the real one). Measured against the MLE at 262k
+    to 1M pixels the bootstrap changed the spectral SNR by +0.02 to +0.05 dB at 5
+    to 84x the cost, and diverged once. unconstrained_spectra and
+    support_selected_spectra are the estimators that work. Kept for reference.
 
     H is shared by every pixel and estimated jointly with R nuisance coefficients
     per pixel, each pixel carrying a fixed amount of information (K bins at the
@@ -2358,3 +2391,91 @@ def bias_corrected_spectra(T, W, H, dose, correction='bootstrap', max_outer=20, 
             W, _, _ = block_newton_optimize(T, R, 50, 1e-12, update_H=False, W_init=W, H_init=H,
                                             compile_mode=compile_mode)
     return W, H, it + 1
+
+
+def unconstrained_spectra(T, W, H, max_steps=300, cg_max=10, rel_tol=1e-10, w_max_steps=100, compile_mode=None):
+    """Re-estimate the spectra with the bound on the pixel coefficients dropped, then re-solve W >= 0.
+
+    The maximum-likelihood spectra are biased by the truncation of pixel
+    coefficients at zero: a coefficient whose true value is zero is estimated
+    positive half the time and clipped the other half, an O(1/sqrt m) effect per
+    pixel (m = information per pixel) that does not average out over pixels.
+    Dropping the bound removes it -- the pixel problem stays strictly convex for
+    any real w -- at the price of the variance reduction the constraint provides.
+    Measured on the phantom at dose 3, rank 3 (spectral SNR, MLE -> this):
+    4k px -0.8 dB, 16k -0.7, 65k +0.3, 262k 40.4 -> 43.2, 524k 41.1 -> 45.8,
+    1M 41.7 -> 49.0, restoring the sqrt(N) rate the MLE had lost; maps +0.15 dB.
+    Cost: a continuation of the joint solve from the ML point, about 0.6x the
+    ML solve's time. Use it when pixels are plentiful (above ~10^5 at dose 3;
+    the crossover moves to larger P at lower dose). Not for coefficients that are
+    physically nonnegative and mostly zero, such as fractions over a dictionary
+    of many similar atoms: there the unconstrained fit is ill-conditioned and
+    the bound carries real information; see support_selected_spectra.
+
+    Returns (W, H, steps) with W >= 0 re-solved for the returned H.
+    """
+    nnal_fn, deriv, _, _ = _kernels(compile_mode)
+    prep = _nnal_prep(T)
+    _, Hu, steps, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps, cg_max=cg_max, rel_tol=rel_tol,
+                                        prep=prep, nnal=nnal_fn, deriv=deriv, nonneg_W=False)
+    Wc, _, _ = block_newton_optimize(T, H.shape[0], w_max_steps, 1e-12, update_H=False, W_init=W, H_init=Hu,
+                                     compile_mode=compile_mode)
+    return Wc, Hu, steps
+
+
+def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=10, rel_tol=1e-10,
+                             w_max_steps=100, compile_mode=None, verbose=False):
+    """Choose each pixel's material subset by penalised likelihood, then refit with the supports fixed.
+
+    The truncation bias of the ML spectra (see unconstrained_spectra) comes from
+    coefficients whose true value is zero. If those are identified and held at
+    zero, the remaining coefficients sit in the interior and only the much
+    smaller curvature bias is left, while W >= 0 -- and the variance reduction it
+    brings -- is kept. Every nonempty subset of the R materials is solved for
+    every pixel (2^R - 1 grouped convex solves, so R <= 6), each pixel takes the
+    subset minimising  dose * loss + penalty * |subset|  (the empty subset is
+    allowed: a pixel with no material), and (W on the selected supports, H) is
+    then refit jointly. Measured at 65k px, dose 3, rank 3 against the MLE:
+    penalty 1 (AIC) +0.79 dB spectra / +0.08 maps; 0.5 log K (BIC) +0.95 / +0.23;
+    2 log K +1.04 / +0.44, with the exact support recovered in 59% of pixels --
+    the best of the estimators tried at that size, and the only one that also
+    lifts the maps appreciably. The selection is a model-selection step and
+    carries its own errors; a stronger penalty helped monotonically here.
+
+    Args:
+        dose: open-beam counts per pixel and bin, which converts the loss to
+            log-likelihood units for the penalty.
+        penalty: per selected coefficient, in log-likelihood units. Default 2 log K.
+
+    Returns (W, H, support, steps) with support a bool mask of W's shape.
+    """
+    R, K = H.shape
+    if R > 6:
+        raise ValueError("support_selected_spectra enumerates all 2^R - 1 subsets; for R > 6 use "
+                         "unconstrained_spectra (signed coefficients do not truncate).")
+    import itertools
+    penalty = 2.0 * math.log(K) if penalty is None else penalty
+    nnal_fn, deriv, rowwise, _ = _kernels(compile_mode)
+    prep = _nnal_prep(T)
+    subsets = [list(c) for r in range(1, R + 1) for c in itertools.combinations(range(R), r)]
+    crit = [rowwise(torch.zeros_like(T), T, prep, 1, dtype=torch.float64) * dose]      # the empty subset
+    W_sub = []
+    for S in subsets:
+        idx = torch.tensor(S, device=T.device)
+        Ws, _, _ = block_newton_optimize(T, len(S), w_max_steps, 1e-12, update_H=False,
+                                         W_init=W[:, idx].contiguous(), H_init=H[idx].contiguous(),
+                                         compile_mode=compile_mode)
+        crit.append(rowwise(Ws @ H[idx], T, prep, 1, dtype=torch.float64) * dose + penalty * len(S))
+        W_sub.append(Ws)
+    best = torch.stack(crit, 1).argmin(1)                    # 0 = empty, j + 1 = subsets[j]
+    W0 = torch.zeros_like(W)
+    for j, S in enumerate(subsets):
+        m = best == j + 1
+        if m.any():
+            W0[m.nonzero().squeeze(1)[:, None], torch.tensor(S, device=T.device)[None, :]] = W_sub[j][m]
+    support = W0 > 0
+    Wn, Hn, steps, _ = _joint_newton_pcg(T, W0, H, max_steps=max_steps, cg_max=cg_max, rel_tol=rel_tol,
+                                         prep=prep, nnal=nnal_fn, deriv=deriv, w_mask=support)
+    if verbose:
+        print(f'  supports: mean size {support.sum(1).double().mean().item():.2f}; joint refit {steps} steps', flush=True)
+    return Wn, Hn, support, steps
