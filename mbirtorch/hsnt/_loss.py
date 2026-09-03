@@ -16,7 +16,7 @@ def _nnal_prep(T):
     log_T = torch.log(Tsafe)
     all_positive = bool(positive.all())
     # Crossover for the phi series: truncation ~ |Xp|^3/24 against cancellation
-    # ~ eps/|Xp|^2. The old hard-coded 1e-3 is ~40x too small in float32.
+    # ~ eps/|Xp|^2 (a fixed 1e-3 would be ~40x too small in float32).
     taylor_cutoff = (24.0 * torch.finfo(T.dtype).eps) ** 0.25
     return log_T, positive, all_positive, taylor_cutoff
 
@@ -95,11 +95,10 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
 def _nnal_rowwise(X, T, prep, dim, dtype=None):
     """NNAL summed over `dim` only: per-pixel (dim=1) or per-wavelength (dim=0).
 
-    dtype is the accumulation dtype of the sum. A per-bin sum over P pixels in
-    float32 has an ulp of 0.06 near 1e6 and 8 near 1e8, so an H step that improves
-    a bin's loss by less than that is invisible to a line search -- a ceiling on H
-    accuracy that worsens linearly with P. Summing in float64 removes it. What
-    remains is the float32 truncation of the elementwise terms, which the line
-    search's noise floor (_ARMIJO_FLOOR) accounts for.
+    dtype is the accumulation dtype of the sum: pass float64 whenever the value
+    drives a line search or a stopping test, because the float32 ulp of a sum over
+    many pixels hides the improvement of a single H step (the float32 truncation
+    of the elementwise terms remains, and is what _ARMIJO_FLOOR accounts for).
+    See docs/hsnt_solver_notes.md, section 1.
     """
     return _nnal_elementwise(X, T, prep).sum(dim=dim, dtype=dtype)

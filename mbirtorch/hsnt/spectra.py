@@ -14,16 +14,14 @@ def unconstrained_spectra(T, W, H, max_steps=300, cg_max=10, rel_tol=1e-10, w_ma
     positive half the time and clipped the other half, an O(1/sqrt m) effect per
     pixel (m = information per pixel) that does not average out over pixels.
     Dropping the bound removes it -- the pixel problem stays strictly convex for
-    any real w -- at the price of the variance reduction the constraint provides.
-    Measured on the phantom at dose 3, rank 3 (spectral SNR, MLE -> this):
-    4k px -0.8 dB, 16k -0.7, 65k +0.3, 262k 40.4 -> 43.2, 524k 41.1 -> 45.8,
-    1M 41.7 -> 49.0, restoring the sqrt(N) rate the MLE had lost; maps +0.15 dB.
-    Cost: a continuation of the joint solve from the ML point, about 0.6x the
-    ML solve's time. Use it when pixels are plentiful (above ~10^5 at dose 3;
-    the crossover moves to larger P at lower dose). Not for coefficients that are
-    physically nonnegative and mostly zero, such as fractions over a dictionary
-    of many similar atoms: there the unconstrained fit is ill-conditioned and
-    the bound carries real information; see support_selected_spectra.
+    any real w -- at the price of the variance reduction the constraint provides,
+    so it wins once pixels are plentiful (above ~10^5 at dose 3; the crossover
+    moves to larger P at lower dose) and loses a little below that. Cost: a
+    continuation of the joint solve from the ML point, cheaper than the ML solve.
+    Not for coefficients that are physically nonnegative and mostly zero, such as
+    fractions over a dictionary of many similar atoms: there the unconstrained fit
+    is ill-conditioned and the bound carries real information; see
+    support_selected_spectra. Measurements: docs/hsnt_solver_notes.md, section 5.
 
     Returns (W, H, steps) with W >= 0 re-solved for the returned H.
     """
@@ -47,12 +45,11 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
     every pixel (2^R - 1 grouped convex solves, so R <= 6), each pixel takes the
     subset minimising  dose * loss + penalty * |subset|  (the empty subset is
     allowed: a pixel with no material), and (W on the selected supports, H) is
-    then refit jointly. Measured at 65k px, dose 3, rank 3 against the MLE:
-    penalty 1 (AIC) +0.79 dB spectra / +0.08 maps; 0.5 log K (BIC) +0.95 / +0.23;
-    2 log K +1.04 / +0.44, with the exact support recovered in 59% of pixels --
-    the best of the estimators tried at that size, and the only one that also
-    lifts the maps appreciably. The selection is a model-selection step and
-    carries its own errors; a stronger penalty helped monotonically here.
+    then refit jointly. The selection is a model-selection step and carries its
+    own errors; a stronger penalty helped monotonically up to the default 2 log K,
+    and a single select/refit round is the optimum (iterating degrades). It is the
+    one estimator here that also lifts the maps appreciably. Measurements:
+    docs/hsnt_solver_notes.md, section 5.
 
     Args:
         dose: open-beam counts per pixel and bin, which converts the loss to

@@ -98,17 +98,10 @@ def _adjustment_value_and_grad(T, W, H, dose, correction, H_ref, chunk=8192):
             # with outward gradient g and curvature m, the one-dimensional integral
             #   int_0^inf exp(-dose (g w + m w^2 / 2)) dw
             #     = (dose m)^-1/2 sqrt(2 pi) exp(gamma^2/2) Phi(-gamma),  gamma = g sqrt(dose/m),
-            # taken along the profile direction (|h_r| dw) so that it is gauge
-            # invariant. It is the only curvature-type adjustment that sees the
-            # truncation of coefficients at zero. In a Monte Carlo of the profile
-            # score at the true H (K=300, dose 3) it removed 28% of the score bias
-            # with the right sign, where Cox-Reid removed none. It is incomplete: the
-            # bound coordinates of a pixel are treated as independent 1-D integrals
-            # with marginal curvature, whereas the material spectra are strongly
-            # correlated and the orthant integral is governed by that correlation
-            # (using the conditional Schur-complement curvature instead made the
-            # correction 2.2x too large with the wrong sign). The consistent version
-            # needs a differentiable bivariate/trivariate orthant probability.
+            # along the profile direction (|h_r| dw) so that it is gauge invariant.
+            # Incomplete: the bound coordinates are treated as independent 1-D
+            # integrals with marginal curvature, where the correlated spectra call
+            # for a joint orthant probability. See docs/hsnt_solver_notes.md, section 5.
             gram = torch.where(fm, (Hg @ Hg.T)[None].expand_as(fm), eye.expand_as(fm).to(W.dtype))
             adj_free = (logdet_M - torch.logdet(gram)).sum() / (2.0 * dose)
             G1 = Tc - Z1
@@ -160,14 +153,11 @@ def bias_corrected_spectra(T, W, H, dose, correction='bootstrap', max_outer=20, 
                            relax=1.0, callback=None, compile_mode=None, verbose=False):
     """Move a converged ML factorization to the root of a bias-corrected estimating equation.
 
-    STATUS: none of these corrections helped on the phantom. The dominant bias of
-    the ML spectra is the truncation of pixel coefficients at zero, which the
-    curvature adjustments ('cox_reid', 'barndorff_nielsen') cannot see and the
-    parametric bootstrap underestimates (its simulated truth, the fitted W, has
-    far fewer exact zeros than the real one). Measured against the MLE at 262k
-    to 1M pixels the bootstrap changed the spectral SNR by +0.02 to +0.05 dB at 5
-    to 84x the cost, and diverged once. unconstrained_spectra and
-    support_selected_spectra are the estimators that work. Kept for reference.
+    Kept for reference: none of these corrections helped on the phantom. The
+    dominant bias of the ML spectra is the truncation of pixel coefficients at
+    zero, which the curvature adjustments do not see and the bootstrap
+    underestimates; unconstrained_spectra and support_selected_spectra are the
+    estimators that work. See docs/hsnt_solver_notes.md, section 5.
 
     H is shared by every pixel and estimated jointly with R nuisance coefficients
     per pixel, each pixel carrying a fixed amount of information (K bins at the

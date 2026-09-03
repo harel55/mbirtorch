@@ -28,31 +28,16 @@ def nndsvda(X, n_components, fill='sqrt', fill_scale=1.0):
     so roughly half its entries are zero. Zeros are poison for multiplicative
     updates, which can never move an entry off zero, so they are filled.
 
-    The fill value has to be chosen at the scale of a FACTOR entry, not of X.
-    Each factor carries sqrt(s_k), so a typical W or H entry is of order
-    sqrt(mean X) and their product is of order mean X. A fill of f in both
-    factors therefore contributes f^2 to the product where both were filled.
-
-      fill = mean X       (classic NNDSVDA)  -> f^2 = (mean X)^2, which only
-                          matches the data when mean X ~ 1. At mean X = 34.5
-                          it put 1190 into every noise component.
-      fill = mean X / 100                    -> f^2 = (mean X)^2 / 1e4. Safe
-                          against overshoot but so small that block_newton's
-                          two-metric projection froze the filled entries at
-                          zero and converged in a reduced subspace, 0.6% worse.
-      fill = c * sqrt(mean X)  (default)     -> f^2 = c^2 * mean X: a fixed
-                          fraction c^2 of a typical entry, whatever the scale of
-                          X. Dimensionally right and scale-free.
-
-    c = 1 was chosen by measurement, not by taste. block_newton's two-metric
-    projection freezes any entry it drives to zero, and a fill it can push there
-    in one step costs a component: at dosage_rate=3 the loss it reaches improves
-    monotonically with the fill, 904,026 at mean/100, 902,547 at c=0.1, 900,323
-    at c=0.3, 898,850 at classic mean, 898,514 at c=1 -- the last within 0.001% of
-    the joint solver. The multiplicative and joint solvers are indifferent to c
-    across that whole range. The price is an initial X that can exceed the data
-    by up to 2x where fills coincide; that is bounded and scale-free, unlike the
-    35x of classic NNDSVDA on a badly floored matrix, and no solver minds it.
+    The fill value is chosen at the scale of a FACTOR entry, not of X. Each factor
+    carries sqrt(s_k), so a typical W or H entry is of order sqrt(mean X), and a
+    fill of f in both factors contributes f^2 to the product where both were
+    filled. The default fill c * sqrt(mean X) with c = 1 therefore adds a fixed
+    fraction c^2 of a typical entry whatever the scale of X: dimensionally right
+    and scale-free. The classic mean fill matches the data only when mean X ~ 1,
+    and a fill far below factor scale is frozen at zero by block_newton's
+    two-metric projection, which then converges in a reduced subspace. c = 1 was
+    chosen by measurement; its price is an initial X up to 2x the data where fills
+    coincide, which no solver minds. See docs/hsnt_solver_notes.md, section 2.
 
     Args:
         X: Nonnegative array of shape (n_samples, n_features).

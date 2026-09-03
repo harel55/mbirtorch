@@ -6,26 +6,21 @@ from ._multiplicative import _reseed_dead
 
 
 _COMPILED_KERNELS = {}
-# Armijo noise floor, as a multiple of eps32 * |row loss|. A decrease smaller than
-# this is not trusted, because elements whose step alpha*B falls below ulp(X) do
-# not move at all in float32, so the measured decrease is a biased truncation that
-# scales linearly with the row length (NOT a random walk: dividing by sqrt(n)
-# re-created the spurious-backtracking pathology, 757 backtracks per 60 steps).
-# With the row sums accumulated in float64 the constant can drop from 8 to 4:
-# backtracks per 60 block steps at c = 0.5/1/2/4/8 were 650/468/160/27/15 at
-# P=4096 and 543/473/236/48/15 at P=16384, with the converged loss identical to
-# the last digit in every case. Halving the floor halves the loss slop the H-step
-# is allowed at large P -- the noise ball in which H wandered at 43.8 dB on 9.4M
-# pixels -- for about half an extra loss evaluation per step.
+# Armijo noise floor, as a multiple of eps32 * |row loss|. A smaller decrease is
+# not trusted: elements whose step alpha*B falls below ulp(X) do not move in
+# float32, so the measured decrease is a biased truncation, linear in the row
+# length (not a random walk). c <= 2 backtracks spuriously; 4 is the smallest
+# safe value once the row sums are float64. See docs/hsnt_solver_notes.md, section 1.
 _ARMIJO_FLOOR = 4.0
-# Trust-region floor as a fraction of the mean row scale (0 -> machine epsilon, the old behaviour).
+# Trust-region floor as a fraction of the mean row scale (0 -> machine epsilon).
+# Without it a row pinned near zero grows by at most 16x per step and the
+# loss-based stopping rule fires during the crawl. See docs/hsnt_solver_notes.md, section 1.
 _TRUST_FLOOR = 1e-3
 # epsilon-active set (Bertsekas): a component within this fraction of the mean row
 # scale of zero, with a gradient pushing it out, is treated as AT the bound and
-# snapped to exactly zero. Without it a component that hit the feasibility limit
-# lands at V - (V/d)*d, a residue of ~1e-17 V in float64 (1e-112 later) that is
-# formally free: the row's shared step length min(V/d) is then ~0 and the whole
-# row freezes at a non-stationary point. float32 rounds the same residue to 0.
+# snapped to exactly zero. Otherwise a tiny residue left at the feasibility limit
+# is formally free, the row's shared step length min(V/d) is ~0, and the row
+# freezes at a non-stationary point. See docs/hsnt_solver_notes.md, section 1.
 _ACTIVE_TOL = 1e-6
 
 
@@ -33,28 +28,20 @@ def _kernels(compile_mode):
     """The four hot kernels, eager or compiled: (nnal, derivatives, rowwise, block step).
 
     compile_mode=None returns the plain functions. Any other value compiles them
-    once and caches the result. The Newton solvers spend their time in
-    elementwise passes over P x K -- the loss, its derivatives, the per-row loss
-    of the line search -- and torch.compile fuses each of those into one kernel:
-    measured 2.2x on a whole joint_newton solve at P=4096, 2.9x at P=16384, and
-    3.8x on a whole block_newton solve. The GEMM-bound CG inner iteration does
-    not benefit (1.07x) and is left eager.
+    once and caches the result; the value itself is otherwise ignored. The Newton
+    solvers spend their time in elementwise passes over P x K -- the loss, its
+    derivatives, the per-row loss of the line search -- and torch.compile fuses
+    each of those into one kernel. The GEMM-bound CG inner iteration does not
+    benefit and is left eager.
 
-    Compiled and eager agree bit-for-bit over a joint_newton solve (28 steps) and
-    over the first 40 block_newton steps; over a 729-step block_newton run the
-    fused reductions' different rounding eventually flips one active-set decision
-    and the paths separate (max |W,H| difference 1.6e-2), but they end at the
-    same loss to 2e-8 relative with identical spectra. Do not expect long
-    block_newton runs to be reproducible across the compiled/eager boundary.
-
-    The value of compile_mode is otherwise ignored here: 'max-autotune' measured
-    no steady-state gain over the default and 2.4x the compile time, and inductor
-    reports too few SMs on this class of card for its GEMM autotuning to apply.
-
-    Compiling costs 4.5 s with a warm inductor cache and ~18 s cold at P=4096, and
-    recompiles whenever P, K, R, dtype or the presence of zero counts changes, so
-    it pays for repeated solves -- the batched path, many datasets, a service --
-    and not for one 0.5 s solve. Default is therefore off.
+    Compiling is a one-off cost of seconds, and recompiles whenever P, K, R, dtype
+    or the presence of zero counts changes, so it pays for repeated solves -- the
+    batched path, many datasets, a service -- and not for one short solve; the
+    default is therefore off. Compiled and eager agree bit-for-bit over short
+    runs, but the fused reductions round differently and a long block_newton run
+    can eventually flip an active-set decision, so do not expect such runs to be
+    reproducible across the compiled/eager boundary. Speedups and compile times:
+    docs/hsnt_solver_notes.md, section 1.
     """
     if compile_mode is None:
         return stable_nnal, stable_nnal_derivatives, _nnal_rowwise, block_newton_step
@@ -174,10 +161,10 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, non
     for _ in range(ls_max):
         trial = torch.where(done, torch.zeros_like(alpha), alpha)
         dim = 1 if axis == 0 else 0
-        # The Armijo decrease can fall below the float32 resolution of the row
-        # loss, which makes the test fail spuriously and backtrack to the cap.
-        # Accept anything that is not measurably worse than the target; the
-        # size of "measurably" is discussed at _ARMIJO_FLOOR.
+        # The Armijo decrease can fall below what the float32 elementwise terms
+        # resolve, which makes the test fail spuriously and backtrack to the cap.
+        # Accept anything that is not measurably worse than the target; the size
+        # of "measurably" is set by _ARMIJO_FLOOR (docs/hsnt_solver_notes.md, section 1).
         noise = _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * base.abs()
         ok = (rowwise(X - expand(trial) * B, T, prep, dim, dtype=torch.float64)
               <= base - 1e-4 * trial * slope + noise) | (trial == 0)
@@ -223,16 +210,14 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
         num_steps = step + 1
         if rel_tol > 0 and num_steps % convergence_check_interval == 0:
             # rel_tol is the relative change in the loss between checks, the same
-            # meaning it has for every other method. The sum is accumulated in
-            # float64: in float32 a loss near 9e5 is quantized at ~0.06, coarser
-            # than the per-step progress here, and the test would fire on noise.
-            # The projected-gradient (KKT) test is kept as a fallback for data a
+            # meaning it has for every other method; the sum is accumulated in
+            # float64 so the test cannot fire on float32 quantization noise. The
+            # projected-gradient (KKT) test is kept as a fallback for data a
             # rank-`num_materials` model fits exactly -- the shifted loss then goes
             # to zero and its relative change stays O(1) forever, while the
             # gradient still vanishes. A KKT test alone is not enough because it is
             # relative to the gradient at the START, so a better initialization
-            # makes the same rel_tol a stricter target: at dosage 100 the default
-            # init ran 4x longer than a poor one for an identical loss.
+            # makes the same rel_tol a stricter target. See docs/hsnt_solver_notes.md, section 3.
             loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
             gnorm = gnorm2.sqrt()
             if gnorm0 is None:
@@ -259,17 +244,31 @@ def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compil
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-12,
                      precond_jitter=1e-8, prep=None, verbose=False, nnal=None, deriv=None, tilt_H=None,
                      nonneg_W=True, w_mask=None):
-    # w_mask (bool, W's shape): coefficients outside the mask are held at their
-    # current value (zero, for a selected support) and take no part in the step.
-    # nonneg_W=False drops the W >= 0 constraint: every coefficient is free and
-    # the line search does not clamp W. The pixel problem stays strictly convex in
-    # w for any real w. Used to estimate H without the truncation bias that the
-    # bound induces (see bias_corrected_spectra); the physical W is re-solved
-    # with the constraint afterwards.
-    # tilt_H, if given, adds the linear term <tilt_H, H> to the objective: its
-    # gradient enters gH and the line search, its Hessian is zero. Used by
-    # bias_corrected_spectra to solve the modified profile likelihood's
-    # stationarity conditions with this solver unchanged otherwise.
+    """Joint truncated-Newton solve on (W, H) by preconditioned CG, from a warm start.
+
+    Each step forms the projected gradient (entries at zero with an outward
+    gradient are frozen) and solves the Newton system approximately by CG. The
+    Hessian-vector product is matrix-free -- dX = dW H + W dH, then Z * dX and the
+    coupling terms through G, six GEMMs and no Hessian formed -- with Levenberg
+    damping lam added to the diagonal. The preconditioner is the block-diagonal
+    Hessian: the per-pixel and per-bin R x R blocks, Cholesky-factored in a batch.
+    CG stops at cg_max iterations or by an Eisenstat-Walker forcing term, the
+    residual reduced by min(sqrt(|g|), 0.5). A backtracking Armijo search on the
+    float64 loss, clamping to the feasible set, accepts the step; a failed search
+    multiplies lam by 10 and retries, an accepted one shrinks it. The solve stops
+    when the relative loss change per accepted step is below rel_tol, on the KKT
+    fallback below (for data the model fits exactly), or when lam runs away, which
+    is what the precision floor looks like from here. Returns (W, H, steps, total_cg).
+
+    Hooks: nonneg_W=False drops W >= 0 -- every coefficient is free and the line
+    search does not clamp W; the pixel problem stays strictly convex for any real
+    w -- so H can be estimated without the truncation bias the bound induces
+    (unconstrained_spectra). w_mask (bool, W's shape) holds coefficients outside
+    the mask at their current value, zero for a selected support
+    (support_selected_spectra). tilt_H adds the linear term <tilt_H, H> to the
+    objective: its gradient enters gH and the line search, its Hessian is zero
+    (bias_corrected_spectra).
+    """
     def tilt(Hx):
         return 0.0 if tilt_H is None else (tilt_H * Hx).sum(dtype=torch.float64)
     nnal = stable_nnal if nnal is None else nnal
@@ -304,8 +303,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         # tightens with a better initialization. Since this test only ever fires in
         # the loss -> 0 regime, it is set tight there: in a quadratic basin
         # loss ~ g^2, so a gradient ratio of rel_tol is a loss ratio of only
-        # rel_tol^2 -- 3e-14 from a warm-up loss of 286 -- and machine precision
-        # needs a gradient ratio of a few tens of eps.
+        # rel_tol^2, and machine precision needs a gradient ratio of a few tens of eps.
         gnorm = gnorm2.sqrt()
         if gnorm0 is None:
             gnorm0 = gnorm
@@ -397,19 +395,18 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
 
     Alternating methods stall at a linear rate once the fit is good, because they
     discard the W<->H coupling block of the Hessian; on a problem where an exact
-    factorization exists, block-Newton alone plateaus around 1e-7. Solving for both
-    factors jointly restores fast convergence to machine precision. The alternating
-    method is still the right way to get into the basin, so it runs first.
+    factorization exists, block-Newton alone plateaus well short of machine
+    precision. Solving for both factors jointly restores fast convergence. The
+    alternating method is still the right way to get into the basin, so it runs
+    first.
 
     update_H=False is not supported here (the joint step updates both factors);
     it falls back to block-Newton alone.
 
     warmup_steps=5 and cg_max=10 were chosen by interleaved A/B at equal converged
-    quality (rel_tol=1e-8) against the previous 10/20: 0.91x at dosage 3 on
-    64x64 (a real 9% loss), 2.43x at dosage 100, 1.31x at dosage 3 on 128x128,
-    same loss to six figures in all three. The cost model behind it: a block
-    warm-up step costs 1.4x a one-CG-iteration joint step, and past a handful of
-    them the joint solver makes better use of the time.
+    quality: a block warm-up step costs more than a one-CG-iteration joint step,
+    and past a handful of them the joint solver makes better use of the time.
+    See docs/hsnt_solver_notes.md, section 3.
     """
     nnal_fn, deriv_fn, _, step_fn = _kernels(compile_mode)
     prep = _nnal_prep(T)

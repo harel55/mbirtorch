@@ -7,16 +7,14 @@ def _shifted(V, ratio, shift, mode, mean_dim):
     """V <- max((V + d) * ratio - d, 0), the shifted multiplicative step.
 
     A plain multiplicative update cannot revive an entry that reaches exactly
-    zero, since 0 * anything = 0. On the demo problem 5.5% of W starts at zero
-    and that fraction never moves over 6000 iterations, even though 1.77% of all
-    entries are zero with a NEGATIVE gradient -- not KKT points, just frozen.
-
-    The offset does not bias the answer. Expanding gives V*ratio + d*(ratio - 1),
-    so an interior fixed point needs (ratio - 1)(V + d) = 0, and V + d > 0 forces
-    ratio = 1; a zero entry stays zero only while d*(ratio - 1) <= 0, i.e.
-    ratio <= 1. Both updates are built so ratio > 1 exactly when the gradient is
-    negative, so the fixed-point set is {V >= 0, grad >= 0, V*grad = 0} -- the KKT
-    set -- for every d > 0. No decay schedule is needed for correctness.
+    zero, since 0 * anything = 0, so entries can freeze at zero with a negative
+    gradient -- not KKT points. The offset does not bias the answer: expanding
+    gives V*ratio + d*(ratio - 1), so an interior fixed point needs
+    (ratio - 1)(V + d) = 0, and V + d > 0 forces ratio = 1; a zero entry stays
+    zero only while d*(ratio - 1) <= 0, i.e. ratio <= 1. Both updates are built so
+    ratio > 1 exactly when the gradient is negative, so the fixed-point set is
+    {V >= 0, grad >= 0, V*grad = 0} -- the KKT set -- for every d > 0. No decay
+    schedule is needed for correctness. See docs/hsnt_solver_notes.md, section 3.
 
     mode='boundary' offsets only entries currently at zero, leaving the interior
     step bit-for-bit the original update. mode='const' offsets everything, which
@@ -46,7 +44,8 @@ def quadratic_update(W, H, T, unused=None, update_H=True, prep=None,
 
     with G = T - exp(-X), Z = exp(-X) and target V = X - G/Z. Reweighted least
     squares on that model, relinearized every step, has the NNAL stationary point
-    as its fixed point.
+    as its fixed point: IRLS on the true NNAL, with a weight exp(-X) > 0 on every
+    measurement, so none is dropped.
 
     Z V = Z X - G, which needs no exp(+X) and so stays bounded however large the
     attenuation gets. Z V is signed, so the multiplicative update splits it into
@@ -54,16 +53,8 @@ def quadratic_update(W, H, T, unused=None, update_H=True, prep=None,
     keeps W and H nonnegative; at the fixed point the ratio is one, which gives
     (exp(-X) - T) H^T = 0, exactly the NNAL stationarity condition.
 
-    This replaces an earlier update that minimized (1/2) sum T (X + log T)^2 --
-    the second-order model expanded about the noiseless solution rather than the
-    current iterate, and never relinearized. That objective weights every
-    zero-count measurement by exactly zero, so at low dose it discards a large
-    fraction of the data (17.7% at dosage_rate=3) and converges somewhere other
-    than the NNAL minimum. Here the weight is exp(-X) > 0 everywhere, so no
-    measurement is dropped.
-
-    Note this is a Gauss-Newton style surrogate, not a majorizer, so individual
-    steps are not guaranteed to decrease the loss.
+    This is a Gauss-Newton style surrogate, not a majorizer, so individual steps
+    are not guaranteed to decrease the loss. See docs/hsnt_solver_notes.md, section 3.
 
     Args:
         W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
@@ -183,13 +174,10 @@ def _reseed_dead(W, H, rel_tol=1e-6, mode='random'):
     offset term d*(ratio - 1) is negative and the clamp holds it at zero forever.
     No multiplicative step can reach it.
 
-    What it is re-seeded WITH matters as much as whether it is. A constant seed
-    keeps the loss honest but leaves the component flat, and a flat spectrum makes
-    the gauge fit against the true spectra ill-conditioned: at dosage_rate=1 the
-    constant seed reaches the same loss as joint_newton to 0.3% yet scores -84 dB
-    on the recovered spectra against joint_newton's 21. A random positive seed
-    breaks that symmetry and hands the dynamics something to differentiate; it
-    scores 21.4 dB on the same case. Seeded, so runs are reproducible.
+    The default seed is small random positive values from a fixed generator, so
+    runs are reproducible. A constant seed leaves the component flat, and a flat
+    spectrum makes the gauge fit against the true spectra ill-conditioned; the
+    random seed breaks that symmetry. See docs/hsnt_solver_notes.md, section 3.
     """
     w = W.norm(dim=0); h = H.norm(dim=1)
     dead = (w <= rel_tol * w.max()) & (h <= rel_tol * h.max())

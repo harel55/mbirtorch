@@ -23,12 +23,11 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         # says the attenuation exceeds that of the faintest pixel that did
         # register -- so it is floored at half a count relative to the smallest
         # genuine transmission, i.e. -log(T_min_real) + log 2. Upstream code
-        # marks zero counts with a tiny positive value (1e-30), and flooring THERE
-        # gives attenuation 69: at dosage_rate=1 half the entries are then 69 and
-        # the mean is 34.5, which the initialization's zero-fill smears into every
-        # component, putting X above 2000 where no attenuation exceeds 1. Any
-        # transmission below 1e-12 is treated as a zero count; no real measurement
-        # gets anywhere near that.
+        # marks zero counts with a tiny positive value (1e-30); flooring THERE
+        # gives an attenuation near 69 that the initialization's zero-fill smears
+        # into every component. Any transmission below 1e-12 is treated as a zero
+        # count; no real measurement gets anywhere near that. See
+        # docs/hsnt_solver_notes.md, section 2.
         real = T > 1e-12
         if bool(real.any()) and not bool(real.all()):
             floor = 0.5 * T[real].min()
@@ -56,18 +55,16 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         # Nesterov extrapolation around the update. The multiplicative update is a
         # fixed-point map g with linear convergence, and the classic momentum
         # sequence beta_k = (k-1)/(k+2) applied as y = clamp(x_k + beta (x_k - x_{k-1}), 0)
-        # cuts its sweeps to a target 17x on the demo problem (6580 -> 380) at 1.3x
-        # the cost per sweep -- 13x in wall clock, which lifts it from 40-70x
-        # slower than joint_newton to parity. The extrapolated point is only an
-        # input; the answer is always the last PLAIN iterate, so the fixed-point
+        # cuts its sweeps by an order of magnitude. The extrapolated point is only
+        # an input; the answer is always the last PLAIN iterate, so the fixed-point
         # set is untouched. A function-value safeguard restarts the momentum
-        # whenever an extrapolated sweep raises the loss; it uses the raw
-        # sum(exp(-X) + T X) minus the constant that separates it from the shifted
-        # loss (0.5 ms against 4.3 ms for stable_nnal -- checking with the full
-        # loss every sweep is what limited an earlier version to 4x), and is
-        # evaluated every extrapolate_check_every sweeps: the sweeps in between are
-        # unguarded, which is the price of the speed. rel_tol keeps its per-step
-        # meaning by comparing across the check interval.
+        # whenever an extrapolated sweep raises the loss, since momentum on a
+        # fixed-point map can overshoot; it uses the raw sum(exp(-X) + T X) minus
+        # the constant that separates it from the shifted loss, far cheaper than
+        # stable_nnal, and is evaluated every extrapolate_check_every sweeps: the
+        # sweeps in between are unguarded, which is the price of the speed. rel_tol
+        # keeps its per-step meaning by comparing across the check interval.
+        # See docs/hsnt_solver_notes.md, section 3.
         log_T, positive, _, _ = prep
         const = torch.sum(torch.where(positive, T * (1.0 - log_T), torch.zeros_like(T)),
                           dtype=torch.float64)
@@ -96,9 +93,9 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
             Wp, Hp = Wn, Hn
         return Wp, Hp, num_steps
 
-    # Converge on a float64 sum. In float32 the loss is quantized at ~1e-7
-    # relative, so at low dosage the multiplicative methods saw two identical
-    # consecutive losses and stopped after two iterations.
+    # Converge on a float64 sum: in float32 the loss is quantized coarser than the
+    # per-step progress at low dosage, and the test would fire on noise. See
+    # docs/hsnt_solver_notes.md, section 1.
     prev_loss = stable_nnal(W @ H, T, prep, dtype=torch.float64)
     for i in range(max_steps):
         # prep is threaded in rather than rebuilt inside `update`: it holds a
@@ -133,26 +130,23 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
 
     rel_tol is the relative change in the loss per step (summed in float64) at
     which a method stops, and means the same thing for every method. It is not
-    worth the same amount of convergence, though: joint_newton is within 0.002%
-    of its optimum at 1e-6, while block_newton and quadratic converge linearly
-    and at 1e-6 can stop on a plateau with a percent still to gain --
-    block_newton at dosage 100 stopped 1.4% short at 1e-6 and 0.001% short at
-    1e-8. Use 1e-8 or tighter for those two. mann_multiplicative is extrapolated
-    by default (see optimize) and reaches joint_newton's answer in comparable
-    wall clock. On data the model fits exactly the loss goes to zero and this
-    test never fires; a projected-gradient test then takes over and runs to
-    machine precision.
+    worth the same amount of convergence, though: joint_newton is close to its
+    optimum at 1e-6, while block_newton and quadratic converge linearly and at
+    1e-6 can stop on a plateau with a percent still to gain; use 1e-8 or tighter
+    for those two. mann_multiplicative is extrapolated by default (see optimize)
+    and reaches joint_newton's answer in comparable wall clock. On data the model
+    fits exactly the loss goes to zero and this test never fires; a
+    projected-gradient (KKT) test then takes over and runs to machine precision.
+    See docs/hsnt_solver_notes.md, section 3.
 
     compile_mode: any non-None value compiles the elementwise hot kernels of
-    block_newton and joint_newton (2-3x per solve, bit-identical) at a one-off
-    cost of 4.5-18 s; worth it for repeated solves, not for one. For the other
-    methods the update function itself is compiled, as before.
+    block_newton and joint_newton (see _kernels), a one-off cost that pays for
+    repeated solves, not for one. For the other methods the update function
+    itself is compiled.
 
     random_state seeds the pixel permutation the batched path uses to choose the
     subsample H is fitted on. It defaults to 0 so two batched runs on the same
-    data give the same answer; pass None for fresh entropy each call. Left
-    unseeded, block_newton took 318 steps in one run and 565 in the next on
-    identical data, which made the batched path impossible to benchmark.
+    data give the same answer; pass None for fresh entropy each call.
     """
     if method == 'quasi_newton':
         update = newton_update
@@ -170,8 +164,8 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
 
     if update in (block_newton_optimize, joint_newton_optimize):
         # These take compile_mode themselves and compile their hot kernels, not the
-        # driver: see _kernels. Wrapping the driver in torch.compile is what the
-        # old branch did for the other methods, and it does nothing useful here.
+        # driver: see _kernels. Wrapping the driver in torch.compile, as is done for
+        # the other methods below, does nothing useful here.
         kwargs['compile_mode'] = compile_mode
     elif compile_mode is not None:
         compile_options = {
@@ -185,7 +179,7 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
 
     if update is multiplicative_update:
         # Nesterov extrapolation is on by default for the multiplicative update:
-        # 13x in wall clock, same fixed points. Pass extrapolate=False to disable.
+        # same fixed points, far fewer sweeps (see optimize). Pass extrapolate=False to disable.
         kwargs.setdefault('extrapolate', True)
     kwargs.update({
         'update': update,
@@ -207,9 +201,7 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     # batch determines it about as well as all of them do. Fit it once on a random
     # subsample, then solve the per-pixel coefficients batch by batch with H held
     # fixed -- that part is separable across pixels, so batching costs nothing but
-    # the loop. The previous version instead factored every batch, then factored
-    # the stacked spectra again with sklearn to reconcile them, which cost one full
-    # solve per batch and a host round trip.
+    # the loop.
     _, H, i_total = optimize(T[batch_idxs[:batch_size]], **kwargs)
 
     # Compute material coefficients for each batch using the unified spectra
