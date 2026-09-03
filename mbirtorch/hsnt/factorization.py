@@ -117,10 +117,19 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
 
     return W, H, num_steps
 
-def nnal_factorization(T: torch.Tensor, method='quasi_newton', num_materials=3, max_steps=1000,
+def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, max_steps=1000,
                        rel_tol=1e-10, batch_size=None, compile_mode=None, random_state=0,
                        **kwargs) -> torch.Tensor:
     """Factorize T ~= exp(-W @ H), W, H >= 0, by minimizing the non-negative attenuation loss.
+
+    method: 'joint_newton' (default) -- block warm-up then a matrix-free truncated
+    Newton solve on (W, H); the fastest to a given loss and the only one that
+    reaches machine precision on exactly factorizable data. 'block_newton' is the
+    alternating exact projected-Newton method (linear convergence; also the warm-up
+    and the fixed-H solver). 'mann_multiplicative' is the damped, extrapolated
+    multiplicative update, at parity with joint_newton in wall clock. 'quadratic'
+    (IRLS) and 'quasi_newton' (diagonal Hessian) are kept for comparison; both are
+    dominated. Measurements: docs/hsnt_solver_notes.md, section 3.
 
     rel_tol is the relative change in the loss per step (summed in float64) at
     which a method stops, and means the same thing for every method. It is not

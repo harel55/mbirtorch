@@ -84,8 +84,9 @@ __all__ = [
 # recons, tests) never open a viewer.  The preprocess, hsnt, and vcls
 # modules resolve the same way, so `import mbirtorch` never pays for their
 # dependency stacks (preprocess: osqp pulls scipy.sparse, plus cv2 and
-# tifffile; hsnt: scikit-learn, scipy, matplotlib; vcls: the model layer and
-# tqdm).  Both spellings keep working -- `mbirtorch.hsnt` resolves here, and
+# tifffile; hsnt: scikit-learn and h5py, with matplotlib imported lazily inside
+# its plotting functions; vcls: the model layer and tqdm).  Both spellings keep
+# working -- `mbirtorch.hsnt` resolves here, and
 # `import mbirtorch.hsnt` is an ordinary submodule import -- and the
 # star-exported FUNCTION names (mbirtorch.dehydrate, mbirtorch.get_opt_views,
 # ...) resolve through _LAZY_NAMES, so the public surface is exactly what eager
@@ -95,9 +96,9 @@ _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer")
 _LAZY_MODULES = ("preprocess", "hsnt", "vcls")
 
 # The names exposed at package level via `from .hsnt import *` and
-# `from .vcls import *`, mapped to their owning module (neither module
-# declares __all__, so this is their full public def list; a new public
-# function in either module gets a line here).
+# `from .vcls import *`, mapped to their owning module. hsnt is a package with
+# an explicit __all__ (mbirtorch/hsnt/__init__.py); this table lists the subset
+# promoted to the top level, so a new top-level name gets a line here.
 _LAZY_NAMES = {
     'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt',
     'import_hsnt_data_hdf5': 'hsnt', 'create_hsnt_metadata': 'hsnt',

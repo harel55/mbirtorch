@@ -1,4 +1,4 @@
-# Reading list for the techniques in `mbirtorch/hsnt.py`
+# Reading list for the techniques in the `mbirtorch.hsnt` package
 
 Grouped by technique, with the part of the code each reference explains.
 
