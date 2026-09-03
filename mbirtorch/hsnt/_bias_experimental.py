@@ -4,7 +4,7 @@ import torch
 
 from . import _newton
 from ._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
-from ._newton import _joint_newton_pcg, _kernels, block_newton_optimize
+from ._newton import _joint_newton_pcg, _kernels, solve_W
 
 
 # -----------------------------------------------------------------------
@@ -149,8 +149,7 @@ def _bootstrap_score_bias(T, W, H, dose, n_sim, seed, chunk, w_steps, compile_mo
         lam = dose * torch.exp(-(Wc @ H))
         for _ in range(n_sim):
             Tb = torch.poisson(lam, generator=gen) / dose
-            Wb, _, _ = block_newton_optimize(Tb, R, w_steps, 1e-12, update_H=False, W_init=Wc, H_init=H,
-                                             compile_mode=compile_mode)
+            Wb = solve_W(Tb, H, Wc, w_steps, 1e-12, compile_mode=compile_mode)
             Gb, _ = deriv(Wb @ H, Tb, _nnal_prep(Tb))
             b += (Wb.T @ Gb).to(torch.float64)
     return b / n_sim
@@ -229,8 +228,7 @@ def bias_corrected_spectra(T, W, H, dose, correction='bootstrap', max_outer=20, 
     prep = _nnal_prep(T)
     R = H.shape[0]
     H_ref = H.detach().clone()
-    W, _, _ = block_newton_optimize(T, R, 50, 1e-12, update_H=False, W_init=W, H_init=H,
-                                    compile_mode=compile_mode)
+    W = solve_W(T, H, W, 50, 1e-12, compile_mode=compile_mode)
     F_prev, H_prev, rises = None, None, 0
     for it in range(max_outer):
         if correction == 'bootstrap':
@@ -267,6 +265,5 @@ def bias_corrected_spectra(T, W, H, dose, correction='bootstrap', max_outer=20, 
                                        prep=prep, nnal=nnal_fn, deriv=deriv, tilt_H=tilt)
         if relax != 1.0:
             H = (H_prev + relax * (H - H_prev)).clamp_(min=0)
-            W, _, _ = block_newton_optimize(T, R, 50, 1e-12, update_H=False, W_init=W, H_init=H,
-                                            compile_mode=compile_mode)
+            W = solve_W(T, H, W, 50, 1e-12, compile_mode=compile_mode)
     return W, H, it + 1

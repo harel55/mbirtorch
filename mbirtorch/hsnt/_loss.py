@@ -21,9 +21,29 @@ def _nnal_prep(T):
     return log_T, positive, all_positive, taylor_cutoff
 
 
+def _nnal_elementwise(X, T, prep):
+    """The shifted NNAL term by term: T * phi(X + log T) with phi(u) = exp(-u) - 1 + u,
+    a Taylor branch below the dtype-aware cutoff, and exp(-X) where T == 0.
+    stable_nnal and _nnal_rowwise are reductions of this one tensor."""
+    log_T, positive, all_positive, taylor_cutoff = prep
+    Xp = X + log_T
+    phi = torch.where(
+        torch.abs(Xp) < taylor_cutoff,
+        Xp * Xp * (0.5 + Xp * (-1.0 / 6.0 + Xp / 24.0)),
+        torch.expm1(-Xp) + Xp,
+    )
+    loss = T * phi
+    if not all_positive:
+        # T == 0 means Xp == X, so the zero-count term is exp(-Xp). It must be a
+        # real exp: expm1(-Xp) saturates at exactly -1 for Xp above ~37 in
+        # float64, so reconstructing it as expm1(-Xp) + 1 underflows to zero.
+        loss = torch.where(positive, loss, torch.exp(-Xp))
+    return loss
+
+
 def stable_nnal(X, T, prep=None, dtype=None):
     """
-    Compute a shifted form of the non-negative attentuation loss
+    Compute a shifted form of the non-negative attenuation loss
     that is much more numerically stable
 
     Args:
@@ -37,24 +57,7 @@ def stable_nnal(X, T, prep=None, dtype=None):
             differ by less than that compare equal and a relative-change test
             fires spuriously.
     """
-    log_T, positive, all_positive, taylor_cutoff = _nnal_prep(T) if prep is None else prep
-
-    Xp = X + log_T
-
-    phi = torch.where(
-        torch.abs(Xp) < taylor_cutoff,
-        Xp * Xp * (0.5 + Xp * (-1.0 / 6.0 + Xp / 24.0)),
-        torch.expm1(-Xp) + Xp,
-    )
-
-    loss = T * phi
-
-    if not all_positive:
-        # T == 0 means Xp == X, so the zero-count term is exp(-Xp). It must be a
-        # real exp: expm1(-Xp) saturates at exactly -1 for Xp above ~37 in
-        # float64, so reconstructing it as expm1(-Xp) + 1 underflows to zero.
-        loss = torch.where(positive, loss, torch.exp(-Xp))
-
+    loss = _nnal_elementwise(X, T, _nnal_prep(T) if prep is None else prep)
     return torch.sum(loss, dim=(-2, -1), dtype=dtype)
 
 
@@ -99,14 +102,4 @@ def _nnal_rowwise(X, T, prep, dim, dtype=None):
     remains is the float32 truncation of the elementwise terms, which the line
     search's noise floor (_ARMIJO_FLOOR) accounts for.
     """
-    log_T, positive, all_positive, taylor_cutoff = prep
-    Xp = X + log_T
-    phi = torch.where(
-        torch.abs(Xp) < taylor_cutoff,
-        Xp * Xp * (0.5 + Xp * (-1.0 / 6.0 + Xp / 24.0)),
-        torch.expm1(-Xp) + Xp,
-    )
-    loss = T * phi
-    if not all_positive:
-        loss = torch.where(positive, loss, torch.exp(-Xp))
-    return loss.sum(dim=dim, dtype=dtype)
+    return _nnal_elementwise(X, T, prep).sum(dim=dim, dtype=dtype)

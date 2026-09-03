@@ -67,6 +67,54 @@ def _kernels(compile_mode):
     return _COMPILED_KERNELS[compile_mode]
 
 
+def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=True):
+    """Projected-Newton direction for a batch of rows of V (B, rank) under V >= 0.
+
+    `flat` (B, Q) holds the upper triangle of each row's rank x rank Hessian
+    (Q = rank (rank + 1) / 2, indexed by `rows`, `cols`). Two-metric projection
+    (Bertsekas): variables within an epsilon of the bound with an outward
+    gradient are frozen and snapped to zero, the rest take the Newton step; a
+    bound-adjacent entry with an inward gradient gets the scaled gradient so one
+    pinned entry cannot zero the step for its whole row; a per-row trust region
+    bounds directions from rows without curvature; a non-descent direction falls
+    back to the scaled gradient; alpha is the largest step keeping V >= 0. With
+    nonneg=False there is no active set, no feasibility limit and alpha = 1. The
+    constants and their measurements are documented at _ARMIJO_FLOOR,
+    _TRUST_FLOOR and _ACTIVE_TOL and in docs/hsnt_solver_notes.md, section 1.
+
+    Returns (d, slope, alpha, bound, projected_gnorm2): d is the descent
+    direction (V decreases along +d), slope = <grad, d> per row, alpha the
+    per-row feasible step, bound the frozen mask, and the squared norm of the
+    projected gradient (the KKT residual at the incoming iterate).
+    """
+    rank = V.shape[1]
+    M = flat.new_zeros(flat.shape[0], rank, rank)
+    M[:, rows, cols] = flat
+    M[:, cols, rows] = flat
+    eps_active = _ACTIVE_TOL * V.abs().amax(-1, keepdim=True).mean()
+    bound = ((V <= eps_active) & (grad > 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
+    free = ~bound
+    projected_gnorm2 = ((grad * free) ** 2).sum()
+    eye = torch.eye(rank, dtype=V.dtype, device=V.device)
+    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
+    rhs = torch.where(free, grad, torch.zeros_like(grad))
+    d = _batched_spd_solve(M, rhs, jitter_rel)
+    d = torch.where(free, d, torch.zeros_like(d))
+    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
+    inward = ((V <= eps_active) & (grad < 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
+    d = torch.where(inward, grad / diag_M, d)
+    row_max = V.abs().amax(-1, keepdim=True)
+    floor = torch.clamp(_TRUST_FLOOR * row_max.mean(), min=torch.finfo(V.dtype).eps)
+    limit = 16.0 * torch.maximum(row_max, floor)
+    d = torch.clamp(d, min=-limit, max=limit)
+    slope = (grad * d).sum(-1)
+    d = torch.where((slope <= 0)[:, None], torch.clamp(rhs / diag_M, min=-limit, max=limit), d)
+    slope = (grad * d).sum(-1)
+    ratio = torch.where(d > 0, V / d.clamp_min(torch.finfo(V.dtype).tiny), torch.full_like(d, float('inf')))
+    alpha = torch.clamp(ratio.amin(-1), max=1.0) if nonneg else torch.ones_like(ratio.amin(-1))
+    return d, slope, alpha, bound, projected_gnorm2
+
+
 def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, nonneg=True,
                       rowwise=None, deriv=None):
     """One exact projected-Newton step on a single factor.
@@ -107,68 +155,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, non
         grad = (other.T @ G).T
         V = V.T
 
-    M = flat.new_zeros(flat.shape[0], rank, rank)
-    M[:, rows, cols] = flat
-    M[:, cols, rows] = flat
-
-    # Two-metric projection: freeze the variables sitting on the V >= 0 boundary
-    # whose gradient pushes them further out, and Newton-step the rest.
-    eps_active = _ACTIVE_TOL * V.abs().amax(-1, keepdim=True).mean()
-    # nonneg=False drops the bound on V: no active set, no feasibility limit on
-    # the step, no clamp. Used for the unconstrained estimate of the spectra.
-    bound = ((V <= eps_active) & (grad > 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
-    free = ~bound
-    # The projected gradient is the KKT residual for this block, and it is already
-    # in hand here; returning it lets the driver test convergence without paying
-    # for a second derivative evaluation.
-    projected_gnorm2 = ((grad * free) ** 2).sum()
-    eye = torch.eye(rank, dtype=V.dtype, device=V.device)
-    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
-    rhs = torch.where(free, grad, torch.zeros_like(grad))
-
-    d = _batched_spd_solve(M, rhs, jitter_rel)
-    d = torch.where(free, d, torch.zeros_like(d))
-
-    # An entry sitting at zero with a NEGATIVE gradient violates KKT and must move
-    # inward. It is in the free set, but the coupled Newton direction for it can
-    # still point outward (d > 0 here means V decreases), and the max-feasible-step
-    # rule below would then zero the step for the whole row -- one such entry
-    # pins all R of its neighbours, and a component that lands there stays dead.
-    # Two-metric projection proper uses the scaled gradient for bound-adjacent
-    # variables, so do that: d = grad / diag(M) < 0 moves the entry off the
-    # bound. Interior entries keep the full Newton direction.
-    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
-    inward = ((V <= eps_active) & (grad < 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
-    d = torch.where(inward, grad / diag_M, d)
-
-    # Trust region, per row. The feasibility clamp below only bounds directions
-    # that drive a factor toward zero; nothing bounds one that grows it. A row
-    # whose Z has underflowed to zero (float32 loses exp(-X) past X ~ 88) carries
-    # no curvature, so the damped solve returns a direction of order 1/tiny --
-    # large but finite, so it survives every non-finite check and only overflows
-    # on the next matmul. Keeping the step within the scale of the row itself
-    # costs nothing when the Hessian is healthy.
-    # The floor is at the problem's scale, not machine epsilon. A row pinned
-    # near zero -- values of 1e-112 occur in float64 -- can only grow 16x per
-    # step, and the loss-based stopping rule fires during that crawl: a float64
-    # W solve stopped with a projected gradient 3e5 times the float32 one. In
-    # float32 eps (1.2e-7 against rows of 0.08) happened to be a workable floor.
-    # From 1e-3 of the mean row scale any row recovers in two or three steps.
-    row_max = V.abs().amax(-1, keepdim=True)
-    floor = torch.clamp(_TRUST_FLOOR * row_max.mean(), min=torch.finfo(V.dtype).eps)
-    limit = 16.0 * torch.maximum(row_max, floor)
-    d = torch.clamp(d, min=-limit, max=limit)
-
-    slope = (grad * d).sum(-1)
-    not_descent = (slope <= 0)[:, None]
-    diag = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
-    d = torch.where(not_descent, torch.clamp(rhs / diag, min=-limit, max=limit), d)
-    slope = (grad * d).sum(-1)
-
-    # Largest step that keeps V >= 0 exactly, so no projection is needed afterwards.
-    ratio = torch.where(d > 0, V / d.clamp_min(torch.finfo(V.dtype).tiny),
-                        torch.full_like(d, float('inf')))
-    alpha = torch.clamp(ratio.amin(-1), max=1.0) if nonneg else torch.ones_like(ratio.amin(-1))
+    d, slope, alpha, bound, projected_gnorm2 = _two_metric_direction(V, grad, flat, rows, cols, jitter_rel, nonneg)
 
     # X(alpha) along the step is exactly X - alpha * B, so the line search is
     # elementwise: no candidate factors and no extra matmuls are materialised.
@@ -256,6 +243,18 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
             prev_loss = loss
     return W, H, num_steps
 
+
+
+def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compile_mode=None):
+    """The pixel coefficients for a fixed H: independent convex problems per pixel,
+    solved by block-Newton W steps from W_init (or a clamped least-squares warm
+    start, the initialization optimize() uses). The single home of the "re-solve
+    W given H" call; callers pass the tolerances they need."""
+    if W_init is None:
+        W_init = torch.linalg.lstsq(H.T, T.T)[0].T.clamp(min=0)
+    W, _, _ = block_newton_optimize(T, H.shape[0], max_steps, rel_tol, update_H=False, W_init=W_init, H_init=H,
+                                    compile_mode=compile_mode, nonneg_W=nonneg)
+    return W
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-12,
                      precond_jitter=1e-8, prep=None, verbose=False, nnal=None, deriv=None, tilt_H=None,

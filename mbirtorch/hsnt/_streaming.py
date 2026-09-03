@@ -1,9 +1,8 @@
 import torch
 
 from . import _newton
-from ._linalg import _batched_spd_solve
 from ._loss import _nnal_prep
-from ._newton import _kernels, block_newton_optimize
+from ._newton import _kernels, solve_W
 from .factorization import nnal_factorization
 
 
@@ -26,38 +25,11 @@ def _h_stats_accumulate(W, H, T, prep, rows, cols, deriv, rowwise):
 
 
 def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
-    """Projected-Newton direction on H from accumulated statistics.
-
-    Mirrors the H axis of block_newton_step -- two-metric projection, KKT release
-    of bound entries with an inward gradient, trust region, descent safeguard,
-    feasibility bound -- operating on the (K, R) transpose. Returns (d, slope,
-    alpha_max) with one row/entry per bin.
-    """
-    V = H.T
-    g = grad.T
-    rank = V.shape[1]
-    M = flat.new_zeros(flat.shape[1], rank, rank)
-    M[:, rows, cols] = flat.T
-    M[:, cols, rows] = flat.T
-    eps_active = _newton._ACTIVE_TOL * V.abs().amax(-1, keepdim=True).mean()
-    bound = (V <= eps_active) & (g > 0)
-    free = ~bound
-    eye = torch.eye(rank, dtype=V.dtype, device=V.device)
-    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
-    rhs = torch.where(free, g, torch.zeros_like(g))
-    d = _batched_spd_solve(M, rhs, jitter_rel)
-    d = torch.where(free, d, torch.zeros_like(d))
-    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
-    d = torch.where((V <= eps_active) & (g < 0), g / diag_M, d)
-    row_max = V.abs().amax(-1, keepdim=True)
-    floor = torch.clamp(_newton._TRUST_FLOOR * row_max.mean(), min=torch.finfo(V.dtype).eps)   # same floor as block_newton_step
-    limit = 16.0 * torch.maximum(row_max, floor)
-    d = torch.clamp(d, min=-limit, max=limit)
-    slope = (g * d).sum(-1)
-    d = torch.where((slope <= 0)[:, None], torch.clamp(rhs / diag_M, min=-limit, max=limit), d)
-    slope = (g * d).sum(-1)
-    ratio = torch.where(d > 0, V / d.clamp_min(torch.finfo(V.dtype).tiny), torch.full_like(d, float('inf')))
-    return d, slope, torch.clamp(ratio.amin(-1), max=1.0)
+    """Projected-Newton direction on H from accumulated statistics: the H axis of
+    block_newton_step on the (K, R) transpose. Returns (d, slope, alpha_max) with
+    one row/entry per bin; see _newton._two_metric_direction."""
+    d, slope, alpha, _, _ = _newton._two_metric_direction(H.T, grad.T, flat.T, rows, cols, jitter_rel)
+    return d, slope, alpha
 
 
 def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384,
@@ -154,12 +126,8 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             if i + 1 < len(chunks):
                 nxt = to_device(chunks[i + 1])            # prefetch overlaps the solve below
             prep = _nnal_prep(Tc)
-            if W_chunks[i] is not None:
-                W0 = W_chunks[i].to(device=device, dtype=H.dtype)
-            else:                                            # optimize()'s initialization for a fixed H
-                W0 = torch.linalg.lstsq(H.T, Tc.T)[0].T.clamp(min=0)
-            W, _, _ = block_newton_optimize(Tc, R, w_max_steps, w_rel_tol, update_H=False, W_init=W0,
-                                            H_init=H.clone(), compile_mode=compile_mode, nonneg_W=nonneg_W)
+            W0 = W_chunks[i].to(device=device, dtype=H.dtype) if W_chunks[i] is not None else None
+            W = solve_W(Tc, H.clone(), W0, w_max_steps, w_rel_tol, nonneg=nonneg_W, compile_mode=compile_mode)
             W_chunks[i] = W.cpu()
             g_c, f_c, b_c = _h_stats_accumulate(W, H, Tc, prep, rows, cols, deriv, rowwise)
             grad += g_c; flat += f_c; base += b_c; scale += (W.T @ Tc).to(torch.float64)
@@ -220,9 +188,8 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         # The physical coefficients: one more pass, W >= 0 given the final H.
         for i in range(len(chunks)):
             Tc = to_device(chunks[i])
-            W, _, _ = block_newton_optimize(Tc, R, w_max_steps, w_rel_tol, update_H=False,
-                                            W_init=W_chunks[i].to(device=device, dtype=H.dtype).clamp(min=0),
-                                            H_init=H.clone(), compile_mode=compile_mode)
+            W = solve_W(Tc, H.clone(), W_chunks[i].to(device=device, dtype=H.dtype).clamp(min=0),
+                        w_max_steps, w_rel_tol, compile_mode=compile_mode)
             W_chunks[i] = W.cpu()
             del Tc, W
     return W_chunks, H, passes

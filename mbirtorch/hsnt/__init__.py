@@ -34,7 +34,7 @@ _estimate_subspace_dimension), so importing this package does not import it.
 from ._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives, _nnal_rowwise
 from ._linalg import _randomized_svd, nndsvda, _batched_spd_solve, _joint_blocks, _joint_dot
 from ._multiplicative import _shifted, _rebalance, _reseed_dead, quadratic_update, newton_update, multiplicative_update
-from ._newton import (_COMPILED_KERNELS, _ARMIJO_FLOOR, _TRUST_FLOOR, _ACTIVE_TOL, _kernels, block_newton_step,
+from ._newton import (_COMPILED_KERNELS, _ARMIJO_FLOOR, _TRUST_FLOOR, _ACTIVE_TOL, _kernels, _two_metric_direction, solve_W, block_newton_step,
                       block_newton_optimize, _joint_newton_pcg, joint_newton_optimize)
 from ._streaming import _h_stats_accumulate, _h_direction, stream_factorization
 from .factorization import optimize, nnal_factorization

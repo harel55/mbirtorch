@@ -3,7 +3,7 @@ import math
 import torch
 
 from ._loss import _nnal_prep
-from ._newton import _joint_newton_pcg, _kernels, block_newton_optimize
+from ._newton import _joint_newton_pcg, _kernels, solve_W
 
 
 def unconstrained_spectra(T, W, H, max_steps=300, cg_max=10, rel_tol=1e-10, w_max_steps=100, compile_mode=None):
@@ -31,8 +31,7 @@ def unconstrained_spectra(T, W, H, max_steps=300, cg_max=10, rel_tol=1e-10, w_ma
     prep = _nnal_prep(T)
     _, Hu, steps, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps, cg_max=cg_max, rel_tol=rel_tol,
                                         prep=prep, nnal=nnal_fn, deriv=deriv, nonneg_W=False)
-    Wc, _, _ = block_newton_optimize(T, H.shape[0], w_max_steps, 1e-12, update_H=False, W_init=W, H_init=Hu,
-                                     compile_mode=compile_mode)
+    Wc = solve_W(T, Hu, W, w_max_steps, 1e-12, compile_mode=compile_mode)
     return Wc, Hu, steps
 
 
@@ -75,9 +74,7 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
     W_sub = []
     for S in subsets:
         idx = torch.tensor(S, device=T.device)
-        Ws, _, _ = block_newton_optimize(T, len(S), w_max_steps, 1e-12, update_H=False,
-                                         W_init=W[:, idx].contiguous(), H_init=H[idx].contiguous(),
-                                         compile_mode=compile_mode)
+        Ws = solve_W(T, H[idx].contiguous(), W[:, idx].contiguous(), w_max_steps, 1e-12, compile_mode=compile_mode)
         crit.append(rowwise(Ws @ H[idx], T, prep, 1, dtype=torch.float64) * dose + penalty * len(S))
         W_sub.append(Ws)
     best = torch.stack(crit, 1).argmin(1)                    # 0 = empty, j + 1 = subsets[j]
