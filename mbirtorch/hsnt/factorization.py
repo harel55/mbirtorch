@@ -3,7 +3,7 @@ import torch
 
 from ._linalg import nndsvda
 from ._loss import _nnal_prep, stable_nnal
-from ._multiplicative import multiplicative_update, newton_update, quadratic_update
+from ._multiplicative import multiplicative_update
 from ._newton import block_newton_optimize, joint_newton_optimize
 
 
@@ -124,9 +124,10 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     reaches machine precision on exactly factorizable data. 'block_newton' is the
     alternating exact projected-Newton method (linear convergence; also the warm-up
     and the fixed-H solver). 'mann_multiplicative' is the damped, extrapolated
-    multiplicative update, at parity with joint_newton in wall clock. 'quadratic'
-    (IRLS) and 'quasi_newton' (diagonal Hessian) are kept for comparison; both are
-    dominated. Measurements: docs/hsnt_solver_notes.md, section 3.
+    multiplicative update, at parity with joint_newton in wall clock. The former
+    'quadratic' (IRLS) and 'quasi_newton' (diagonal Hessian) methods were removed
+    in the 2026-09 cleanup as dominated. Measurements: docs/hsnt_solver_notes.md,
+    section 3.
 
     rel_tol is the relative change in the loss per step (summed in float64) at
     which a method stops, and means the same thing for every method. It is not
@@ -148,19 +149,14 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     subsample H is fitted on. It defaults to 0 so two batched runs on the same
     data give the same answer; pass None for fresh entropy each call.
     """
-    if method == 'quasi_newton':
-        update = newton_update
-    elif method == 'mann_multiplicative':
+    if method == 'mann_multiplicative':
         update = multiplicative_update
-    elif method == 'quadratic':
-        update = quadratic_update
     elif method == 'block_newton':
         update = block_newton_optimize
     elif method == 'joint_newton':
         update = joint_newton_optimize
     else:
-        raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton', "
-                         "'quasi_newton', 'mann_multiplicative' or 'quadratic'.")
+        raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton' or 'mann_multiplicative'.")
 
     if update in (block_newton_optimize, joint_newton_optimize):
         # These take compile_mode themselves and compile their hot kernels, not the

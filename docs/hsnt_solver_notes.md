@@ -136,6 +136,41 @@ truth (`bias_corrected_spectra` is kept for reference only: +0.02 to +0.05 dB at
 3 and 20.9/22.2 at dose 30 (oracle ceilings 11.6/12.3 and 22.3/23.3) for every estimator alike, against 8.4-8.8
 and 17.1-17.5 as fitted: 2.4-3.7 dB recoverable by a data-driven gauge criterion, still open.
 
+## 5b. Details removed from the code comments during the 2026-09-04 cleanup
+
+Kept here so the pointers in the code lose nothing.
+- Armijo floor: halving the floor halves the loss slop the streaming H step is allowed at large P (the noise
+  ball in which H wandered at 43.8 dB on 9.4M pixels) for about half an extra loss evaluation per step.
+- Compiled kernels: the GEMM-bound CG inner iteration does not benefit (1.07x). Compiled and eager agree
+  bit-for-bit over a joint_newton solve (28 steps) and over the first 40 block_newton steps; over a 729-step
+  block_newton run the fused reductions' different rounding eventually flips one active-set decision and the
+  paths separate (max |W, H| difference 1.6e-2) but end at the same loss to 2e-8 relative with identical
+  spectra. inductor reports too few SMs on the laptop card for its GEMM autotuning to apply. After the
+  cleanup's dedup the compiled joint solver took 46 steps instead of 45 to the same loss (graph fusion
+  differs once the direction code is a function), so the regression check allows +-2 steps on compiled and
+  batched paths.
+- joint_newton warm-up cost model: a block warm-up step costs about 1.4x a one-CG-iteration joint step.
+- Joint Hessian-vector product: six GEMMs (dW@H, W@dH, ZdX@H^T, G@dH^T, W^T@ZdX, dW^T@G), not five as
+  written elsewhere in these notes.
+- NNDSVDa fill: the mean/100 fill converged in a reduced subspace, 0.6% worse; the c = 1 sqrt(mean) fill lands
+  within 0.001% of the joint solver, and the multiplicative and joint solvers are indifferent to c across
+  0.1..1; classic NNDSVDa on the badly floored matrix was 35x worse.
+- Re-seeding dead components: the constant seed reaches the same loss as joint_newton to 0.3% at dose 3
+  (at dose 1 it fails; see section 3).
+- Nesterov restart cost: the cheap restart loss costs 0.5 ms against 4.3 ms for stable_nnal; checking with
+  the full loss every sweep limited an earlier version to 4x. Float64 sums: the multiplicative methods once
+  saw two identical consecutive float32 losses and stopped after two iterations.
+- Batched path history: the previous version factored every batch, then factored the stacked spectra again
+  with sklearn to reconcile them, one full solve per batch plus a host round trip.
+- Streaming polish_dtype: on an H100, whose kernels here are memory-bound, float64 costs about 2x (and
+  changed nothing; section 6).
+- unconstrained_spectra small-P penalty: measured -0.8 dB at 4k (single seed, fp64) and -0.6..-0.8 across seeds
+  in the grid, -0.7 at 16k, +0.3 at 65k; maps +0.15 dB.
+- bias_corrected_spectra: the bootstrap correction diverged once (1M px, rank 4). The orthant adjustment
+  removed 28% of the score bias with the right sign in the Monte Carlo (K = 300, dose 3) where Cox-Reid removed
+  none; using the conditional Schur-complement curvature instead made it 2.2x too large with the wrong sign;
+  a consistent version needs a differentiable bivariate/trivariate orthant probability.
+
 ## 6. Precision was not the cap
 Phase 1b (H100): float64 equals float32 at 262k and 524k (40.35 vs 40.39; 41.02 vs 41.07 dB). Phase 2: float64
 polish on 10M pixels reproduced every digit of the float32 run.

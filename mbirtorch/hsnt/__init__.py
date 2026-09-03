@@ -9,7 +9,6 @@ Submodules, one line each:
     _streaming          stream_factorization: the out-of-core factorization over chunks
     factorization       the `optimize` driver and the `nnal_factorization` front end
     spectra             unconstrained_spectra and support_selected_spectra, the re-estimates that remove the truncation bias
-    _bias_experimental  bias_corrected_spectra: the modified profile likelihood and the bootstrap (experimental; kept for reference)
     denoise             hyper_denoise / dehydrate / rehydrate and the subspace-dimension estimate (scikit-learn)
     io                  the hsnt HDF5 format: import_hsnt_data_hdf5, create_hsnt_metadata, export_hsnt_data_hdf5 (h5py)
     simulate            generate_hyper_data, the Ni/Cu/Al phantom
@@ -33,14 +32,12 @@ _estimate_subspace_dimension), so importing this package does not import it.
 """
 from ._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives, _nnal_rowwise
 from ._linalg import _randomized_svd, nndsvda, _batched_spd_solve, _joint_blocks, _joint_dot
-from ._multiplicative import _shifted, _rebalance, _reseed_dead, quadratic_update, newton_update, multiplicative_update
+from ._multiplicative import _shifted, _rebalance, _reseed_dead, multiplicative_update
 from ._newton import (_COMPILED_KERNELS, _ARMIJO_FLOOR, _TRUST_FLOOR, _ACTIVE_TOL, _kernels, _two_metric_direction, solve_W, block_newton_step,
                       block_newton_optimize, _joint_newton_pcg, joint_newton_optimize)
 from ._streaming import _h_stats_accumulate, _h_direction, stream_factorization
 from .factorization import optimize, nnal_factorization
 from .spectra import unconstrained_spectra, support_selected_spectra
-from ._bias_experimental import (_CORRECTIONS, _kr_matrices, _adjustment_value_and_grad, _bootstrap_score_bias,
-                                 bias_corrected_spectra)
 from .denoise import hyper_denoise, dehydrate, rehydrate, _estimate_subspace_dimension
 from .io import (KEY_DESCRIPTIONS, VALIDATION_RULES, ALLOWED_KEYS, _validate_key, _with_key_docstring,
                  import_hsnt_data_hdf5, create_hsnt_metadata, export_hsnt_data_hdf5)
@@ -54,6 +51,6 @@ __all__ = [
     "nnal_factorization", "stable_nnal", "stable_nnal_derivatives",
     "compare_spectra",
     "stream_factorization",
-    "unconstrained_spectra", "support_selected_spectra", "bias_corrected_spectra",
+    "unconstrained_spectra", "support_selected_spectra",
     "nndsvda", "optimize", "block_newton_optimize", "joint_newton_optimize", "block_newton_step",
 ]

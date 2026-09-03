@@ -29,7 +29,7 @@ Grouped by technique, with the part of the code each reference explains.
 - Eisenstat & Walker, *Choosing the forcing terms in an inexact Newton method*, SIAM J. Sci. Comput. 17 (1996). Adaptive CG tolerance.
 - Pearlmutter, *Fast exact multiplication by the Hessian*, Neural Computation 6 (1994); Martens, *Deep learning via Hessian-free optimization*, ICML (2010). Matrix-free Hessian-vector products.
 
-## 5. IRLS and majorization (`quadratic_update`)
+## 5. IRLS and majorization (the former `quadratic_update`, removed in the 2026-09 cleanup as dominated)
 - Green, *Iteratively reweighted least squares for maximum likelihood estimation, and some robust and resistant alternatives*, JRSS B 46 (1984).
 - Hunter & Lange, *A tutorial on MM algorithms*, The American Statistician 58 (2004).
 

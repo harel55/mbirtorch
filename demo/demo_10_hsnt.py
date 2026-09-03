@@ -98,7 +98,7 @@ def main():
     # Perform hyperspectral denoising
     start_time = time.time()
     W_newt, H_newt, i_newt = nnal_factorization(
-        T, method='quasi_newton', **kwargs, W_init=W.clone(), H_init=H.clone()
+        T, method='joint_newton', **kwargs, W_init=W.clone(), H_init=H.clone()
     )
     print(f'Newton reconstruction completed in: {time.time() - start_time} seconds after {i_newt} iterations')
     start_time = time.time()
@@ -107,31 +107,31 @@ def main():
     )
     print(f'Multiplicative reconstruction completed in: {time.time() - start_time} seconds after {i_mu} iterations')
     start_time = time.time()
-    W_quad, H_quad, i_quad = nnal_factorization(
-        T, method='quadratic', **kwargs, W_init=W.clone(), H_init=H.clone()
+    W_blk, H_blk, i_blk = nnal_factorization(
+        T, method='block_newton', **kwargs, W_init=W.clone(), H_init=H.clone()
     )
-    print(f'Quadratic reconstruction completed in: {time.time() - start_time} seconds after {i_quad} iterations')
+    print(f'Block-Newton reconstruction completed in: {time.time() - start_time} seconds after {i_blk} iterations')
 
     print(f"attenuation loss Scipy:\t\t\t\t{stable_nnal(W @ H, T).item()}")
     print(f"attenuation loss Newton (Scipy init):\t\t{stable_nnal(W_newt @ H_newt, T).item()}")
     print(f"attenuation loss Mann (Scipy init):\t\t{stable_nnal(W_mu @ H_mu, T).item()}")
-    print(f"attenuation loss Quadratic (Scipy init):\t{stable_nnal(W_quad @ H_quad, T).item()}")
+    print(f"attenuation loss Block Newton (Scipy init):\t{stable_nnal(W_blk @ H_blk, T).item()}")
     print()
     print(f"T-weighted L2 loss Scipy:\t\t\t{(T*((torch.log(T) + (W @ H))**2)).sum().item()/2}")
     print(f"T-weighted L2 loss Newton (Scipy init):\t\t{(T*((torch.log(T) + (W_newt @ H_newt))**2)).sum().item()/2}")
     print(f"T-weighted L2 loss Mann (Scipy init):\t\t{(T*((torch.log(T) + (W_mu @ H_mu))**2)).sum().item()/2}")
-    print(f"T-weighted L2 loss Quadratic (Scipy init):\t{(T*((torch.log(T) + (W_quad @ H_quad))**2)).sum().item()/2}")
+    print(f"T-weighted L2 loss Block Newton (Scipy init):\t{(T*((torch.log(T) + (W_blk @ H_blk))**2)).sum().item()/2}")
     print()
     print(f"L2 loss Scipy:\t\t\t{torch.linalg.norm(torch.log(T) + (W @ H)).item()}")
     print(f"L2 loss Newton (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_newt @ H_newt)).item()}")
     print(f"L2 loss Mann (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_mu @ H_mu)).item()}")
-    print(f"L2 loss Quadratic (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_quad @ H_quad)).item()}")
+    print(f"L2 loss Block Newton (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_blk @ H_blk)).item()}")
 
     # Compute least squares estimate of material coefficients for current projections
     theta_frob = torch.linalg.lstsq(H.T, material_basis.T)[0].T
     theta_newt = torch.linalg.lstsq(H_newt.T, material_basis.T)[0].T
     theta_mu = torch.linalg.lstsq(H_mu.T, material_basis.T)[0].T
-    theta_quad = torch.linalg.lstsq(H_quad.T, material_basis.T)[0].T
+    theta_blk = torch.linalg.lstsq(H_blk.T, material_basis.T)[0].T
 
     # Move everything back to CPU for plotting
     material_projection = material_projection.cpu().numpy()
@@ -143,12 +143,12 @@ def main():
     H_newt = H_newt.cpu().numpy()
     W_mu = W_mu.cpu().numpy()
     H_mu = H_mu.cpu().numpy()
-    W_quad = W_quad.cpu().numpy()
-    H_quad = H_quad.cpu().numpy()
+    W_blk = W_blk.cpu().numpy()
+    H_blk = H_blk.cpu().numpy()
     theta_frob = theta_frob.cpu().numpy()
     theta_newt = theta_newt.cpu().numpy()
     theta_mu = theta_mu.cpu().numpy()
-    theta_quad = theta_quad.cpu().numpy()
+    theta_blk = theta_blk.cpu().numpy()
 
     # Plot reconstructed spectra
     compare_spectra(
@@ -156,7 +156,7 @@ def main():
             theta_frob @ H,
             theta_newt @ H_newt,
             theta_mu @ H_mu,
-            theta_quad @ H_quad,
+            theta_blk @ H_blk,
         ],
         ground_truth=material_basis,
         labels=['Ni', 'Cu', 'Al'],
@@ -183,7 +183,7 @@ def main():
             ((W @ np.linalg.pinv(theta_frob)).reshape(image_dims) / row_max, 'L$^2$ Loss'),
             ((W_newt @ np.linalg.pinv(theta_newt)).reshape(image_dims) / row_max, 'Quasi-Newton'),
             ((W_mu @ np.linalg.pinv(theta_mu)).reshape(image_dims) / row_max, 'Mann-Multiplicative'),
-            ((W_quad @ np.linalg.pinv(theta_quad)).reshape(image_dims) / row_max, 'T-Weighted L$^2$'),
+            ((W_blk @ np.linalg.pinv(theta_blk)).reshape(image_dims) / row_max, 'T-Weighted L$^2$'),
         ]):
         ax = plt.subplot(1, 5, i + 1)
         ax.set_title(title)

@@ -1,6 +1,5 @@
 import torch
 
-from ._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 
 
 def _shifted(V, ratio, shift, mode, mean_dim):
@@ -33,120 +32,6 @@ def _shifted(V, ratio, shift, mode, mean_dim):
         scale = torch.where(V <= 0, scale.expand_as(V), torch.zeros_like(V))
     return (V * ratio + scale * (ratio - 1.0)).clamp_(min=0)
 
-
-def quadratic_update(W, H, T, unused=None, update_H=True, prep=None,
-                     shift=1e-1, shift_mode='boundary', ratio_max=2.0):
-    """Iteratively reweighted multiplicative update for the NNAL.
-
-    The second-order model of the NNAL at the current iterate X is
-
-        L(X') ~ L(X) + G (X' - X) + (1/2) Z (X' - X)^2 = (1/2) Z (X' - V)^2 + c
-
-    with G = T - exp(-X), Z = exp(-X) and target V = X - G/Z. Reweighted least
-    squares on that model, relinearized every step, has the NNAL stationary point
-    as its fixed point: IRLS on the true NNAL, with a weight exp(-X) > 0 on every
-    measurement, so none is dropped.
-
-    Z V = Z X - G, which needs no exp(+X) and so stays bounded however large the
-    attenuation gets. Z V is signed, so the multiplicative update splits it into
-    positive and negative parts and puts each on the side of the ratio where it
-    keeps W and H nonnegative; at the fixed point the ratio is one, which gives
-    (exp(-X) - T) H^T = 0, exactly the NNAL stationarity condition.
-
-    This is a Gauss-Newton style surrogate, not a majorizer, so individual steps
-    are not guaranteed to decrease the loss. See docs/hsnt_solver_notes.md, section 3.
-
-    Args:
-        W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
-        H: Spectral basis matrix (num_materials × spectral channels), PyTorch tensor
-        T: Data term matrix (spatial pixels × spectral channels), PyTorch tensor
-        unused: Placeholder for auxiliary state (not used by this method).
-        update_H: If False, keep H fixed and only update W.
-        prep: Optional tuple from _nnal_prep(T).
-
-    Returns:
-        Updated (W, H) pair as PyTorch tensors
-    """
-    prep = _nnal_prep(T) if prep is None else prep
-    tiny = torch.finfo(T.dtype).tiny
-
-    X = W @ H
-    G, Z = stable_nnal_derivatives(X, T, prep)
-    ZV = Z * X - G
-    # This ratio is undamped and can be very large. shift_mode='const' rides on it
-    # for every entry and diverges to NaN within a few hundred iterations without a
-    # cap; 'boundary' only offsets entries already at zero and is safe uncapped, so
-    # the cap is applied only where it is needed and never alters the plain update.
-    cap = ratio_max if (shift > 0 and shift_mode == 'const') else float('inf')
-    ratio = ((ZV.clamp(min=0) @ H.T)
-             / ((Z * X) @ H.T + (-ZV).clamp(min=0) @ H.T).clamp(min=tiny))
-    W = _shifted(W, ratio.clamp(max=cap), shift, shift_mode, 0)
-
-    if update_H:
-        # Relinearize before the H step: the model is only second order accurate
-        # at the iterate it was expanded about, and W has just moved.
-        X = W @ H
-        G, Z = stable_nnal_derivatives(X, T, prep)
-        ZV = Z * X - G
-        ratio = ((W.T @ ZV.clamp(min=0))
-                 / (W.T @ (Z * X) + W.T @ (-ZV).clamp(min=0)).clamp(min=tiny))
-        H = _shifted(H, ratio.clamp(max=cap), shift, shift_mode, 1)
-
-    return W, H, 0.0
-
-
-def newton_update(W, H, T, lr_init, update_H=True, prep=None):
-    """PyTorch-optimized Newton update with automatic differentiation and line search.
-
-    Args:
-        W: Feature matrix (spatial pixels × num_materials), PyTorch tensor
-        H: Spectral basis matrix (num_materials × spectral channels), PyTorch tensor
-        T: Data term matrix (spatial pixels × spectral channels), PyTorch tensor
-        lr_init: Initial learning rate for line search
-        update_H: If False, keep H fixed and only update W.
-
-    Returns:
-        Updated (W, H) pair as PyTorch tensors
-    """
-    X = W @ H
-    G, Z = stable_nnal_derivatives(X, T, prep)
-    init_loss = stable_nnal(X, T, prep)
-
-    # Compute gradients
-    grad_W = G @ H.T
-    grad_H = W.T @ G
-
-    # Compute Hessian diagonal approximation manually (kept explicit for numerical stability)
-    d2L_dW2 = Z @ H.T.pow(2)
-    d2L_dH2 = W.T.pow(2) @ Z
-
-    dW = grad_W / (d2L_dW2 + 1e-30)
-    dH = grad_H / (d2L_dH2 + 1e-30) if update_H else torch.zeros_like(H)
-
-    learning_rates = lr_init * torch.logspace(
-        -10, 1, steps=13, base=2, dtype=T.dtype, device=T.device
-    )
-    W_candidates = torch.clip(W[None] - learning_rates[:, None, None] * dW[None], min=1e-30)
-    if update_H:
-        H_candidates = torch.clip(H[None] - learning_rates[:, None, None] * dH[None], min=1e-30)
-    else:
-        H_candidates = H.expand(learning_rates.shape[0], -1, -1)
-
-    X_candidates = torch.bmm(W_candidates, H_candidates)
-    candidate_losses = stable_nnal(X_candidates, T, prep)
-    directional_derivatives = (
-        torch.sum(grad_W[None] * (W_candidates - W[None]), dim=(1, 2))
-        + torch.sum(grad_H[None] * (H_candidates - H[None]), dim=(1, 2))
-    )
-    armijo = candidate_losses <= init_loss + 1e-4 * directional_derivatives
-    valid_losses = torch.where(armijo, candidate_losses, torch.full_like(candidate_losses, torch.inf))
-    best_index = torch.argmin(valid_losses)
-    best_index = best_index.reshape(1)
-    return (
-        W_candidates.index_select(0, best_index).squeeze(0),
-        H_candidates.index_select(0, best_index).squeeze(0),
-        learning_rates.index_select(0, best_index).squeeze(0),
-    )
 
 def _rebalance(W, H):
     """Equalize the scale of each component between W and H, leaving W @ H fixed.
