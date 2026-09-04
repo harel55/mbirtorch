@@ -78,7 +78,14 @@ at zero and never moved under the plain update; 1.77% of entries were zero with 
 Random re-seeding of components dead in both factors (at dose 1 the constant seed scored -84 dB on the
 spectra against joint_newton's 21; a random positive seed scored 21.4). Nesterov extrapolation with
 function-value restart cut sweeps 17x on the demo (6580 -> 380) at 1.3x the cost per sweep, 13x in wall
-clock, lifting it from 40-70x slower than joint_newton to parity.
+clock, lifting it from 40-70x slower than joint_newton to parity. The extrapolated loop returns the best
+plain iterate and stops when the best has failed to improve by `rel_tol` per sweep over two consecutive
+checks (the momentum loss is not monotone). It converges sublinearly, so `rel_tol` buys less than for
+joint_newton: on the demo in float32, 1e-6 stops 275 sweeps in, 0.009% above the joint optimum (0.5 s);
+1e-7 at 465 sweeps and 0.001%; 1e-8 at 660 sweeps and 0.0001% (1.3 s). A 2026-09-03 fix: `nnal_factorization`
+tested `update is multiplicative_update` after `torch.compile` had replaced `update` with its wrapper, so
+every compiled multiplicative solve silently ran the plain sweeps and stopped 0.06% above the optimum at
+1.6x the sweeps; the compiled and eager updates themselves agree to 3e-7 per sweep.
 
 **quadratic (IRLS).** Relinearized weighted least squares on the true NNAL. It replaced an update that
 minimized `(1/2) sum T (X + log T)^2`, which converges somewhere other than the NNAL minimum and at low dose

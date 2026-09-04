@@ -56,23 +56,30 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         # fixed-point map g with linear convergence, and the classic momentum
         # sequence beta_k = (k-1)/(k+2) applied as y = clamp(x_k + beta (x_k - x_{k-1}), 0)
         # cuts its sweeps by an order of magnitude. The extrapolated point is only
-        # an input; the answer is always the last PLAIN iterate, so the fixed-point
-        # set is untouched. A function-value safeguard restarts the momentum
-        # whenever an extrapolated sweep raises the loss, since momentum on a
-        # fixed-point map can overshoot; it uses the raw sum(exp(-X) + T X) minus
-        # the constant that separates it from the shifted loss, far cheaper than
-        # stable_nnal, and is evaluated every extrapolate_check_every sweeps: the
-        # sweeps in between are unguarded, which is the price of the speed. rel_tol
-        # keeps its per-step meaning by comparing across the check interval.
-        # See docs/hsnt_solver_notes.md, section 3.
+        # an input; the answer is always a PLAIN iterate, so the fixed-point set is
+        # untouched. A function-value safeguard restarts the momentum whenever an
+        # extrapolated sweep raises the loss, since momentum on a fixed-point map
+        # can overshoot; it uses the raw sum(exp(-X) + T X) minus the constant that
+        # separates it from the shifted loss, far cheaper than stable_nnal, and is
+        # evaluated every extrapolate_check_every sweeps: the sweeps in between are
+        # unguarded, which is the price of the speed.
+        # The loss along a momentum sequence is not monotone, so the stopping test
+        # tracks the BEST plain iterate and stops only when the best has failed to
+        # improve by rel_tol per sweep over two consecutive checks; the best point is
+        # returned. On the demo this costs 5 sweeps over a test of consecutive
+        # losses and cannot be fooled by a single flat check. The multiplicative
+        # method converges sublinearly, so rel_tol = 1e-6 leaves it ~0.009% above the
+        # optimum where joint_newton is within 0.002%; 1e-8 reaches 0.0001% at 2.4x
+        # the sweeps. See docs/hsnt_solver_notes.md, section 3.
         log_T, positive, _, _ = prep
         const = torch.sum(torch.where(positive, T * (1.0 - log_T), torch.zeros_like(T)),
                           dtype=torch.float64)
         cheap = lambda X: torch.sum(torch.exp(-X) + T * X, dtype=torch.float64) - const
         noise = 1e-9                                  # fp32 elementwise noise on the raw sum is ~1e-10 relative
-        Wp, Hp = W, H                                 # last plain iterate: the answer
+        Wp, Hp = W, H                                 # last plain iterate
         Wy, Hy = W, H                                 # extrapolated input to the sweep
         prev, j = None, 0
+        best, Wb, Hb, stalls = None, W, H, 0          # best plain iterate seen: the answer
         for i in range(max_steps):
             Wn, Hn, aux = update(Wy, Hy, T, aux, update_H=update_H, prep=prep)
             num_steps = i + 1
@@ -82,16 +89,21 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
                 if prev is not None and (not torch.isfinite(L) or bool(L > prev * (1.0 + noise))):
                     Wy, Hy, j = Wp, Hp, 0                 # momentum hurt: restart from the last plain point
                     continue
-                if prev is not None and rel_tol > 0 and bool(
-                        torch.abs(L - prev) <= rel_tol * extrapolate_check_every * torch.abs(L)):
-                    Wp, Hp = Wn, Hn
+                first = best is None
+                if torch.isfinite(L) and (first or bool(L < best)):
+                    improved = first or bool(best - L > rel_tol * extrapolate_check_every * torch.abs(L))
+                    best, Wb, Hb = L, Wn, Hn
+                else:
+                    improved = False
+                stalls = 0 if improved else stalls + 1
+                if rel_tol > 0 and prev is not None and stalls >= 2:
                     break
                 prev = L
             beta = (j - 1) / (j + 2) if j > 1 else 0.0
             Wy = (Wn + beta * (Wn - Wp)).clamp_(min=0)
             Hy = (Hn + beta * (Hn - Hp)).clamp_(min=0)
             Wp, Hp = Wn, Hn
-        return Wp, Hp, num_steps
+        return Wb, Hb, num_steps
 
     # Converge on a float64 sum: in float32 the loss is quantized coarser than the
     # per-step progress at low dosage, and the test would fire on noise. See
@@ -158,6 +170,14 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     else:
         raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton' or 'mann_multiplicative'.")
 
+    if update is multiplicative_update:
+        # Nesterov extrapolation is on by default for the multiplicative update:
+        # same fixed points, far fewer sweeps (see optimize). Pass extrapolate=False
+        # to disable. Decided before torch.compile replaces `update` with its wrapper:
+        # an identity test after that point is false, and a compiled solve then ran
+        # the plain sweeps, stopping 0.06% above the optimum instead of 0.009%.
+        kwargs.setdefault('extrapolate', True)
+
     if update in (block_newton_optimize, joint_newton_optimize):
         # These take compile_mode themselves and compile their hot kernels, not the
         # driver: see _kernels. Wrapping the driver in torch.compile, as is done for
@@ -173,10 +193,6 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
             options=compile_options,
         )
 
-    if update is multiplicative_update:
-        # Nesterov extrapolation is on by default for the multiplicative update:
-        # same fixed points, far fewer sweeps (see optimize). Pass extrapolate=False to disable.
-        kwargs.setdefault('extrapolate', True)
     kwargs.update({
         'update': update,
         'num_materials': num_materials,

@@ -52,7 +52,9 @@ def main():
         noisy=True,
         verbose=verbose
     )
-    noisy_hyper_projection = torch.tensor(noisy_hyper_projection, dtype=torch.float64, device=device)
+    # float32: the solvers need no more (float64 changed nothing in the precision study) and it is
+    # several times faster on consumer GPUs, whose double-precision throughput is a small fraction of single.
+    noisy_hyper_projection = torch.tensor(noisy_hyper_projection, dtype=torch.float32, device=device)
     noisy_hyper_projection = torch.nan_to_num(noisy_hyper_projection, nan=0.0, posinf=0.0, neginf=0.0)  # Replace any NaNs or infs with zeros
     T = torch.exp(-noisy_hyper_projection).reshape(-1, noisy_hyper_projection.shape[-1])
     print(f"Range of T: {torch.min(T).item():.2g} to {torch.max(T).item():.2g}")
@@ -92,40 +94,36 @@ def main():
         'max_steps': 1000,
         'batch_size': None,
         'rel_tol': 1e-6,
-        'compile_mode': 'reduce-overhead',
+        # compile_mode='default' compiles the hot kernels: a one-off cost of seconds that pays only for
+        # repeated solves, so it is left off for this single pass per method.
     }
 
     # Perform hyperspectral denoising
     start_time = time.time()
     W_newt, H_newt, i_newt = nnal_factorization(
-        T, method='joint_newton', **kwargs, W_init=W.clone(), H_init=H.clone()
+        T, method='joint_newton', **kwargs
     )
-    print(f'Newton reconstruction completed in: {time.time() - start_time} seconds after {i_newt} iterations')
+    print(f'Joint-Newton reconstruction completed in: {time.time() - start_time} seconds after {i_newt} iterations')
     start_time = time.time()
     W_mu, H_mu, i_mu = nnal_factorization(
-        T, method='mann_multiplicative', **kwargs, W_init=W.clone(), H_init=H.clone()
+        T, method='mann_multiplicative', **kwargs
     )
     print(f'Multiplicative reconstruction completed in: {time.time() - start_time} seconds after {i_mu} iterations')
     start_time = time.time()
     W_blk, H_blk, i_blk = nnal_factorization(
-        T, method='block_newton', **kwargs, W_init=W.clone(), H_init=H.clone()
+        T, method='block_newton', **kwargs
     )
     print(f'Block-Newton reconstruction completed in: {time.time() - start_time} seconds after {i_blk} iterations')
 
-    print(f"attenuation loss Scipy:\t\t\t\t{stable_nnal(W @ H, T).item()}")
-    print(f"attenuation loss Newton (Scipy init):\t\t{stable_nnal(W_newt @ H_newt, T).item()}")
-    print(f"attenuation loss Mann (Scipy init):\t\t{stable_nnal(W_mu @ H_mu, T).item()}")
-    print(f"attenuation loss Block Newton (Scipy init):\t{stable_nnal(W_blk @ H_blk, T).item()}")
+    print(f"attenuation loss Scipy:\t\t{stable_nnal(W @ H, T).item()}")
+    print(f"attenuation loss Joint Newton:\t{stable_nnal(W_newt @ H_newt, T).item()}")
+    print(f"attenuation loss Mann:\t\t{stable_nnal(W_mu @ H_mu, T).item()}")
+    print(f"attenuation loss Block Newton:\t{stable_nnal(W_blk @ H_blk, T).item()}")
     print()
-    print(f"T-weighted L2 loss Scipy:\t\t\t{(T*((torch.log(T) + (W @ H))**2)).sum().item()/2}")
-    print(f"T-weighted L2 loss Newton (Scipy init):\t\t{(T*((torch.log(T) + (W_newt @ H_newt))**2)).sum().item()/2}")
-    print(f"T-weighted L2 loss Mann (Scipy init):\t\t{(T*((torch.log(T) + (W_mu @ H_mu))**2)).sum().item()/2}")
-    print(f"T-weighted L2 loss Block Newton (Scipy init):\t{(T*((torch.log(T) + (W_blk @ H_blk))**2)).sum().item()/2}")
-    print()
-    print(f"L2 loss Scipy:\t\t\t{torch.linalg.norm(torch.log(T) + (W @ H)).item()}")
-    print(f"L2 loss Newton (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_newt @ H_newt)).item()}")
-    print(f"L2 loss Mann (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_mu @ H_mu)).item()}")
-    print(f"L2 loss Block Newton (Scipy init):\t{torch.linalg.norm(torch.log(T) + (W_blk @ H_blk)).item()}")
+    print(f"L2 loss Scipy:\t\t{torch.linalg.norm(torch.log(T) + (W @ H)).item()}")
+    print(f"L2 loss Joint Newton:\t{torch.linalg.norm(torch.log(T) + (W_newt @ H_newt)).item()}")
+    print(f"L2 loss Mann:\t\t{torch.linalg.norm(torch.log(T) + (W_mu @ H_mu)).item()}")
+    print(f"L2 loss Block Newton:\t{torch.linalg.norm(torch.log(T) + (W_blk @ H_blk)).item()}")
 
     # Compute least squares estimate of material coefficients for current projections
     theta_frob = torch.linalg.lstsq(H.T, material_basis.T)[0].T
@@ -161,10 +159,10 @@ def main():
         ground_truth=material_basis,
         labels=['Ni', 'Cu', 'Al'],
         subtitles=[
-            r'L$^2$ Loss',
-            'Quasi-Newton (scipy init)',
-            'Mann-Multiplicative (scipy init)',
-            'T-Weighted L$^2$ (scipy init)',
+            r'Scipy L$^2$ Loss',
+            'Joint-Newton',
+            'Mann-Multiplicative',
+            'Block-Newton',
         ],
         title=f'Material attenuation spectra reconstructions',
         x_label='Wavelength index',
@@ -180,38 +178,15 @@ def main():
     image_dims = (detector_rows, detector_columns, num_materials_true)
     for i, (image, title) in enumerate([
             (material_projection.reshape(image_dims) / row_max, 'Ground Truth'),
-            ((W @ np.linalg.pinv(theta_frob)).reshape(image_dims) / row_max, 'L$^2$ Loss'),
-            ((W_newt @ np.linalg.pinv(theta_newt)).reshape(image_dims) / row_max, 'Quasi-Newton'),
+            ((W @ np.linalg.pinv(theta_frob)).reshape(image_dims) / row_max, 'Scipy L$^2$ Loss'),
+            ((W_newt @ np.linalg.pinv(theta_newt)).reshape(image_dims) / row_max, 'Joint-Newton'),
             ((W_mu @ np.linalg.pinv(theta_mu)).reshape(image_dims) / row_max, 'Mann-Multiplicative'),
-            ((W_blk @ np.linalg.pinv(theta_blk)).reshape(image_dims) / row_max, 'T-Weighted L$^2$'),
+            ((W_blk @ np.linalg.pinv(theta_blk)).reshape(image_dims) / row_max, 'Block-Newton'),
         ]):
         ax = plt.subplot(1, 5, i + 1)
         ax.set_title(title)
         ax.imshow(image)
     plt.savefig(f'example_1_material_maps.png')
 
-    # plt.show()
-
 if __name__ == "__main__":
-    # dosages = np.logspace(0, 4, 101)
-
-    # os.remove('snr.txt')
-    # for dosage_rate in dosages:
     main()
-    #     plt.close('all')
-
-    # data = np.array(open("snr.txt").readlines(), dtype=float).reshape(-1,3,3)
-    # plt.rcParams['figure.constrained_layout.use'] = True
-    # plt.rc('font', size=12)
-    # plt.figure(figsize=(15, 5))
-    # for i, material in enumerate(["Ni", "Cu", "Al"]):
-    #     ax = plt.subplot(1, 3, i+1)
-    #     ax.plot(dosages, data[:,:,i])
-    #     ax.legend(['L$^2$ Norm','Quasi-Newton','Mann-Multiplicative'])
-    #     ax.set_xscale('log')
-    #     ax.set_xlabel('Dosage (arbitrary units)')
-    #     ax.set_ylabel('SNR (dB)')
-    #     ax.set_title(material)
-    # plt.suptitle('Denoising performance over dosage\nPixel count: 4096')
-    # plt.savefig('example_1_snr_4096.png')
-    # plt.show()
