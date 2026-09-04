@@ -59,3 +59,8 @@ Grouped by technique, with the part of the code each reference explains.
 - Bioucas-Dias et al., *Hyperspectral unmixing overview: geometrical, statistical, and sparse regression-based approaches*, IEEE JSTARS 5 (2012).
 
 Suggested order: Nocedal & Wright ch. 3/5/7 and Bertsekas (1982) for the solver; Gillis (2020) on identifiability for the gauge; Lancaster (2000) then Cox & Reid (1987) for the bias story; Santisteban (2001) for the strain physics.
+
+## 11. Gauge fixing by pure pixels (`pure_pixel_gauge`)
+- Fu, Huang, Sidiropoulos & Ma, *Nonnegative matrix factorization for signal and data analytics: identifiability, algorithms, and applications*, IEEE Signal Process. Mag. 36 (2019). When a nonnegative factorization is unique: separability (pure pixels) and the sufficiently-scattered condition; why the likelihood alone leaves the mixing free.
+- Nascimento & Bioucas-Dias, *Vertex component analysis: a fast algorithm to unmix hyperspectral data*, IEEE Trans. Geosci. Remote Sens. 43 (2005). Endmember extraction under the pure-pixel assumption, the same assumption `pure_pixel_gauge` rests on; it takes the cluster means rather than the extreme points, which noise pushes outward.
+- Arthur & Vassilvitskii, *k-means++: the advantages of careful seeding*, SODA (2007). The seeding of the cluster search.

@@ -141,7 +141,24 @@ truth (`bias_corrected_spectra` is kept for reference only: +0.02 to +0.05 dB at
 
 **Maps are gauge-limited.** With the fitted spectra rotated into the true gauge, maps reach 10.8/11.5 dB at dose
 3 and 20.9/22.2 at dose 30 (oracle ceilings 11.6/12.3 and 22.3/23.3) for every estimator alike, against 8.4-8.8
-and 17.1-17.5 as fitted: 2.4-3.7 dB recoverable by a data-driven gauge criterion, still open.
+and 17.1-17.5 as fitted: 2.4-3.7 dB recoverable by a data-driven gauge criterion.
+
+**Gauge fix (`pure_pixel_gauge`, 2026-09-04).** The likelihood does not identify the gauge: nonnegativity confines
+the mixing A to a polytope and the solver stops wherever its path ends there. In the MLE basis the true axes had
+L1 rows like (0.48, 0.11, 0.41) at dose 3 and (0.07, 0.01, 0.92) at dose 30, so a pure pixel has no dominant
+coefficient and a share threshold finds nothing (6 / 0 / 104 pixels at dose 3; one component dominated every pixel
+at dose 30); support-selected single-material pixels gave axis error 0.19 and worse maps. Clustering instead:
+intensity-weighted k-means (k-means++, 8 seeds) on the L1-normalised coefficient rows of the pixels with material
+(likelihood ratio against X = 0 above 2 log K), axes = cluster means, H := A H, W >= 0 re-solved with H fixed (a
+joint refit would return to the MLE gauge). It recovers the oracle: maps 8.35 -> 11.48 (oracle 11.47) at dose 3
+and 17.12 -> 22.14 (oracle 22.18) at dose 30 at 65k pixels, axis error 0.012 / 0.0001, identical with or without
+the weights, at 2 or 4 log K, and with constrained or unconstrained per-pixel means; the clustering takes 0.1-0.3 s
+and the W re-solve is the only real cost. The loss rises by 7e-4 relative, the same as the oracle's, so the loss
+cannot validate a gauge. Size dependence at dose 3 (seed 129): 4k pixels 7.90 -> 10.67 (oracle 10.97), 16k 8.29 ->
+11.41 (11.51), 65k 8.35 -> 11.48 (11.47); at 4k and dose 30, 17.04 -> 22.08 (22.43). About a tenth of the weakly
+attenuating aluminium pixels land in the other two clusters at every size, but the axis error still falls as
+1/sqrt(pixels) (0.057 / 0.021 / 0.012), so the residual is the noise of the cluster means, not the misassignment.
+The assumption is that every material has pure pixels.
 
 ## 5b. Details removed from the code comments during the 2026-09-04 cleanup
 

@@ -10,6 +10,7 @@ import torch
 
 hsnt = pytest.importorskip("mbirtorch.hsnt")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+ALIGN_MIN = 0.998        # pure_pixel_gauge on _problem(): 0.9992-0.9993 for seeds 0-2, against 0.991-0.994 for the MLE
 
 
 def _problem(P=2048, K=200, R=3, dose=10.0, seed=0, noisy=True, dtype=torch.float32):
@@ -70,6 +71,22 @@ def test_spectra_estimators_run_and_keep_w_nonnegative():
     Ws, Hs, support, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0)
     assert Ws.min() >= 0 and support.dtype == torch.bool and support.shape == W.shape
     assert bool((Ws[~support] == 0).all())                                          # off-support coefficients stay zero
+
+
+@cuda
+def test_pure_pixel_gauge_aligns_the_spectra_with_the_truth():
+    T, _, Ht = _problem()                                                             # one material per pixel: the pure-pixel case
+    W, H, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=300, rel_tol=1e-8)
+    Wg, Hg, A, labels = hsnt.pure_pixel_gauge(T, W, H, dose=10.0)
+
+    def alignment(Hf):                                                                # the worst true spectrum's best cosine against the fitted rows
+        Hn = torch.nn.functional.normalize(Hf.double(), dim=1); Tn = torch.nn.functional.normalize(Ht, dim=1)
+        return (Tn @ Hn.T).amax(1).amin().item()
+
+    assert Wg.min() >= 0 and Hg.min() >= 0 and A.shape == (3, 3)
+    assert torch.allclose(A.sum(1), torch.ones(3, dtype=A.dtype, device=A.device))
+    assert labels.shape == (T.shape[0],) and (labels[: T.shape[0] // 8] == -1).double().mean() > 0.9   # background left out
+    assert alignment(Hg) > ALIGN_MIN and alignment(Hg) > alignment(H)
 
 
 @cuda

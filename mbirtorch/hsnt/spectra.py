@@ -47,9 +47,9 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
     allowed: a pixel with no material), and (W on the selected supports, H) is
     then refit jointly. The selection is a model-selection step and carries its
     own errors; a stronger penalty helped monotonically up to the default 2 log K,
-    and a single select/refit round is the optimum (iterating degrades). It is the
-    one estimator here that also lifts the maps appreciably. Measurements:
-    docs/hsnt_solver_notes.md, section 5.
+    and a single select/refit round is the optimum (iterating degrades). It lifts
+    the maps a little as well; the gauge fix, pure_pixel_gauge, lifts them far
+    more. Measurements: docs/hsnt_solver_notes.md, section 5.
 
     Args:
         dose: open-beam counts per pixel and bin, which converts the loss to
@@ -86,3 +86,102 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
     if verbose:
         print(f'  supports: mean size {support.sum(1).double().mean().item():.2f}; joint refit {steps} steps', flush=True)
     return Wn, Hn, support, steps
+
+
+def pure_pixel_gauge(T, W, H, dose, penalty=None, seeds=8, kmeans_steps=100, w_max_steps=200, random_state=0,
+                     compile_mode=None, verbose=False):
+    """Re-mix the factorization so that each spectrum is the mean fitted spectrum of one cluster of pure pixels.
+
+    The likelihood does not identify the gauge. For any invertible A with
+    W A^-1 >= 0 and A H >= 0, (W A^-1, A H) fits the data exactly as well as
+    (W, H); nonnegativity only confines A to a polytope, and the joint solver
+    stops wherever its path ends inside it. On the phantom the fitted rows were
+    combinations of the true spectra with condition numbers 49 (dose 3) and 333
+    (dose 30), and the maps inherited the mixing: 8.4 dB against 11.5 for the
+    same subspace in the true gauge. The gauge is fixed with a prior the
+    likelihood lacks: most pixels contain a single material. The coefficient
+    rows of W, taken as directions, then form R clusters whose centres are the
+    rows of A, and A @ H are the pure pixels' mean spectra. Pixels without
+    material (likelihood ratio against X = 0 below `penalty`, in log-likelihood
+    units) are left out, the clusters are found by intensity-weighted k-means
+    from several k-means++ seeds, and W >= 0 is re-solved with the re-mixed H
+    held fixed. H is deliberately not refit: a joint refit returns to the MLE
+    gauge. Recovers the oracle rotation's maps (11.48 vs 11.47 dB at dose 3,
+    22.14 vs 22.18 at dose 30, 65k pixels; +3.1 and +5.0 dB over the MLE) for
+    the cost of one fixed-H W solve; the result was the same with or without
+    the intensity weights, at penalty 2 to 8 log K, and with constrained or
+    unconstrained per-pixel means. The estimate of A is noise-limited on small
+    images: at 4k pixels the maps stop 0.3 dB short of the oracle (7.9 -> 10.7
+    vs 11.0 at dose 3), at 16k 0.1 dB short, with the axis error falling as
+    1/sqrt(pixels). Requires every material to have pure pixels:
+    a material present only in mixtures pulls its axis into the data cone, and
+    a mixture-dominated dataset yields clusters that are not materials. The
+    order of the returned spectra is the cluster order, which is arbitrary.
+    Measurements: docs/hsnt_solver_notes.md, section 5.
+
+    Args:
+        dose: open-beam counts per pixel and bin, converting the loss to
+            log-likelihood units for the material test.
+        penalty: likelihood-ratio threshold for a pixel to count as carrying
+            material. Default 2 log K, the same as support_selected_spectra's
+            penalty for one coefficient.
+        seeds: k-means++ restarts; the lowest within-cluster dispersion wins.
+        random_state: seed of the k-means++ draws, so two calls agree.
+
+    Returns (W, H, A, labels): W >= 0 re-solved for the new H; H = A @ H_in
+    with the rows of A normalised to unit sum; labels the cluster of each
+    pixel, -1 for pixels left out of the clustering.
+    """
+    R, K = H.shape
+    penalty = 2.0 * math.log(K) if penalty is None else penalty
+    _, _, rowwise, _ = _kernels(compile_mode)
+    prep = _nnal_prep(T)
+    llr = dose * (rowwise(torch.zeros_like(T), T, prep, 1, dtype=torch.float64)
+                  - rowwise(W @ H, T, prep, 1, dtype=torch.float64))
+    keep = llr > penalty
+    n_keep = int(keep.sum())
+    if n_keep < R:
+        raise ValueError(f"pure_pixel_gauge: {n_keep} pixels carry material at penalty {penalty:.1f}; need at least {R}")
+    Wk = W[keep].double()
+    s = Wk.sum(1)                                                        # intensity: the weight of a pixel's direction
+    U = Wk / s[:, None].clamp_min(torch.finfo(torch.float64).tiny)       # direction on the simplex
+    gen = torch.Generator(device=W.device)
+    best = None
+    for seed in range(seeds):
+        gen.manual_seed(random_state + seed)
+        C = U[torch.multinomial(s, 1, generator=gen)]
+        for _ in range(1, R):                                            # k-means++: seed far from the seeds so far
+            p = s * torch.cdist(U, C).pow(2).amin(1)
+            p = p if p.sum() > 0 else torch.ones_like(p)
+            C = torch.cat([C, U[torch.multinomial(p / p.sum(), 1, generator=gen)]])
+        for _ in range(kmeans_steps):
+            labels = torch.cdist(U, C).argmin(1)
+            Cn = C.clone()
+            for k in range(R):
+                m = labels == k
+                if m.any():
+                    Cn[k] = (s[m, None] * U[m]).sum(0) / s[m].sum()
+            converged = torch.allclose(Cn, C, atol=1e-9, rtol=0.0)
+            C = Cn
+            if converged:
+                break
+        objective = (s * torch.cdist(U, C).pow(2).amin(1)).sum().item()
+        if best is None or objective < best[0]:
+            best = (objective, labels)
+    _, labels = best
+    A = torch.eye(R, dtype=torch.float64, device=W.device)               # an empty cluster keeps the fitted axis
+    for k in range(R):
+        m = labels == k
+        if m.any():
+            A[k] = Wk[m].sum(0)                                          # intensity-weighted mean direction
+    A = A / A.sum(1, keepdim=True)
+    H_new = (A @ H.double()).to(H.dtype).clamp_(min=0)
+    W0 = torch.linalg.lstsq(A.T, W.double().T)[0].T.clamp_(min=0).to(W.dtype).contiguous()   # W A^-1, the same maps in the new gauge
+    W_new = solve_W(T, H_new, W0, w_max_steps, 1e-12, compile_mode=compile_mode)
+    full = torch.full((T.shape[0],), -1, dtype=torch.long, device=T.device)
+    full[keep] = labels
+    if verbose:
+        sizes = [int((labels == k).sum()) for k in range(R)]
+        print(f'  pure_pixel_gauge: {n_keep} of {T.shape[0]} pixels carry material; clusters {sizes}; '
+              f'cond(A) {torch.linalg.cond(A).item():.1f}', flush=True)
+    return W_new, H_new, A, full
