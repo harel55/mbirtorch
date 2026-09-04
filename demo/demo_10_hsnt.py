@@ -106,7 +106,7 @@ def main():
     print(f'Joint-Newton reconstruction completed in: {time.time() - start_time} seconds after {i_newt} iterations')
     start_time = time.time()
     W_mu, H_mu, i_mu = nnal_factorization(
-        T, method='mann_multiplicative', **kwargs
+        T, method='multiplicative', **kwargs
     )
     print(f'Multiplicative reconstruction completed in: {time.time() - start_time} seconds after {i_mu} iterations')
     start_time = time.time()
@@ -117,12 +117,12 @@ def main():
 
     print(f"attenuation loss Scipy:\t\t{stable_nnal(W @ H, T).item()}")
     print(f"attenuation loss Joint Newton:\t{stable_nnal(W_newt @ H_newt, T).item()}")
-    print(f"attenuation loss Mann:\t\t{stable_nnal(W_mu @ H_mu, T).item()}")
+    print(f"attenuation loss Multiplicative:\t{stable_nnal(W_mu @ H_mu, T).item()}")
     print(f"attenuation loss Block Newton:\t{stable_nnal(W_blk @ H_blk, T).item()}")
     print()
     print(f"L2 loss Scipy:\t\t{torch.linalg.norm(torch.log(T) + (W @ H)).item()}")
     print(f"L2 loss Joint Newton:\t{torch.linalg.norm(torch.log(T) + (W_newt @ H_newt)).item()}")
-    print(f"L2 loss Mann:\t\t{torch.linalg.norm(torch.log(T) + (W_mu @ H_mu)).item()}")
+    print(f"L2 loss Multiplicative:\t{torch.linalg.norm(torch.log(T) + (W_mu @ H_mu)).item()}")
     print(f"L2 loss Block Newton:\t{torch.linalg.norm(torch.log(T) + (W_blk @ H_blk)).item()}")
 
     # Compute least squares estimate of material coefficients for current projections
@@ -161,7 +161,7 @@ def main():
         subtitles=[
             r'Scipy L$^2$ Loss',
             'Joint-Newton',
-            'Mann-Multiplicative',
+            'Multiplicative',
             'Block-Newton',
         ],
         title=f'Material attenuation spectra reconstructions',
@@ -180,7 +180,7 @@ def main():
             (material_projection.reshape(image_dims) / row_max, 'Ground Truth'),
             ((W @ np.linalg.pinv(theta_frob)).reshape(image_dims) / row_max, 'Scipy L$^2$ Loss'),
             ((W_newt @ np.linalg.pinv(theta_newt)).reshape(image_dims) / row_max, 'Joint-Newton'),
-            ((W_mu @ np.linalg.pinv(theta_mu)).reshape(image_dims) / row_max, 'Mann-Multiplicative'),
+            ((W_mu @ np.linalg.pinv(theta_mu)).reshape(image_dims) / row_max, 'Multiplicative'),
             ((W_blk @ np.linalg.pinv(theta_blk)).reshape(image_dims) / row_max, 'Block-Newton'),
         ]):
         ax = plt.subplot(1, 5, i + 1)

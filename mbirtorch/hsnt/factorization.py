@@ -135,7 +135,7 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     Newton solve on (W, H); the fastest to a given loss and the only one that
     reaches machine precision on exactly factorizable data. 'block_newton' is the
     alternating exact projected-Newton method (linear convergence; also the warm-up
-    and the fixed-H solver). 'mann_multiplicative' is the damped, extrapolated
+    and the fixed-H solver). 'multiplicative' is the damped, extrapolated
     multiplicative update, at parity with joint_newton in wall clock. The former
     'quadratic' (IRLS) and 'quasi_newton' (diagonal Hessian) methods were removed
     in the 2026-09 cleanup as dominated. Measurements: docs/hsnt_solver_notes.md,
@@ -146,7 +146,7 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     worth the same amount of convergence, though: joint_newton is close to its
     optimum at 1e-6, while block_newton and quadratic converge linearly and at
     1e-6 can stop on a plateau with a percent still to gain; use 1e-8 or tighter
-    for those two. mann_multiplicative is extrapolated by default (see optimize)
+    for those two. multiplicative is extrapolated by default (see optimize)
     and reaches joint_newton's answer in comparable wall clock. On data the model
     fits exactly the loss goes to zero and this test never fires; a
     projected-gradient (KKT) test then takes over and runs to machine precision.
@@ -161,14 +161,14 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     subsample H is fitted on. It defaults to 0 so two batched runs on the same
     data give the same answer; pass None for fresh entropy each call.
     """
-    if method == 'mann_multiplicative':
+    if method == 'multiplicative':
         update = multiplicative_update
     elif method == 'block_newton':
         update = block_newton_optimize
     elif method == 'joint_newton':
         update = joint_newton_optimize
     else:
-        raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton' or 'mann_multiplicative'.")
+        raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton' or 'multiplicative'.")
 
     if update is multiplicative_update:
         # Nesterov extrapolation is on by default for the multiplicative update:

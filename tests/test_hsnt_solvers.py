@@ -30,7 +30,7 @@ def _loss(W, H, T):
 
 
 @cuda
-@pytest.mark.parametrize("method", ["joint_newton", "block_newton", "mann_multiplicative"])
+@pytest.mark.parametrize("method", ["joint_newton", "block_newton", "multiplicative"])
 def test_every_method_decreases_the_loss_and_stays_nonnegative(method):
     T, _, _ = _problem()
     W, H, steps = hsnt.nnal_factorization(T, method=method, num_materials=3, max_steps=300, rel_tol=1e-6)

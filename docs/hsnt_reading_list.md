@@ -10,7 +10,7 @@ Grouped by technique, with the part of the code each reference explains.
 ## 2. Nonnegative factorization: model, multiplicative updates, initialization
 - Lee & Seung, *Algorithms for non-negative matrix factorization*, NIPS 13 (2001). The multiplicative update generalized by `multiplicative_update`.
 - Fevotte & Idier, *Algorithms for nonnegative matrix factorization with the beta-divergence*, Neural Computation 23 (2011). Majorization view of multiplicative updates for Poisson/KL losses; damping; why plain MU cannot resurrect zeros.
-- O'Donoghue & Candes, *Adaptive restart for accelerated gradient schemes*, Found. Comput. Math. 15 (2015). Nesterov extrapolation with function-value restart (Mann update).
+- O'Donoghue & Candes, *Adaptive restart for accelerated gradient schemes*, Found. Comput. Math. 15 (2015). Nesterov extrapolation with function-value restart (`multiplicative_update`).
 - Boutsidis & Gallopoulos, *SVD based initialization: a head start for nonnegative matrix factorization*, Pattern Recognition 41 (2008). NNDSVD / NNDSVDa (`nndsvda`).
 - Halko, Martinsson & Tropp, *Finding structure with randomness*, SIAM Review 53 (2011). Randomized SVD inside the initializer.
 - Gillis, *Nonnegative Matrix Factorization*, SIAM (2020). Uniqueness, separability, minimum volume, algorithms; the gauge freedom (W, H) -> (W A, A^-1 H).

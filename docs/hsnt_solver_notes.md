@@ -72,7 +72,7 @@ Cholesky, two-metric projection, KKT release of bound entries with an inward gra
 elementwise line search. Linear convergence: plateaus around 1e-7 where an exact factorization exists; at dose
 100 stopped 1.4% short at 1e-6 and 0.001% short at 1e-8. It remains the warm-up and the fixed-H W solver.
 
-**mann_multiplicative.** Damped multiplicative update with the shifted step `V <- max((V + d) r - d, 0)`, whose
+**multiplicative.** Damped multiplicative update with the shifted step `V <- max((V + d) r - d, 0)`, whose
 fixed-point set equals the KKT set for any d > 0 (so zeros can be resurrected: on the demo 5.5% of W started
 at zero and never moved under the plain update; 1.77% of entries were zero with a negative gradient).
 Random re-seeding of components dead in both factors (at dose 1 the constant seed scored -84 dB on the
