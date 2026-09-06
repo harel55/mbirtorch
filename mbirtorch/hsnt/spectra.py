@@ -14,7 +14,10 @@ def unconstrained_spectra(T, W, H, max_steps=300, cg_max=10, rel_tol=1e-10, w_ma
     positive half the time and clipped the other half, an O(1/sqrt m) effect per
     pixel (m = information per pixel) that does not average out over pixels.
     Dropping the bound removes it -- the pixel problem stays strictly convex for
-    any real w -- at the price of the variance reduction the constraint provides,
+    any real w; estimating H with W free is a semi-NMF step (Ding, Li & Jordan
+    2010) and the relax-where-it-truncates logic of NEG-ML in PET -- at the price
+    of the variance reduction the constraint provides (the implicit regularisation
+    of a sign constraint, Slawski & Hein 2013),
     so it wins once pixels are plentiful (above ~10^5 at dose 3; the crossover
     moves to larger P at lower dose) and loses a little below that. Cost: a
     continuation of the joint solve from the ML point, cheaper than the ML solve.
@@ -101,7 +104,12 @@ def pure_pixel_gauge(T, W, H, dose, penalty=None, seeds=8, kmeans_steps=100, w_m
     same subspace in the true gauge. The gauge is fixed with a prior the
     likelihood lacks: most pixels contain a single material. The coefficient
     rows of W, taken as directions, then form R clusters whose centres are the
-    rows of A, and A @ H are the pure pixels' mean spectra. Pixels without
+    rows of A, and A @ H are the pure pixels' mean spectra. The remedy follows
+    Chowdhury et al. (ICIP 2023; IEEE Trans. Comput. Imaging 2025), who cluster
+    the coefficient vectors of an NMF fit of the same kind of data and take the
+    cluster means as the mixing; the same construction is K-P-Means (Xu et al.
+    2014) and the vertex hunting of Topic-SCORE. This function applies it to the
+    exact-rank Poisson fit in the pixel domain. Pixels without
     material (likelihood ratio against X = 0 below `penalty`, in log-likelihood
     units) are left out, the clusters are found by intensity-weighted k-means
     from several k-means++ seeds, and W >= 0 is re-solved with the re-mixed H

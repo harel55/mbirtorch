@@ -76,7 +76,11 @@ elementwise line search. Linear convergence: plateaus around 1e-7 where an exact
 fixed-point set equals the KKT set for any d > 0 (so zeros can be resurrected: on the demo 5.5% of W started
 at zero and never moved under the plain update; 1.77% of entries were zero with a negative gradient).
 Random re-seeding of components dead in both factors (at dose 1 the constant seed scored -84 dB on the
-spectra against joint_newton's 21; a random positive seed scored 21.4). Nesterov extrapolation with
+spectra against joint_newton's 21; a random positive seed scored 21.4). A component dead in both factors
+is a degenerate stationary point (zero gradient), so the re-seed escapes a saddle, not a KKT violation. The
+shifted step is the inadmissible-zero offset of Chi & Kolda (2012) and the modified update of Lin (2007) in
+translated form, and the extrapolated loop follows Ang & Gillis (2019) and the Richardson-Lucy acceleration of
+Biggs & Andrews (1997); neither is new here (reading list, section 2). Nesterov extrapolation with
 function-value restart cut sweeps 17x on the demo (6580 -> 380) at 1.3x the cost per sweep, 13x in wall
 clock, lifting it from 40-70x slower than joint_newton to parity. The extrapolated loop returns the best
 plain iterate and stops when the best has failed to improve by `rel_tol` per sweep over two consecutive
@@ -121,30 +125,59 @@ pixel carrying a fixed amount of information (Neyman-Scott). Measured at dose 3,
 | 10M (streaming) | 43.8 | -- |
 
 The converged estimate gains 0.66 dB per doubling instead of 3; float64 reproduces float32; converging further
-lowers the SNR while lowering the loss; a truth-started solve reaches the same optimum (unique MLE at K = 1200),
-and at K = 300 the deeper minimum is the worse estimate. A Monte Carlo of the profile score at the true H
+lowers the SNR while lowering the loss; a truth-started solve reaches the same optimum at K = 1200 on one seed
+(not evidence of a unique MLE: at K = 300 two minima exist and the deeper one is the worse estimate; a
+multi-start landscape study is still to be done). A Monte Carlo of the profile score at the true H
 showed the bias is the truncation of pixel coefficients at zero (dropping W >= 0 removes it entirely, z = 4.9
 -> 1.1), not the smooth O(1/m) term: Cox-Reid and Barndorff-Nielsen adjustments remove none of it, and a
 parametric bootstrap of the score underestimates it because the fitted W has far fewer exact zeros than the
 truth (`bias_corrected_spectra` is kept for reference only: +0.02 to +0.05 dB at 5 to 84x the cost).
+Both failures are predicted by boundary theory, not discovered here: the modified profile likelihoods are
+interior-mode Laplace approximations, invalid when the nuisance mode sits on a bound (Erkanli 1994), and the
+parametric bootstrap is inconsistent for a parameter on the boundary (Andrews 2000). The per-pixel mechanism is
+the projected-normal limit of a constrained estimate (Self & Liang 1987; Geyer 1994; Andrews 1999), and the
+same clipping bias is known in constrained Poisson reconstruction (NEG-ML; Lim, Dewaraja & Fessler 2018). What
+is new is the identification of truncation as the dominant incidental-parameter term of a jointly estimated
+shared factor in a constrained factorization, with the consequence that the standard correction toolkit aims
+at the wrong term (reading list, section 7).
 
 **Remedies that work.**
 - `unconstrained_spectra`: estimate H with the bound on W dropped, then re-solve W >= 0. Spectra 40.4 -> 43.2
-  (262k), 41.1 -> 45.8 (524k), 41.7 -> 49.0 dB (1M), restoring the sqrt(N) rate; 0.6x the MLE's time; loses
-  0.7 dB at 4k pixels where the constraint's variance reduction still dominates (crossover near 65k at dose 3,
-  later at lower dose). On 10M pixels streaming: 43.8 -> 49.0 dB after six passes, still improving.
+  (262k), 41.1 -> 45.8 (524k), 41.7 -> 49.0 dB (1M), empirically restoring the 3 dB per doubling slope over
+  262k-1M pixels on the phantom (the smooth O(R/K) Neyman-Scott term remains, so this is not a consistency
+  statement); 0.6x the MLE's time; loses 0.7 dB at 4k pixels where the constraint's variance reduction still
+  dominates (crossover near 65k at dose 3, later at lower dose): the implicit regularisation of a sign
+  constraint (Slawski & Hein 2013; Meinshausen 2013). The H step with W free is a semi-NMF fit (Ding, Li &
+  Jordan 2010) and the relax-where-it-truncates logic of NEG-ML in PET; the estimator is not new, its
+  incidental-parameter justification and the measured crossover are. On 10M pixels streaming: 43.8 -> 49.0 dB
+  after six passes, still improving.
 - `support_selected_spectra`: penalised-likelihood choice of each pixel's material subset (all 2^R - 1), then a
   joint refit with the supports fixed. At 65k: penalty 1 (AIC) +0.79 dB spectra / +0.08 maps; 0.5 log K (BIC)
   +0.95 / +0.23; 2 log K +1.04 / +0.44 (default), exact support in 59% of pixels, 0.8x the MLE's time; also
   reduces the gauge mixing of the fitted rows (condition 49 -> 15). Iterating select/refit degenerates (round 2:
-  -0.6 dB, round 3: -2.6 dB); one round is the optimum.
+  -0.6 dB, round 3: -2.6 dB); one round is the optimum. Per-pixel subset selection is MESMA / ISMA (Roberts et
+  al. 1998; Rogge et al. 2006) and exact sparse NNLS by enumeration (Cohen & Gillis 2019; Nadisic et al. 2020),
+  and the refit is post-selection refitting; new here are the empty set in the penalised choice, the single
+  refit, and the debiasing purpose. BIC and 2 log K gave the same result, so the penalty is not load-bearing.
 
 **Maps are gauge-limited.** With the fitted spectra rotated into the true gauge, maps reach 10.8/11.5 dB at dose
 3 and 20.9/22.2 at dose 30 (oracle ceilings 11.6/12.3 and 22.3/23.3) for every estimator alike, against 8.4-8.8
-and 17.1-17.5 as fitted: 2.4-3.7 dB recoverable by a data-driven gauge criterion.
+and 17.1-17.5 as fitted: 2.4-3.7 dB recoverable by a data-driven gauge criterion. "Gauge" here is a synonym for
+what chemometrics has called the rotational ambiguity of bilinear models and the set (area) of feasible
+solutions since Lawton & Sylvestre (1971): Abdollahi & Tauler (2011), Rajko (2009), Neymeyr & Sawall (2018);
+in NMF theory Laurberg et al. (2008), Huang, Sidiropoulos & Swami (2014), Fu et al. (2018/2019). None of that
+is new here. The measurement that is new is the oracle-rotation attribution: three estimators share one
+post-rotation ceiling within 0.1 dB of the true-spectra oracle, so the whole deficit is mixing and none is
+subspace, and a +7.3 dB spectral gain moved the maps only +0.15 dB.
 
-**Gauge fix (`pure_pixel_gauge`, 2026-09-04).** The likelihood does not identify the gauge: nonnegativity confines
-the mixing A to a polytope and the solver stops wherever its path ends there. In the MLE basis the true axes had
+**Gauge fix (`pure_pixel_gauge`, 2026-09-04).** The likelihood does not identify the gauge (the textbook
+non-uniqueness of NMF: nonnegativity confines the mixing A to a polytope and the solver stops wherever its path
+ends there). The remedy is not new either: Chowdhury et al. (ICIP 2023; IEEE Trans. Comput. Imaging 11, 2025)
+already cluster the coefficient vectors of an NMF subspace fit of Bragg-edge neutron data, take the cluster
+means as the mixing, remix the spectra and hold them fixed for the decomposition, under a one-material-per-voxel
+assumption; the same construction is K-P-Means (Xu, Li, Wong & Peng 2014) and the vertex hunting of GeoNMF and
+Topic-SCORE. `pure_pixel_gauge` moves it to the pixel domain of the exact-rank Poisson fit with a
+likelihood-ratio material test and intensity-weighted k-means. In the MLE basis the true axes had
 L1 rows like (0.48, 0.11, 0.41) at dose 3 and (0.07, 0.01, 0.92) at dose 30, so a pure pixel has no dominant
 coefficient and a share threshold finds nothing (6 / 0 / 104 pixels at dose 3; one component dominated every pixel
 at dose 30); support-selected single-material pixels gave axis error 0.19 and worse maps. Clustering instead:
@@ -158,7 +191,11 @@ cannot validate a gauge. Size dependence at dose 3 (seed 129): 4k pixels 7.90 ->
 11.41 (11.51), 65k 8.35 -> 11.48 (11.47); at 4k and dose 30, 17.04 -> 22.08 (22.43). About a tenth of the weakly
 attenuating aluminium pixels land in the other two clusters at every size, but the axis error still falls as
 1/sqrt(pixels) (0.057 / 0.021 / 0.012), so the residual is the noise of the cluster means, not the misassignment.
-The assumption is that every material has pure pixels.
+The assumption is that every material has pure pixels; raw cluster means are biased inward when pixels are
+mixed (Drumetz et al. 2020; K-P-Means purifies them), and the sufficiently-scattered / minimum-volume route
+(Huang, Fu & Sidiropoulos 2016; Fu, Huang & Sidiropoulos 2018) is the alternative when a material has no pure
+pixels, which is the case for two of three materials in the group's SNAP sample (the aluminium holder lies on
+every ray through nickel and copper).
 
 ## 5b. Details removed from the code comments during the 2026-09-04 cleanup
 
@@ -202,8 +239,34 @@ polish on 10M pixels reproduced every digit of the float32 run.
 ## 7. Large rank
 On the three-material phantom, R = 10/30/100 free components: spectral SNR 32.1 -> 31.9 -> 30.6 -> 20.0 at 16k
 pixels, step counts 60 -> 342 -> 600 (cap); the direct-fit map metric inflates with R while the coupled metric
-collapses. Learning a dictionary of near-collinear dilated spectra (adjacent cosine 0.9997) from scratch fails
-outright (material accuracy at chance); with a known dictionary and per-pixel greedy nonnegative selection,
-material accuracy 0.92-0.98 and strain resolution ~0.25% dilation at dose 3, ~0.12% at dose 30. Approximately
+collapses; the R = 30 and 100 runs hit the step cap and 3.9 of 4 GB, so the collapse is a solver-plus-conditioning
+result, not a converged-estimator property. An unstructured factorization cannot learn a dictionary of
+near-collinear dilated spectra (adjacent cosine 0.9997): material accuracy at chance from an NNDSVDa start, as
+the shift-free controls of AgileFD (Suram et al. 2017) show for diffraction; structured models that learn a base
+pattern and its dilation (AgileFD; StretchedNMF, Gu et al. 2024) are the untested alternative, so "cannot be
+learned from scratch" holds only for the unstructured factorization. With a known dictionary and per-pixel
+greedy nonnegative selection, material accuracy 0.92-0.98 and strain resolution ~0.25% dilation at dose 3,
+~0.12% at dose 30, an order of magnitude coarser than multi-edge cross-correlation at conventional counts
+(~90 microstrain, Ramadhan et al. 2019): a low-dose characterisation, not a new capability. Approximately
 known spectra (texture, impurity) are recoverable in shape to 37-40 dB by one round of base-spectrum
 refinement; absolute per-material scale is not identifiable from the data (H W is), so maps need a reference.
+
+## 8. Novelty assessment (2026-09-06)
+An adversarial literature review (ten scouts, ten refuters, four reviewer lenses; web-verified except where the
+reading list says "verify") found close prior art for every method in this package and returned "partially
+refuted" for every candidate contribution. Genuinely new in this setting, as measurements rather than methods:
+(1) the shared-spectra bias of the constrained Poisson factorization is truncation-dominated, the standard
+incidental-parameter corrections aim at the wrong term, and dropping the bound in the H step restores the
+pixel-count trend (section 5); (2) the map deficit is mixing, not subspace, by the oracle-rotation attribution
+across estimators (section 5); (3) the first Poisson-transmission factorization of Bragg-edge data at 1e7
+pixels, with its cost model (section 4). To be positioned as instances of published work: the model (Poisson
+exponential-family PCA with a log link; generalized CP lists this loss and solves it all at once with L-BFGS-B),
+the joint Newton-CG (Sorber et al. 2013; Vandecappelle et al. 2021; Hansen, Plantenga & Kolda 2015), the
+extrapolated multiplicative update (Lin 2007; Chi & Kolda 2012; Ang & Gillis 2019), the gauge fix (Chowdhury
+et al. 2023/2025), the streaming (one-step polishing of GLMs; out-of-core NMF), the strain dictionary (AgileFD;
+Balke et al. 2021 in this group) and the numerics (an appendix). Missing before publication: measured data
+(SNAP; public IMAT sets), external baselines (all-at-once L-BFGS-B, variable projection, HALS-KL and Newton
+KL-NMF, the AMD pipeline, SPA/VCA/min-vol NMF, edge fitting for strain), replicated seeds with intervals, a
+proposition for the truncation bias, mixed-pixel and no-pure-pixel phantoms, instrument physics in the forward
+model, standard metrics in physical units, and a reproducibility package. The full assessment with the per-claim
+prior art is recorded separately as a slide deck.

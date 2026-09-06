@@ -13,7 +13,9 @@ def _shifted(V, ratio, shift, mode, mean_dim):
     zero only while d*(ratio - 1) <= 0, i.e. ratio <= 1. Both updates are built so
     ratio > 1 exactly when the gradient is negative, so the fixed-point set is
     {V >= 0, grad >= 0, V*grad = 0} -- the KKT set -- for every d > 0. No decay
-    schedule is needed for correctness. See docs/hsnt_solver_notes.md, section 3.
+    schedule is needed for correctness. This is the inadmissible-zero offset of
+    Chi & Kolda (2012) and the modified update of Lin (2007) in translated form,
+    not a new device. See docs/hsnt_solver_notes.md, section 3.
 
     mode='boundary' offsets only entries currently at zero, leaving the interior
     step bit-for-bit the original update. mode='const' offsets everything, which
@@ -57,7 +59,10 @@ def _reseed_dead(W, H, rel_tol=1e-6, mode='random'):
     component whose W column and H row are both zero has a ratio of exactly zero in
     either update -- the numerator is a product with the dead factor -- so the
     offset term d*(ratio - 1) is negative and the clamp holds it at zero forever.
-    No multiplicative step can reach it.
+    No multiplicative step can reach it. Such a component is a degenerate
+    stationary point (zero gradient), so the re-seed escapes a saddle rather than
+    a KKT violation; CP-APR (Chi & Kolda 2012) restarts from a new point for the
+    same reason.
 
     The default seed is small random positive values from a fixed generator, so
     runs are reproducible. A constant seed leaves the component flat, and a flat
