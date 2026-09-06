@@ -115,10 +115,10 @@ def main():
     )
     print(f'Block-Newton reconstruction completed in: {time.time() - start_time} seconds after {i_blk} iterations')
 
-    print(f"attenuation loss Scipy:\t\t{stable_nnal(W @ H, T).item()}")
-    print(f"attenuation loss Joint Newton:\t{stable_nnal(W_newt @ H_newt, T).item()}")
+    print(f"attenuation loss Scipy:\t\t\t{stable_nnal(W @ H, T).item()}")
+    print(f"attenuation loss Joint Newton:\t\t{stable_nnal(W_newt @ H_newt, T).item()}")
     print(f"attenuation loss Multiplicative:\t{stable_nnal(W_mu @ H_mu, T).item()}")
-    print(f"attenuation loss Block Newton:\t{stable_nnal(W_blk @ H_blk, T).item()}")
+    print(f"attenuation loss Block Newton:\t\t{stable_nnal(W_blk @ H_blk, T).item()}")
     print()
     print(f"L2 loss Scipy:\t\t{torch.linalg.norm(torch.log(T) + (W @ H)).item()}")
     print(f"L2 loss Joint Newton:\t{torch.linalg.norm(torch.log(T) + (W_newt @ H_newt)).item()}")
