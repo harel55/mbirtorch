@@ -312,3 +312,66 @@ KL-NMF, the AMD pipeline, SPA/VCA/min-vol NMF, edge fitting for strain), replica
 proposition for the truncation bias, mixed-pixel and no-pure-pixel phantoms, instrument physics in the forward
 model, standard metrics in physical units, and a reproducibility package. The full assessment with the per-claim
 prior art is recorded separately as a slide deck.
+
+## 9. Hybrid Bragg spectral model (`mbirtorch.hsnt.bragg`, branch `hybrid-spectra`, 2026-09-20)
+
+The bilinear model `X = W H` does not identify the gauge: any invertible remix `(W A^-1, A H)` inside the nonnegative
+polytope has the same likelihood, so the MLE spectra are mixtures and the maps are 5-6 dB below the known-spectra
+ceiling (sections 5 and 8). The hybrid model removes the ambiguity by giving each crystalline component a physical
+form,
+
+    mu_r(lambda) = (lambda / lambda_ref)^2 * sum_hkl h_hkl * S(lambda - 2 d_hkl(a_r)) + c0 + c_abs * lambda + spline(lambda),
+
+with `S` a smoothed step (Bragg edge: the coherent elastic cross-section loses the (hkl) family above `2 d_hkl`),
+`d_hkl = a / sqrt(h^2 + k^2 + l^2)` for a cubic lattice, heights `h`, `c0`, `c_abs` nonnegative and an 8-knot cubic
+B-spline residual with a ridge for whatever the physics above leaves out. The edge positions of one component are a
+rigid pattern set by `(type, a)`, and a mixture of two lattices has edges of both, so rows cannot be remixed without
+leaving the model: the gauge is fixed by the data. Nothing is assumed about the materials (user rule): the lattice
+type (fcc, bcc, diamond) and parameter of every component are discovered.
+
+**Discovery (`warm_start`).** For a fixed `(type, a)` the model is linear in its coefficients, so its spectra form a
+subspace `D(a)`. The pure spectrum of a material lies, up to the model's approximation error, in the intersection of
+`D(a)` with the row space of the bilinear MLE. Over a geometric grid of `a` in [2, 7] A and every type, the closest
+pair of directions of the two spaces is the top canonical correlation (an `n x n` Gram eigenproblem per `a`, batched;
+~2 s on the CPU for 3 x 1250 values). Local maxima are refined by golden section on sigma(a) (the direction is only
+right at the exact `a`; a 0.02% grid error costs 1e-3 in fit rms). Candidates are scored by a BIC on the fit with
+NONNEGATIVE heights to their own direction (the unconstrained correlation cannot tell a lattice from one whose edge set
+contains it: parameter 2a, `sqrt2 a` across bcc/fcc, a superset type). Two more rules were needed: an alias whose
+extra edges are insignificant (height / standard error < 3) or coincide with another candidate's edges is dropped (a
+superset lattice can hold two materials' edges at once and then wins on correlation, as happened on the synthetic
+test), and a candidate sharing most of its edges with a chosen one is skipped. A component whose fit rms exceeds 4x
+the best (and 0.5%) is left nonparametric. Weak-edge materials remain ambiguous at low dose: fcc `a` and bcc
+`a / sqrt2` share every even-index edge, so Al at dose 3 comes out as its bcc alias (spectrum still 14-20 dB).
+
+**Solver (`hybrid_factorization`).** Alternating: (1) golden-section search on each `a` and an exact projected Newton
+step on all linear coefficients against the convex quadratic model of the loss in `H` with `W` fixed (the block
+solver's per-bin Newton statistics; a ~100-variable bounded QP via Cholesky + BVLS), Armijo-checked; (2) the convex
+per-pixel `W` solve; (3) a Levenberg-damped Newton step on the PROFILED objective `L*(x) = min_W L(W, H(x))`, whose
+Hessian is the Schur complement of the joint Hessian over the per-pixel 3x3 map blocks (accumulated in pixel chunks)
+-- this is what moves along the valley of near-equivalent factorizations that the alternating moves crawl along
+(from a poor start: 40 outer iterations and still +47 loss units above the truth; with the profiled step: 4-6). The
+undamped profiled step from a poor start predicted a decrease larger than the whole loss (indefinite joint Hessian);
+damping by the actual/predicted ratio fixed it. Free rows take one block Newton step per outer iteration (slow: 30
+iterations when present). The bilinear maps are carried into the new gauge as the initial `W`.
+
+**Measurements** (`claude_scratch/nnal_work/hybrid/exp4_results.json`; blind, natural order, scale-only fit per
+component, seed 129, laptop GPU). Slab 64x64, dose 300: lattices fcc 3.6217 / 3.5230 / 4.0733 A (truth 3.6218 /
+3.5231 / 4.0732); spectra 42.5 / 45.1 / 41.7 dB, against 25 / 3 / 6 for the blind bilinear rows (which need the
+oracle gauge for 50 / 48 / 42); maps 34.7 / 30.0 / 19.9 against 32.3 / 27.5 / 20.6 for the bilinear WITH the oracle
+gauge and 38.4 / 34.5 / 27.0 with the true spectra. Dose 30: spectra 37.8 / 40.6 / 33.5 (bilinear oracle gauge
+39.6 / 38.4 / 31.3), maps 24.8 / 20.0 / 9.5 (gauge 22.6 / 17.7 / 10.8; known spectra 28.1 / 24.1 / 16.0). Spheres
+(mixed pixels, 4 views), dose 300: maps 33.6 / 28.6 / 18.9 (gauge 31.8 / 26.4 / 20.0; known 34.8 / 30.4 / 23.5).
+The hybrid loss sits at the truth's (8205 vs 8202; bilinear 8183): the bilinear overfits by exactly its gauge
+freedom. Spectrum accuracy is capped by the model's approximation of the phantom's basis rows (43-46 dB on a direct
+fit), not by noise. A fourth, non-crystalline component with a resonance line: the Bragg rows stay at 42-46 dB, the
+free row's map reaches the bilinear-gauge level (16 dB) but its spectrum is not identified (its smooth part rotates
+with the Bragg rows' smooth parts); the automatic crystalline/non-crystalline decision works at dose 300 and accepts
+a spurious lattice at dose 30. Runtime: 27 s against 2.8 s for the bilinear MLE at 37k pixels (5 s discovery + 6
+outer x 3.6 s, three `W` solves per iteration), 8 s against 0.7 s at 4k.
+
+**What the results mean.** The material-agnostic Bragg parametrisation identifies spectra AND maps in natural order
+at or above the level the bilinear model reaches only with an oracle gauge, on pure and mixed pixels, at 10x the
+cost. The remaining gap to the known-spectra map ceiling (3-7 dB) is the soft rotation of the smooth parts through
+the spline (a looser spline lowers the loss and worsens the maps; the 8-knot / ridge 1 default was tuned on this
+phantom). Not done: polychromatic resolution kernel, hexagonal lattices, structure-factor priors (deliberately
+excluded), a profiled step for free rows, real Ni-cylinder data.
