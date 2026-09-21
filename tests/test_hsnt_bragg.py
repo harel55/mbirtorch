@@ -19,16 +19,50 @@ LAM = np.linspace(1.5, 4.5, 400)                                                
 TRUE = [("fcc", 3.52), ("fcc", 3.61), ("bcc", 2.87)]                                # Ni-, Cu- and Fe-like lattices
 
 
-def _spectrum(lattice, a, seed):
+def _spectrum(lattice, a, seed, resolution=(0.0, 0.0)):
     """A model spectrum with random nonnegative edge heights and a smooth part, as a numpy row."""
     rng = np.random.default_rng(seed)
-    m = bragg.BraggSpectrum(LAM, lattice, a_range=(a - 0.02, a + 0.02), n_spline=8)
+    m = bragg.BraggSpectrum(LAM, lattice, a_range=(a - 0.02, a + 0.02), n_spline=8, resolution=resolution)
     lin = np.concatenate([rng.uniform(0.05, 0.3, m.n_edges), [0.3, 0.1], np.zeros(m.n_spline)])
     return m(m.pack(a, lin)).numpy()
 
 
-def _basis():
-    return np.stack([_spectrum(l, a, i) for i, (l, a) in enumerate(TRUE)])
+def _basis(resolution=(0.0, 0.0)):
+    return np.stack([_spectrum(l, a, i, resolution) for i, (l, a) in enumerate(TRUE)])
+
+
+def test_edge_profile_is_a_smeared_step_with_a_tail_toward_longer_wavelength():
+    lam = torch.linspace(1.5, 4.5, 1200, dtype=torch.float64)[:, None]; e = torch.tensor([[3.0]], dtype=torch.float64)
+    gauss = bragg.edge_profile(lam, e, torch.tensor([[0.01]], dtype=torch.float64), torch.tensor([[0.0]], dtype=torch.float64))[:, 0]
+    emg = bragg.edge_profile(lam, e, torch.tensor([[0.01]], dtype=torch.float64), torch.tensor([[0.02]], dtype=torch.float64))[:, 0]
+    for s in (gauss, emg):
+        assert torch.isfinite(s).all() and s.min() >= 0 and s.max() <= 1 and (s[1:] <= s[:-1] + 1e-12).all()
+        assert s[0] > 0.999 and s[-1] < 1e-6                                          # 1 below the edge, 0 above
+    assert torch.allclose(gauss, 0.5 * torch.erfc((lam[:, 0] - 3.0) / (0.01 * np.sqrt(2.0))))
+    mid = 0.5 * (lam[1:, 0] + lam[:-1, 0])
+    for s in (gauss, emg):                                                            # profiles are centred on the kernel's MEDIAN
+        assert abs(lam[(s - 0.5).abs().argmin(), 0] - 3.0) < 2e-3                    # half height at the edge
+    density = emg[:-1] - emg[1:]
+    assert (mid * density).sum() / density.sum() > 3.0 + 0.003                        # right-skewed: mean above the median
+    assert emg[(lam[:, 0] > 3.03).nonzero()[0, 0]] > gauss[(lam[:, 0] > 3.03).nonzero()[0, 0]] + 0.01  # tail toward longer wavelength
+    assert abs(bragg.emg_median(0.01, 0.02).item() - 0.0) > 0.005 and bragg.emg_median(0.01, 0.0).item() == 0.0
+
+
+@cuda
+def test_hybrid_fits_the_instrument_resolution():
+    """Spectra broadened by an exponentially modified Gaussian: the fitted resolution recovers the widths and the
+    spectra, where a sharp-edge model is biased."""
+    truth_res = (0.004, 0.006); H = _basis(truth_res); T, W_true = _problem(H, dose=100.0)
+    Wb, Hb, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=300, rel_tol=1e-8)
+    rows, maps = Hb.double().cpu().numpy(), Wb.double().cpu().numpy()
+    W, Hh, _, info = bragg.hybrid_factorization(T, LAM, init_rows=rows, init_maps=maps, max_outer=20)
+    Ws, Hs, _, info_s = bragg.hybrid_factorization(T, LAM, init_rows=rows, init_maps=maps, max_outer=20, resolution=(0.0, 0.0), fit_resolution=False)
+    sig, tau = info["resolution"]                                                     # 1.6 and 2.4 bins wide on this grid
+    assert 0.4 * truth_res[0] < sig < 2.0 * truth_res[0] and tau < 3.0 * truth_res[1]
+    snr_fit, perm = _natural(Hh.double().cpu().numpy(), H); snr_sharp, _ = _natural(Hs.double().cpu().numpy(), H)
+    assert min(snr_fit) > 25 and sum(snr_fit) > sum(snr_sharp) + 6
+    for (lt, a), (lt_true, a_true) in zip([info["lattices"][p] for p in perm], TRUE):
+        assert lt == lt_true and abs(a - a_true) < 2e-3
 
 
 def _problem(H, P=2048, dose=30.0, seed=0):
@@ -76,8 +110,8 @@ def test_warm_start_discovers_types_and_parameters_from_mixed_rows():
     """The rows of a bilinear fit are mixtures of the pure spectra; the discovery works on their span."""
     H = _basis(); rng = np.random.default_rng(3)
     rows = rng.uniform(0.2, 1.0, (3, 3)) @ H                                          # an arbitrary gauge
-    thetas, lattices, residuals, free = bragg.warm_start(rows, LAM, device="cpu")
-    assert free == 0 and len(lattices) == 3
+    thetas, lattices, residuals, free, resolution = bragg.warm_start(rows, LAM, device="cpu")
+    assert free == 0 and len(lattices) == 3 and resolution[0] < 1e-3                # sharp data: (near) sharp model
     found = sorted((lt, round(float(th[0]), 3)) for (lt, _), th in zip(lattices, thetas))
     for (lt, a), (lt_true, a_true) in zip(found, sorted(TRUE)):
         assert lt == lt_true and abs(a - a_true) < 0.002 * a_true

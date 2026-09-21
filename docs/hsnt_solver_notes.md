@@ -375,3 +375,87 @@ cost. The remaining gap to the known-spectra map ceiling (3-7 dB) is the soft ro
 the spline (a looser spline lowers the loss and worsens the maps; the 8-knot / ridge 1 default was tuned on this
 phantom). Not done: polychromatic resolution kernel, hexagonal lattices, structure-factor priors (deliberately
 excluded), a profiled step for free rows, real Ni-cylinder data.
+
+### 9.1 Instrument resolution (2026-09-20, later)
+
+Real edges are smeared by the time-of-flight resolution. The step in `BraggSpectrum` is now `edge_profile`: an
+exponentially modified Gaussian kernel (Gaussian width sigma, exponential tail of decay tau toward longer wavelength,
+the moderator's slow decay; Santisteban et al. 2001), both proportional to the edge wavelength as for a time-of-flight
+instrument, with `(sigma / lam, tau / lam)` shared by every component (an instrument property) and fitted by
+golden-section search on the same quadratic model as the lattice parameters (`fit_resolution=True`; `warm_start`
+seeds the Gaussian width from the chosen directions). Two identifiability facts shaped the parametrisation. A tail
+proportional to wavelength shifts every edge by the same fraction, exactly like a lattice dilation, so an uncentred
+tail is not identifiable from `a`: on the phantom the tail collapsed to zero and `a` came out 0.5% high. Centring
+the profile on the kernel's mean is not enough either: a wider symmetric Gaussian placed at the kernel's median
+mimics the skewed profile, and the coordinate search on tau never leaves zero (synthetic test: sigma 0.0061 for
+0.004, tau 0, a 0.4% low). Centred on the kernel's MEDIAN (`emg_median`, tabulated once by bisection and
+interpolated) the lattice parameter is the half-height position of the smeared edge, the quantity an edge fit locks
+onto, tau only sets the asymmetry about it, and the coordinate search converges: synthetic (0.0041, 0.0055) for
+(0.004, 0.006), a within 4e-4 relative. Consequence to keep in mind: with an uncalibrated kernel `a` is the
+half-height position; converting it to 2 d_hkl needs the kernel's median offset (a calibration with a reference
+sample); relative strain between regions is unaffected.
+
+Phantom rows broadened with sigma / lam = 0.004, tau / lam = 0.006 (4.8 and 7.1 bins at 3 A; blurred vs sharp basis
+31-33 dB), slab 64x64, blind:
+
+    dose 300   sharp-edge model:  loss +145 above the truth, a biased (3.5200 / 3.6209 / 4.0858 for 3.5231 / 3.6218 / 4.0732),
+                                  spectra 25 / 33 / 33 dB, maps 30 / 15 / 4
+               fitted resolution: (0.0039, 0.0057); loss at the truth's; a 3.5225 / 3.6223 / 4.0734;
+                                  spectra 46 / 51 / 43, maps 33 / 27 / 18  (true kernel fixed: 47 / 52 / 44, 33 / 28 / 18)
+    dose 30    sharp 28 / 32 / 31, maps 22 / 13 / 5  ->  fitted (0.0040, 0.0053): 37 / 41 / 33, maps 23 / 18 / 9 (= true kernel)
+
+The kernel acts on the attenuation (the edge steps are smeared before the exponential). The measurement smears the
+TRANSMISSION, and the two differ at second order in the edge jump; for this kernel on the phantom's nickel row the
+chi-square excess per pixel at dose 300 is 0.12 / 1.25 / 9.0 (of 1200 bins) at X_max 0.5 / 1.0 / 2.1, so the
+attenuation-domain kernel is adequate to X ~ 1 and a transmission-domain operator (fine grid, kernel after the
+exponential, kernel-aware Newton statistics) is the next step for thick samples. Not modelled: time offsets constant
+in wavelength, kernel shapes beyond the exponentially modified Gaussian, wavelength-dependent widths beyond
+proportional.
+
+### 9.2 Runtime: why 10x, and what remains
+
+The estimate before implementation was 2-3x the bilinear solve. The first implementation measured 10x (27 s vs
+2.6 s at 37k pixels on the laptop). Per-phase profiling attributed it as follows.
+
+1. 57% in the map solves. Three per outer iteration where one suffices (the profiled step carries the maps'
+   response, so no solve is needed between the coefficient step and it), and each took 6-7 Newton steps at 0.41 s
+   instead of 2 at 0.11 s. The cause was a bug in `_two_metric_direction` (shared by every solver): a bound-adjacent
+   component with an inward gradient was solved jointly in the Newton system and then overwritten by its scaled
+   gradient, leaving the other components' moves, which assumed the joint solution, dangling. With physically
+   normalised spectra the smooth parts of Cu and Al are nearly collinear, so for 109 pixels per step the direction
+   raised the loss by 1.05 against a predicted decrease of 0.003 and the elementwise line search backtracked to its
+   cap (8 float64 loss passes) on every step. Inward components are now kept out of the Newton system. The bilinear
+   solvers see this rarely (their arbitrary gauge is better conditioned): the regression harness moves by 5 of
+   45-357 steps and up to 5e-6 relative in loss (baseline not regenerated).
+2. Discovery: 5.5 s of Python-level loops (650 single-parameter scans, 25 least-squares refits with 9-point grids).
+   Batched golden section across peaks and single-solve scoring: 3.5-4 s, a fixed cost (1.8 s is the coarse scan of
+   three lattice types on the CPU).
+3. float64 products over pixels x bins in the profiled system, on a consumer GPU with 1/32-rate float64: products in
+   the data's dtype with float64 sums, 0.48 -> 0.11 s per call.
+
+Now 13.6 s vs 2.7 s (5x) at 37k pixels, 6.2 vs 0.7 at 4k: discovery 4 s + 6 outer x 1.6 s. The remaining excess over
+the estimate is the fixed discovery cost (30% at 37k, amortised at scale), ~7 float64 loss evaluations per iteration
+(0.3 s), map solves of 4-9 warm-started steps because every iteration moves H substantially, and ~200 small bounded
+QPs per iteration for the lattice and resolution searches (0.9 s of CPU BVLS). The estimate assumed one Newton-step
+equivalent per iteration; the model is fine, the implementation still spends about four.
+
+### 9.3 Toward strain (what the model would and would not give)
+
+A Bragg edge at 2 d_hkl records the spacing of planes NORMAL to the beam, so a transmission spectrum measures the
+normal strain along the ray, averaged along the ray with the material's attenuation as the weight. The hybrid model
+as written has one lattice parameter per material for the whole image; strain needs a per-pixel dilation of that
+material's spectrum, `mu_r(lam / (1 + eps_pr))` (the strain track's parametrisation), one parameter per pixel and
+material on top of the maps, plus a per-pixel broadening for strain gradients along the ray. Each projection then
+yields the longitudinal ray transform of the strain tensor (Lionheart and Withers 2015), whose null space is the
+symmetrised gradients of displacement fields; recovering the 3-D tensor needs equilibrium or compatibility
+constraints (Airy or Beltrami stress functions, Gaussian-process priors: Wensrich, Hendriks, Gregg et al.
+2016-2020), many rotation axes, or a reduced assumption (axisymmetry, plane stress). Assumptions to track: cubic
+lattice and uniform texture (per-material edge heights are global here; texture varies edge heights and, with
+per-pixel heights, can mimic strain); a calibrated wavelength axis and resolution kernel for absolute d (relative
+strain needs only their stability); composition and temperature also dilate the lattice; the attenuation-weighted
+average mixes strain with the density map; and the edge shift for 1e-3 strain is 0.3 bins here, so strain precision
+is count-limited (earlier estimate 0.18% / 0.06% per pixel at dose 3 / 30).
+
+Wavelength-axis audit (same day): nothing in `bragg.py` assumes a spectral range; the reflection index range follows
+from `(2 a / lam_min)^2` (a fixed `hmax = 8` missed edges below 1.5 A), bin-relative widths use the median bin width,
+the spline knots span the data, and the phantom basis's axis lives in `simulate.material_basis_wavelengths`.

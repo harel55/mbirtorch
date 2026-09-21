@@ -31,14 +31,75 @@ LATTICES = {
 }
 
 
-def reflections(lattice, a, lam_min, lam_max, hmax=8):
+def reflections(lattice, a, lam_min, lam_max, hmax=None):
     """Bragg-edge wavelengths 2 d_hkl in [lam_min, lam_max] for a cubic lattice of parameter a, ascending, one per
-    distinct h^2 + k^2 + l^2 (families with equal spacing share an edge). Returns (n_values, edges) as arrays."""
+    distinct h^2 + k^2 + l^2 (families with equal spacing share an edge). Returns (n_values, edges) as arrays.
+    The index range follows from the wavelength range: h^2 + k^2 + l^2 <= (2 a / lam_min)^2."""
     allowed = LATTICES[lattice]
+    if hmax is None:
+        hmax = int(math.ceil(2.0 * a / max(lam_min, 1e-9))) + 1
     ns = sorted({h * h + k * k + l * l for h in range(hmax) for k in range(hmax) for l in range(hmax)
                  if (h, k, l) != (0, 0, 0) and allowed(h, k, l)})
     ns = np.array([n for n in ns if lam_min <= 2 * a / math.sqrt(n) <= lam_max], dtype=float)
     return ns, 2 * a / np.sqrt(ns)
+
+
+def _emg_cdf(x, sigma, tau):
+    """Distribution function of the exponentially modified Gaussian (Gaussian width sigma, exponential decay tau > 0),
+    with log-Phi for stability: F(x) = Phi(x / sigma) - exp(-x / tau + sigma^2 / (2 tau^2)) Phi(x / sigma - sigma / tau)."""
+    z = x / sigma
+    ratio = sigma / tau
+    return 0.5 * torch.erfc(-z / math.sqrt(2.0)) - torch.exp(-x / tau + 0.5 * ratio ** 2 + torch.special.log_ndtr(z - ratio))
+
+
+_EMG_MEDIAN_TABLE = None
+
+
+def emg_median(sigma, tau):
+    """Median of the exponentially modified Gaussian kernel relative to its Gaussian centre (0 for tau = 0). The
+    median scales as sigma * m(tau / sigma); m is tabulated once by bisection on a log grid of the ratio and
+    interpolated, so the call costs a few tensor operations. Inputs broadcast against each other."""
+    global _EMG_MEDIAN_TABLE
+    if _EMG_MEDIAN_TABLE is None:
+        r = torch.logspace(-4, 4, 4001, dtype=torch.float64)                          # tau / sigma
+        lo = torch.full_like(r, -4.0); hi = r + 4.0                                    # in units of sigma
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            below = _emg_cdf(mid, torch.ones_like(r), r) < 0.5
+            lo = torch.where(below, mid, lo); hi = torch.where(below, hi, mid)
+        _EMG_MEDIAN_TABLE = (torch.log(r), 0.5 * (lo + hi))
+    sigma = torch.as_tensor(sigma, dtype=torch.float64); tau = torch.as_tensor(tau, dtype=torch.float64)
+    sigma, tau = torch.broadcast_tensors(sigma, tau)
+    log_r, m = _EMG_MEDIAN_TABLE
+    log_r, m = log_r.to(sigma.device), m.to(sigma.device)
+    ratio = torch.log(tau.clamp(min=1e-300) / sigma.clamp(min=1e-300)).clamp(log_r[0], log_r[-1])
+    i = torch.clamp(torch.searchsorted(log_r, ratio.reshape(-1)).reshape(ratio.shape), 1, log_r.numel() - 1)
+    w = (ratio - log_r[i - 1]) / (log_r[i] - log_r[i - 1])
+    med = sigma * (m[i - 1] * (1 - w) + m[i] * w)
+    return torch.where(tau > 0, med, torch.zeros_like(sigma))
+
+
+def edge_profile(lam, edges, sigma, tau):
+    """Bragg-edge step seen through the instrument: 1 below the edge, 0 above, smeared by the time-of-flight
+    resolution. The kernel is an exponentially modified Gaussian (a Gaussian of width `sigma` and an exponential
+    tail of decay `tau` toward longer wavelength, the moderator's slow decay; Santisteban et al. 2001), so the step
+    is 1 - F(x) with F the kernel's distribution function (`_emg_cdf`); tau = 0 gives the plain Gaussian erfc step.
+    The profile is centred on the kernel's MEDIAN, x = lam - edge + median(sigma, tau): a tail proportional to
+    wavelength shifts every edge by the same fraction, exactly like a lattice dilation, so an uncentred tail is not
+    identifiable from the lattice parameter, and centring on the mean still lets a wider symmetric Gaussian at the
+    median mimic the skewed profile. Centred on the median, `edges` is the half-height position of the smeared edge
+    (what an edge fit locks onto) and tau only sets the asymmetry about it. Shapes broadcast: lam (K, 1),
+    edges (..., n), sigma and tau (..., n) or scalars. Returns (K, ..., n)."""
+    sigma_t = torch.as_tensor(sigma, dtype=torch.float64); tau_t = torch.as_tensor(tau, dtype=torch.float64)
+    x = lam - edges + emg_median(sigma_t, tau_t)
+    z = x / sigma_t
+    gauss = 0.5 * torch.erfc(z / math.sqrt(2.0))                                       # 1 - Phi(z)
+    if bool((tau_t > 0).any()):
+        tau_safe = tau_t.clamp(min=1e-6 * sigma_t.clamp(min=1e-300))
+        ratio = sigma_t / tau_safe
+        tail = torch.exp(-x / tau_safe + 0.5 * ratio ** 2 + torch.special.log_ndtr(z - ratio))
+        return torch.where(tau_t > 0, gauss + tail, gauss)
+    return gauss
 
 
 def _bspline_basis(lam, n_knots, degree=3):
@@ -59,7 +120,7 @@ class BraggSpectrum:
     parameters; the spline residual is free but ridge-penalised (see `penalty`).
     """
 
-    def __init__(self, lam, lattice="fcc", a_range=(3.0, 4.6), n_spline=16, edge_width_rel=0.0, min_width=None):
+    def __init__(self, lam, lattice="fcc", a_range=(3.0, 4.6), n_spline=16, resolution=(0.0, 0.0), min_width=None):
         self.lam = torch.as_tensor(np.asarray(lam, dtype=np.float64))
         self.lattice = lattice
         self.a_range = a_range
@@ -67,7 +128,7 @@ class BraggSpectrum:
         self.n_edges = len(self.ns_all)
         self.S = torch.as_tensor(_bspline_basis(self.lam.numpy(), n_spline))           # (K, n_spline)
         self.n_spline = self.S.shape[1]
-        self.edge_width_rel = edge_width_rel
+        self.resolution = tuple(float(v) for v in resolution)                        # (sigma / lam, tau / lam) of the edge profile
         bin_w = float((self.lam[1:] - self.lam[:-1]).mean())
         self.min_width = 0.5 * bin_w if min_width is None else min_width
         self.lam_ref = float(self.lam.mean())
@@ -87,13 +148,20 @@ class BraggSpectrum:
         ns = torch.as_tensor(self.ns_all, dtype=torch.float64, device=self.lam.device)
         return 2.0 * a / torch.sqrt(ns)                                               # (n_edges,)
 
+    def steps(self, e, lam=None):
+        """Edge steps (K, n_edges) for edge wavelengths e, through the instrument's resolution: Gaussian width and
+        exponential tail both proportional to the edge wavelength (time-of-flight resolution), width floored at
+        `min_width` so a sharp model still spans a bin."""
+        lam = self.lam if lam is None else lam
+        sigma = torch.clamp(self.resolution[0] * e, min=self.min_width)
+        tau = self.resolution[1] * e
+        return edge_profile(lam[:, None], e[None, :], sigma[None, :], tau[None, :])
+
     def __call__(self, theta, lam=None):
         lam = self.lam if lam is None else lam
         a, h, c0, c_abs, spl = self.split(theta)
         e = self.edges(a)                                                             # edge wavelengths
-        width = torch.clamp(self.edge_width_rel * e, min=self.min_width)              # resolution width per edge
-        # smoothed step: 1 below the edge, 0 above, Gaussian-blurred over `width`
-        step = 0.5 * torch.erfc((lam[:, None] - e[None, :]) / (math.sqrt(2.0) * width[None, :]))   # (K, n_edges)
+        step = self.steps(e, lam)                                                     # (K, n_edges)
         coherent = (lam / self.lam_ref) ** 2 * (step @ h)
         smooth = c0 + c_abs * lam / self.lam_ref + (self.S.to(lam.device) if lam is not self.lam else self.S) @ spl
         return coherent + smooth
@@ -110,8 +178,7 @@ class BraggSpectrum:
         (K x (n_edges + 2 + n_spline)) as a tensor on the model's device."""
         with torch.no_grad():
             e = self.edges(torch.as_tensor(float(a), dtype=torch.float64))
-            width = torch.clamp(self.edge_width_rel * e, min=self.min_width)
-            step = 0.5 * torch.erfc((self.lam[:, None] - e[None, :]) / (math.sqrt(2.0) * width[None, :]))
+            step = self.steps(e)
             coh = ((self.lam / self.lam_ref) ** 2)[:, None] * step
             lin = torch.stack([torch.ones_like(self.lam), self.lam / self.lam_ref], 1)
             return torch.cat([coh, lin, self.S], 1)
@@ -208,7 +275,7 @@ def _scan_correlation(Q, lam, lattice, a_values, n_spline, min_width, S_spline, 
 
 
 def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"), a_range=(2.0, 7.0), lattices=None,
-               edge_width_rel=0.0, ridge=1.0, n_spline=8, polish=2, free_ratio=4.0, free_floor=5e-3, device=None, verbose=False):
+               resolution=None, ridge=1.0, n_spline=8, polish=2, free_ratio=4.0, free_floor=5e-3, device=None, verbose=False):
     """Bragg parameters for the crystalline components, discovered from the row space of a bilinear factorization.
 
     Nothing is assumed about the materials: each component's lattice type and parameter are found from the data.
@@ -233,10 +300,13 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
         H_rows: rows of the bilinear factorization (R, bins).
         n_bragg: number of crystalline components to seek (default: all rows).
         lattices: optional explicit [(type, (a_lo, a_hi)), ...]; then only the parameter is searched, per component.
+        resolution: (sigma / lam, tau / lam) of the edge profile if known; None fits a Gaussian width to the chosen
+            components' directions over a geometric grid (the exponential tail is left to the solver).
         device: torch device for the batched scan (default: cuda if available).
 
-    Returns (thetas, lattices, residuals, free): thetas and lattices=[(type, (a_lo, a_hi))] for the chosen crystalline
-    components, their residuals 1 - sigma^2, and `free` the number of components left nonparametric.
+    Returns (thetas, lattices, residuals, free, resolution): thetas and lattices=[(type, (a_lo, a_hi))] for the chosen
+    crystalline components, their residuals 1 - sigma^2, `free` the number of components left nonparametric, and the
+    edge resolution (sigma / lam, tau / lam) used or fitted.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Hr = np.asarray(H_rows, dtype=np.float64)
@@ -245,35 +315,37 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
     Q, _ = np.linalg.qr(Hr.T)                                                         # orthonormal basis of the row space
     n_bragg = Hr.shape[0] if n_bragg is None else int(n_bragg)
     S_spline = _bspline_basis(lam, n_spline)
-    sharp_w = max(edge_width_rel * float(lam.mean()), 0.5 * bin_w)
+    res0 = (0.0, 0.0) if resolution is None else tuple(float(v) for v in resolution)
+    sharp_w = max(res0[0] * float(lam.mean()), 0.5 * bin_w)                         # Gaussian scan width (tail ignored in the scan)
     searches = [(lt, ar) for lt, ar in lattices] if lattices is not None else [(lt, tuple(a_range)) for lt in lattice_types]
     candidates = []
+    scan = lambda lt, a_values, width: _scan_correlation(Q, lam, lt, np.asarray(a_values, dtype=np.float64), n_spline, width, S_spline, "cpu")
     for lt, (lo, hi) in searches:
         # coarse scan with edges smoothed to a few bins, so the correlation peaks are wider than the grid spacing
         grid = np.geomspace(lo, hi, int(np.log(hi / lo) / 0.001) + 2)
-        sig, _ = _scan_correlation(Q, lam, lt, grid, n_spline, 3.0 * bin_w, S_spline, "cpu")   # float64 eigh: faster on the CPU
+        sig, _ = scan(lt, grid, 3.0 * bin_w)                                          # float64 eigh: faster on the CPU
         peaks = [i for i in range(len(grid)) if sig[i] >= sig[max(i - 1, 0)] and sig[i] >= sig[min(i + 1, len(grid) - 1)]]
-        peaks = sorted(peaks, key=lambda i: -sig[i])[:12 if lattices is None else 4]
-        for i in peaks:                                                               # refine each peak with the sharp model
-            lo_i, hi_i = max(lo, grid[i] * (1 - 0.0025)), min(hi, grid[i] * (1 + 0.0025))
-            fine = np.linspace(lo_i, hi_i, 26)
-            sf, _ = _scan_correlation(Q, lam, lt, fine, n_spline, sharp_w, S_spline, "cpu")
-            j = int(np.argmax(sf)); lo_i, hi_i = fine[max(j - 1, 0)], fine[min(j + 1, len(fine) - 1)]
-            cache = {}
-
-            def sig_at(a):                                                            # golden-section maximisation of sigma(a):
-                if a not in cache:                                                    # the direction is only right at the exact a
-                    cache[a] = _scan_correlation(Q, lam, lt, np.array([a]), n_spline, sharp_w, S_spline, "cpu")
-                return cache[a][0][0]
-            x1, x2 = lo_i + 0.382 * (hi_i - lo_i), lo_i + 0.618 * (hi_i - lo_i)
-            for _ in range(16):
-                if sig_at(x1) > sig_at(x2):
-                    hi_i = x2
-                else:
-                    lo_i = x1
-                x1, x2 = lo_i + 0.382 * (hi_i - lo_i), lo_i + 0.618 * (hi_i - lo_i)
-            a = max(cache, key=sig_at); s_a, y_a = cache[a]
-            candidates.append(dict(type=lt, a=float(a), resid=max(1.0 - s_a[0] ** 2, 1e-15), y=y_a[0], search=(lo, hi),
+        peaks = np.array(sorted(peaks, key=lambda i: -sig[i])[:8 if lattices is None else 4])
+        # refine every peak with the sharp model, all peaks in one batch: a fine grid to bracket, then a vectorised
+        # golden-section maximisation of sigma(a) (the direction is only right at the exact a)
+        los = np.maximum(lo, grid[peaks] * (1 - 0.0025)); his = np.minimum(hi, grid[peaks] * (1 + 0.0025))
+        fine = np.linspace(los, his, 26, axis=1)                                      # (n_peaks, 26)
+        sf, _ = scan(lt, fine.ravel(), sharp_w); sf = sf.reshape(fine.shape)
+        j = sf.argmax(1); idx = np.arange(len(peaks))
+        los, his = fine[idx, np.maximum(j - 1, 0)], fine[idx, np.minimum(j + 1, fine.shape[1] - 1)]
+        x1, x2 = los + 0.382 * (his - los), los + 0.618 * (his - los)
+        f1, _ = scan(lt, x1, sharp_w); f2, _ = scan(lt, x2, sharp_w)
+        for _ in range(16):
+            b = f1 > f2
+            his = np.where(b, x2, his); los = np.where(b, los, x1)
+            x1n = np.where(b, los + 0.382 * (his - los), x2); x2n = np.where(b, x1, los + 0.618 * (his - los))
+            fn, _ = scan(lt, np.where(b, x1n, x2n), sharp_w)
+            f1, f2 = np.where(b, fn, f2), np.where(b, f1, fn)
+            x1, x2 = x1n, x2n
+        a_best = np.where(f1 > f2, x1, x2)
+        s_a, y_a = scan(lt, a_best, sharp_w)
+        for a, sa, ya in zip(a_best, s_a, y_a):
+            candidates.append(dict(type=lt, a=float(a), resid=max(1.0 - sa ** 2, 1e-15), y=ya, search=(lo, hi),
                                    edges=reflections(lt, float(a), lam.min(), lam.max())[1]))
     candidates.sort(key=lambda c: c["resid"])
     # Score the plausible candidates by a BIC on the NONNEGATIVE-height fit to their own direction: the canonical
@@ -281,10 +353,9 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
     # bcc/fcc, a superset type) always correlates at least as well; with heights kept >= 0 the extra slots buy
     # almost nothing, and the edge-count penalty n ln K then favours the smaller edge set.
     for c in candidates[:4 * n_bragg + 4]:
-        m = BraggSpectrum(lam, lattice=c["type"], a_range=(c["a"] * 0.995, c["a"] * 1.005), n_spline=n_spline, edge_width_rel=edge_width_rel)
+        m = BraggSpectrum(lam, lattice=c["type"], a_range=(c["a"] * 0.995, c["a"] * 1.005), n_spline=n_spline, resolution=res0)
         target = np.clip(c["y"], 0, None); target /= max(target.max(), 1e-12)
-        theta, fit, a, e = fit_spectrum(m, target, a_grid=np.linspace(c["a"] * (1 - 1e-4), c["a"] * (1 + 1e-4), 3), ridge=ridge, refine_steps=1)
-        c["a"] = float(a); c["edges"] = reflections(c["type"], c["a"], lam.min(), lam.max())[1]
+        theta, fit, a, e = fit_spectrum(m, target, a_grid=np.array([c["a"]]), ridge=ridge, refine_steps=0)   # a is already refined
         c["fit_rms"] = max(e, 1e-12)
         c["bic"] = K * np.log(c["fit_rms"] ** 2) + len(c["edges"]) * np.log(K)
         # significance of each fitted edge: height over its standard error from the (unconstrained) normal equations
@@ -334,20 +405,35 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
         if chosen and c["fit_rms"] > max(free_ratio * chosen[0]["fit_rms"], free_floor):
             break                                                                     # the rest are not crystalline
         chosen.append(c)
+    # edge resolution: with none given, the Gaussian width that best fits the chosen directions (grid, summed rms)
+    res = res0
+    if resolution is None and chosen:
+        best = None
+        for sig_rel in np.concatenate([[0.0], np.geomspace(2e-4, 2e-2, 10)]):
+            tot = 0.0
+            for c in chosen:
+                m = BraggSpectrum(lam, lattice=c["type"], a_range=(c["a"] * 0.995, c["a"] * 1.005), n_spline=n_spline, resolution=(sig_rel, 0.0))
+                target = np.clip(c["y"], 0, None); target /= max(target.max(), 1e-12)
+                tot += fit_spectrum(m, target, a_grid=np.array([c["a"]]), ridge=ridge, refine_steps=0)[3] ** 2
+            if best is None or tot < best[0]:
+                best = (tot, float(sig_rel))
+        res = (best[1], 0.0)
+        if verbose:
+            print(f"  edge resolution: Gaussian sigma / lambda = {res[0]:.2e} from the fitted directions", flush=True)
     thetas, out_lattices, residuals = [], [], []
     for c in chosen:
         a = c["a"]; lo, hi = c["search"]
         rng = (max(lo, a * 0.98), min(hi, a * 1.02))
-        m = BraggSpectrum(lam, lattice=c["type"], a_range=rng, n_spline=n_spline, edge_width_rel=edge_width_rel)
+        m = BraggSpectrum(lam, lattice=c["type"], a_range=rng, n_spline=n_spline, resolution=res)
         target = np.clip(c["y"], 0, None); target /= max(target.max(), 1e-12)
-        theta, fit, a, e = fit_spectrum(m, target, a_grid=np.linspace(a * (1 - 0.002), a * (1 + 0.002), 9), ridge=ridge, refine_steps=2)
+        theta, fit, a, e = fit_spectrum(m, target, a_grid=np.array([a]), ridge=ridge, refine_steps=0)
         for _ in range(polish):
             target = Q @ (Q.T @ fit); target = np.clip(target, 0, None) / max(target.max(), 1e-12)
-            theta, fit, a, e = fit_spectrum(m, target, a_grid=np.linspace(a * (1 - 0.002), a * (1 + 0.002), 9), ridge=ridge, refine_steps=2)
+            theta, fit, a, e = fit_spectrum(m, target, a_grid=np.linspace(a * (1 - 1e-4), a * (1 + 1e-4), 3), ridge=ridge, refine_steps=1)
         if verbose:
             print(f"  component {len(thetas)}: {c['type']} a = {a:.4f} A, {len(c['edges'])} edges in range, residual {c['resid']:.2e}, fit rms {e:.2e}", flush=True)
         thetas.append(theta); out_lattices.append((c["type"], rng)); residuals.append(c["resid"])
-    return thetas, out_lattices, residuals, n_bragg - len(chosen)
+    return thetas, out_lattices, residuals, n_bragg - len(chosen), res
 
 
 def _quadratic_step(models, a_vals, g, Msym, H_old, Rb, ridge, P, dev):
@@ -408,7 +494,7 @@ def _profiled_system(models, a_vals, W, H, G, Z, x_cur, Rb, ridge, dev, chunk=32
     By the envelope theorem the gradient of L* is the partial gradient in x and its Hessian is the Schur complement
     A_xx - A_xW A_WW^-1 A_Wx of the joint (W, x) Hessian, accumulated over pixel chunks (A_WW is R x R per pixel,
     restricted to the maps' free set). Returns a dict for `_profiled_solve`."""
-    P, K = G.shape; R = W.shape[1]
+    P, K = G.shape; R = W.shape[1]; dt = W.dtype
     D = [m.design_t(a).to(dev, torch.float64) for m, a in zip(models, a_vals)]
     sizes = [d.shape[1] for d in D]; n = int(sum(sizes)); off = np.cumsum([0] + sizes)
     Wd, Hd = W.double(), H.double()
@@ -421,22 +507,23 @@ def _profiled_system(models, a_vals, W, H, G, Z, x_cur, Rb, ridge, dev, chunk=32
         g[off[r]:off[r + 1]] = D[r].T @ WG[r]
     Ainv_chunks, C_chunks, gW_chunks = [], [], []
     for p0 in range(0, P, chunk):
-        sl = slice(p0, min(p0 + chunk, P)); Wc, Gc, Zc, fc = Wd[sl], G[sl].double(), Z[sl].double(), free[sl]
-        Pc = Wc.shape[0]
+        sl = slice(p0, min(p0 + chunk, P)); Wc, fc = Wd[sl], free[sl]; Gc, Zc = G[sl], Z[sl]   # products in T's dtype, sums in float64
+        Pc = Wc.shape[0]; Wf, Hf = W[sl], H
+        Df = [d.to(dt) for d in D]
         for r in range(Rb):
             for q in range(Rb):
-                A[off[r]:off[r + 1], off[q]:off[q + 1]] += D[r].T @ (((Wc[:, r] * Wc[:, q]) @ Zc)[:, None] * D[q])
-        Ap = torch.einsum('pk,rk,sk->prs', Zc, Hd, Hd)                                # per-pixel W Hessian
+                A[off[r]:off[r + 1], off[q]:off[q + 1]] += D[r].T @ (((Wf[:, r] * Wf[:, q]) @ Zc).double()[:, None] * D[q])
+        Ap = torch.einsum('pk,rk,sk->prs', Zc, Hf, Hf).double()                       # per-pixel W Hessian
         mask = fc[:, :, None] * fc[:, None, :]
         Ap = Ap * mask + torch.diag_embed(1.0 - fc) + 1e-12 * torch.eye(R, dtype=torch.float64, device=dev)
         Ainv = torch.linalg.inv(Ap)
         C = torch.zeros(Pc, R, n, dtype=torch.float64, device=dev)                    # d^2 L / dW_pr dx
         for q in range(Rb):
             for r in range(R):
-                C[:, r, off[q]:off[q + 1]] = Wc[:, q, None] * ((Zc * Hd[r][None, :]) @ D[q])
-            C[:, q, off[q]:off[q + 1]] += Gc @ D[q]
+                C[:, r, off[q]:off[q + 1]] = Wc[:, q, None] * ((Zc * Hf[r][None, :]) @ Df[q]).double()
+            C[:, q, off[q]:off[q + 1]] += (Gc @ Df[q]).double()
         C = C * fc[:, :, None]
-        gW = (Gc @ Hd.T) * fc                                                          # (Pc, R)
+        gW = (Gc @ Hf.T).double() * fc                                                 # (Pc, R)
         S_red += torch.einsum('prs,pri,psj->ij', Ainv, C, C)
         g_red += torch.einsum('prs,ps,pri->i', Ainv, gW, C)
         Ainv_chunks.append(Ainv); C_chunks.append(C); gW_chunks.append(gW)
@@ -482,8 +569,8 @@ def _profiled_solve(sys, damping):
 
 def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_maps=None, lattice_types=("fcc", "bcc", "diamond"),
                          a_range=(2.0, 7.0), lattices=None, thetas=None, H_free_init=None, W_init=None, max_outer=30,
-                         rel_tol=1e-6, w_max_steps=100, ridge=1.0, n_spline=8, edge_width_rel=0.0, lattice_bracket=0.002,
-                         free_ratio=4.0, verbose=False):
+                         rel_tol=1e-6, w_max_steps=100, w_rel_tol=1e-8, ridge=1.0, n_spline=8, resolution=None,
+                         fit_resolution=True, lattice_bracket=0.002, free_ratio=4.0, verbose=False):
     """Fit n_bragg parametric Bragg spectra plus n_free nonparametric rows to T under the NNAL, assuming nothing about
     the materials: lattice types and parameters are discovered from the data (see `warm_start`).
 
@@ -501,14 +588,19 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
         W_init: initial maps (pixels, R); default: convex solve with the initial spectra.
         ridge, n_spline: the spline residual's size and ridge (relative to the pixel count); the defaults were tuned on
             the three-metal phantom, where a looser residual trades map fidelity for a slightly lower loss.
+        resolution, fit_resolution: the edge profile's (sigma / lam, tau / lam), an exponentially modified Gaussian
+            shared by all components (an instrument property, see `edge_profile`); None starts from the warm start's
+            Gaussian estimate (or sharp edges), and fit_resolution refines both parameters by golden-section search
+            on the quadratic model each iteration. info['resolution'] holds the result.
         lattice_bracket: initial half-width of the lattice-parameter search, relative to a (shrinks adaptively).
+        w_max_steps, w_rel_tol: the per-iteration convex map solve (block Newton, warm-started: 2-3 steps at 1e-8).
 
-    Each outer iteration: (1) a golden-section search on each lattice parameter and an exact projected Newton step on
-    the linear spectral coefficients, both on the convex quadratic model of the loss in H with the maps fixed, Armijo
-    checked; (2) the convex per-pixel map solve; (3) a Levenberg-damped Newton step on the PROFILED objective
-    (maps' optimal response folded in through the Schur complement of the joint Hessian), which moves along the
-    valley of near-equivalent factorizations that alternating steps crawl along; (4) a block Newton step on the free
-    rows and a final map solve.
+    Each outer iteration: (1) a golden-section search on each lattice parameter (skipped once it has settled, then
+    re-checked every fourth iteration) and an exact projected Newton step on the linear spectral coefficients, both on
+    the convex quadratic model of the loss in H with the maps fixed, Armijo checked; (2) a Levenberg-damped Newton step
+    on the PROFILED objective (maps' optimal response folded in through the Schur complement of the joint Hessian),
+    which moves along the valley of near-equivalent factorizations that alternating steps crawl along; (3) a block
+    Newton step on the free rows; (4) the one convex per-pixel map solve of the iteration.
 
     Returns (W, H, thetas, info): H the assembled spectra (R, bins) in T's dtype; info['lattices'] the discovered
     (type, a) per crystalline component, info['loss'] per iteration.
@@ -522,18 +614,21 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
             raise ValueError("hybrid_factorization needs init_rows (a bilinear factorization) or explicit lattices")
         rows_np = np.asarray(init_rows, dtype=np.float64)
         n_bragg = rows_np.shape[0] - n_free if n_bragg is None else int(n_bragg)
-        thetas, lattices, discovered, extra_free = warm_start(rows_np, lam_np, n_bragg=n_bragg, lattice_types=lattice_types,
-                                                              a_range=a_range, edge_width_rel=edge_width_rel, ridge=ridge,
-                                                              n_spline=n_spline, free_ratio=free_ratio, device=dev, verbose=verbose)
+        thetas, lattices, discovered, extra_free, resolution = warm_start(rows_np, lam_np, n_bragg=n_bragg, lattice_types=lattice_types,
+                                                                          a_range=a_range, resolution=resolution, ridge=ridge,
+                                                                          n_spline=n_spline, free_ratio=free_ratio, device=dev, verbose=verbose)
         n_free += extra_free
-    models = [BraggSpectrum(lam_t.cpu(), lattice=l, a_range=ar, n_spline=n_spline, edge_width_rel=edge_width_rel) for l, ar in lattices]
+    resolution = (0.0, 0.0) if resolution is None else tuple(float(v) for v in resolution)
+    models = [BraggSpectrum(lam_t.cpu(), lattice=l, a_range=ar, n_spline=n_spline, resolution=resolution) for l, ar in lattices]
     for m in models:
         m.lam = lam_t; m.S = m.S.to(dev)
     Rb = len(models); R = Rb + n_free
     if thetas is None and init_rows is not None:
         rows_np = np.asarray(init_rows, dtype=np.float64)
-        thetas, _, _, _ = warm_start(rows_np, lam_np, lattices=lattices, edge_width_rel=edge_width_rel, ridge=ridge,
-                                     n_spline=n_spline, device=dev, verbose=verbose)
+        thetas, _, _, _, resolution = warm_start(rows_np, lam_np, lattices=lattices, resolution=resolution, ridge=ridge,
+                                                 n_spline=n_spline, device=dev, verbose=verbose)
+        for m in models:
+            m.resolution = resolution
         if n_free and H_free_init is None:
             # free components start from the rows least explained by the fitted Bragg spectra
             Hb0 = np.stack([m(th.to(lam_t.device)).cpu().numpy() for m, th in zip(models, thetas)])
@@ -560,18 +655,23 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
         Hb = torch.as_tensor(np.asarray(init_rows, dtype=np.float64), device=dev)
         M = torch.linalg.lstsq(H.double().T, Hb.T)[0].T                              # Hb ~ M @ H, so W_b Hb ~ (W_b M) H
         W_init = (torch.as_tensor(init_maps, device=dev).double() @ M).clamp(min=0).to(dt)
-    W = solve_W(T, H, W_init.to(dev, dt) if W_init is not None else None, w_max_steps, 1e-10)
+    W = solve_W(T, H, W_init.to(dev, dt) if W_init is not None else None, w_max_steps, w_rel_tol)
     loss = stable_nnal(W @ H, T, prep, dtype=torch.float64).item()
     info = dict(loss=[loss], a=[[float(th[0]) for th in thetas]], accepted=[], residuals=discovered,
-                lattices=[(l, float(th[0])) for (l, _), th in zip(lattices, thetas)])
+                lattices=[(l, float(th[0])) for (l, _), th in zip(lattices, thetas)], resolution=[resolution])
+    res_brackets = [max(resolution[0], 0.01), max(resolution[1], 0.01)]              # half-widths of the resolution search (start wide)
+    res_moves = [np.inf, np.inf]
+
+    def set_resolution(res):
+        for m in models:
+            m.resolution = tuple(res)
     brackets = [lattice_bracket * float(th[0]) for th in thetas]
     damping = 1e-3
+    a_moves = [np.inf] * Rb
     for outer in range(1, max_outer + 1):
         loss_start = loss
-        # ---- spectral parameters, three moves per iteration.
-        # (a) Lattice parameters: golden-section search on the W-fixed quadratic model of the loss in H (edge
-        #     positions are local in wavelength, so the maps' response matters little there), and
-        # (b) linear coefficients: exact minimiser of that convex model (projected Newton, W fixed), Armijo-checked.
+        # ---- (1) lattice parameters and linear coefficients with the maps fixed, on the convex quadratic model of
+        #      the loss in H (the block solver's per-bin Newton statistics); Armijo on the true loss
         g, flat, rows, cols = _h_statistics(W, H, T, prep)
         Msym = torch.zeros(K, R, R, dtype=torch.float64, device=dev)
         Msym[:, rows, cols] = flat.T.double(); Msym[:, cols, rows] = flat.T.double()
@@ -579,9 +679,44 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
         a_vals = [float(th[0]) for th in thetas]
         coeffs, _ = _quadratic_step(models, a_vals, *stats)
         for r in range(Rb):
+            settled = brackets[r] <= 2.5e-5 * a_vals[r] and a_moves[r] <= 1e-5 * a_vals[r]
+            if settled and outer % 4:
+                continue
             a_new, coeffs, _ = _lattice_search(models, a_vals, r, brackets[r], *stats)
-            brackets[r] = float(min(max(4.0 * abs(a_new - a_vals[r]), 2e-5 * a_new), lattice_bracket * a_new))
+            a_moves[r] = abs(a_new - a_vals[r])
+            brackets[r] = float(min(max(4.0 * a_moves[r], 2e-5 * a_new), lattice_bracket * a_new))
             a_vals[r] = a_new
+        # edge resolution (shared by all components): golden-section search on each of (sigma / lam, tau / lam) on the
+        # same quadratic model, coefficients re-solved at every trial; skipped once settled, re-checked every fourth
+        res_old = tuple(models[0].resolution); res_new = list(res_old)
+        if fit_resolution:
+            for j in range(2):
+                settled = res_brackets[j] <= 2e-5 and res_moves[j] <= 1e-5
+                if settled and outer % 4:
+                    continue
+                lo_j, hi_j = max(0.0, res_new[j] - res_brackets[j]), min(0.05, res_new[j] + res_brackets[j])
+                cache = {}
+
+                def q_res(v):
+                    if v not in cache:
+                        trial_res = list(res_new); trial_res[j] = v; set_resolution(trial_res)
+                        cache[v] = _quadratic_step(models, a_vals, *stats)
+                    return cache[v][1]
+                x1, x2 = lo_j + 0.382 * (hi_j - lo_j), lo_j + 0.618 * (hi_j - lo_j)
+                for _ in range(8):
+                    if q_res(x1) < q_res(x2):
+                        hi_j = x2
+                    else:
+                        lo_j = x1
+                    x1, x2 = lo_j + 0.382 * (hi_j - lo_j), lo_j + 0.618 * (hi_j - lo_j)
+                v_best = min(list(cache) + [res_new[j]], key=q_res)
+                res_moves[j] = abs(v_best - res_new[j]); res_new[j] = v_best; coeffs = cache[v_best][0]
+                res_brackets[j] = float(min(max(4.0 * res_moves[j], 1e-5), 0.02))
+            set_resolution(res_new)
+            if max(res_moves[0] if np.isfinite(res_moves[0]) else 0.0, res_moves[1] if np.isfinite(res_moves[1]) else 0.0) > 1e-4:
+                brackets = [lattice_bracket * a for a in a_vals]; a_moves = [np.inf] * Rb   # the tail and a trade off: re-open the a search
+            if any(np.isfinite(mv) and mv > 1e-4 * a for mv, a in zip(a_moves, a_vals)):
+                res_brackets = [max(b, 2e-3) for b in res_brackets]; res_moves = [np.inf, np.inf]
         new_thetas = [m.pack(a, x).to(dev) for m, a, x in zip(models, a_vals, coeffs)]
         step = 1.0; accepted = False
         for _ in range(6):
@@ -592,12 +727,11 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
                 thetas, H, loss, accepted = trial, H_trial, l_trial, True
                 break
             step *= 0.5
-        if accepted:
-            W = solve_W(T, H, W, w_max_steps, 1e-10)
-            loss = stable_nnal(W @ H, T, prep, dtype=torch.float64).item()
-        # (c) Linear coefficients again, now as a Levenberg-damped Newton step on the PROFILED objective (the maps'
-        #     optimal response folded in through the Schur complement): this is what moves along the valley of
-        #     near-equivalent factorizations that the alternating moves crawl along.
+        if not accepted:
+            set_resolution(res_old)                                                   # the resolution move goes with the rejected step
+        info["accepted"].append(accepted)
+        # ---- (2) Levenberg-damped Newton step on the PROFILED objective from the current (W, H): the maps' response
+        #      dW comes with the step, so no map solve is needed between (1) and (2)
         X = W @ H
         G, Z = stable_nnal_derivatives(X, T, prep)
         a_vals = [float(th[0]) for th in thetas]
@@ -613,24 +747,23 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
                 ratio = (loss - l_trial) / predicted
                 damping = max(damping / 3.0, 1e-8) if ratio > 0.5 else min(damping * 3.0, 1e3)
                 thetas, H, W, loss = trial, H_trial, W_trial, l_trial
-                W = solve_W(T, H, W, w_max_steps, 1e-10)
-                loss = stable_nnal(W @ H, T, prep, dtype=torch.float64).item()
                 break
             damping = min(damping * 10.0, 1e6)
         del system
-        info["accepted"].append(accepted)
-        # ---- free rows: one block Newton step on H (then the Bragg rows are re-imposed)
+        # ---- (3) free rows: one block Newton step on H (then the Bragg rows are re-imposed)
         if n_free:
             X = W @ H
             H_new, _, _ = block_newton_step(H.clone(), W, X, T, prep, 1)
             H_free = H_new[Rb:]
             H = assemble(thetas, H_free)
-            W = solve_W(T, H, W, w_max_steps, 1e-10)
-            loss = stable_nnal(W @ H, T, prep, dtype=torch.float64).item()
-        info["loss"].append(loss); info["a"].append([float(th[0]) for th in thetas])   # W is optimal for H here
+        # ---- (4) maps: the one convex solve of the iteration
+        W = solve_W(T, H, W, w_max_steps, w_rel_tol)
+        loss = stable_nnal(W @ H, T, prep, dtype=torch.float64).item()
+        info["loss"].append(loss); info["a"].append([float(th[0]) for th in thetas]); info["resolution"].append(tuple(models[0].resolution))
         if verbose:
-            print(f"  outer {outer:2d}: loss {loss:.6f}  a = {[round(float(th[0]), 4) for th in thetas]}  theta step {'ok' if accepted else 'rejected'}", flush=True)
+            print(f"  outer {outer:2d}: loss {loss:.6f}  a = {[round(float(th[0]), 4) for th in thetas]}  resolution {tuple(round(v, 5) for v in models[0].resolution)}  theta step {'ok' if accepted else 'rejected'}", flush=True)
         if abs(loss_start - loss) <= rel_tol * abs(loss) and outer > 2:
             break
     info["outer"] = outer; info["lattices"] = [(l, float(th[0])) for (l, _), th in zip(lattices, thetas)]
+    info["resolution"] = tuple(models[0].resolution)
     return W, H, thetas, info

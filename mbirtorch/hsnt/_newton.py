@@ -83,13 +83,20 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     free = ~bound
     projected_gnorm2 = ((grad * free) ** 2).sum()
     eye = torch.eye(rank, dtype=V.dtype, device=V.device)
-    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
-    rhs = torch.where(free, grad, torch.zeros_like(grad))
-    d = _batched_spd_solve(M, rhs, jitter_rel)
-    d = torch.where(free, d, torch.zeros_like(d))
-    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
+    # Bound-adjacent entries with an inward gradient take a scaled-gradient step and are kept OUT of the Newton
+    # system: solving for them jointly and then overwriting their component leaves the other components' moves
+    # (which assumed the joint solution) dangling. With nearly collinear rows of the fixed factor that dangling
+    # move can raise the loss by orders of magnitude more than the predicted decrease and the line search then
+    # backtracks to its cap on every step (seen with the hybrid Bragg spectra: 109 pixels, 8 backtracks per step).
     inward = ((V <= eps_active) & (grad < 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
+    newton = free & ~inward
+    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)   # true curvature, for the scaled steps
+    M = torch.where(newton[:, :, None] & newton[:, None, :], M, eye.expand_as(M))
+    rhs = torch.where(newton, grad, torch.zeros_like(grad))
+    d = _batched_spd_solve(M, rhs, jitter_rel)
+    d = torch.where(newton, d, torch.zeros_like(d))
     d = torch.where(inward, grad / diag_M, d)
+    rhs = torch.where(free, grad, torch.zeros_like(grad))
     row_max = V.abs().amax(-1, keepdim=True)
     floor = torch.clamp(_TRUST_FLOOR * row_max.mean(), min=torch.finfo(V.dtype).eps)
     limit = 16.0 * torch.maximum(row_max, floor)

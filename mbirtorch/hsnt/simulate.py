@@ -196,3 +196,14 @@ def generate_sphere_data(material_basis, num_angles=4, detector_rows=64, detecto
             print(f"   -view {a} ({np.rad2deg(angles[a]):5.1f} deg): {mat.mean():.1%} of pixels hold material; of those "
                   f"{(n[mat] == 1).mean():.0%} pure, {(n[mat] == 2).mean():.0%} two materials, {(n[mat] == 3).mean():.0%} three")
     return [noisy_hyper_projection, angles, gt_hyper_projection, material_projection]
+
+
+def material_basis_wavelengths(num_bins, lam0=1.5099, step=0.0025196):
+    """Wavelength (Angstrom) of each bin of the phantom's `material_basis.npy`, which stores spectra without an axis.
+
+    The axis was calibrated from the nickel row (fcc, a = 3.5231 A): its edges at bins 26, 43, 100, 208, 244, 390,
+    799 and 1016 match 2 a / sqrt(h^2 + k^2 + l^2) for the (531), (511)/(333), (422), (420), (331), (400), (222) and
+    (311) families with a linear axis lam = lam0 + step * bin to 1.3 mA rms. Anything that gives the hybrid Bragg
+    model a wavelength axis for phantom data should call this instead of repeating the constants.
+    """
+    return lam0 + step * np.arange(num_bins, dtype=np.float64)
