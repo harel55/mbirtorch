@@ -214,6 +214,8 @@ def read_tif_stack(directory, wave_range=None, downsample=1, desc="stack"):
 
 def read_open_beam(paths, wave_range, downsample, expected_shape):
     """Average one or more open-beam stacks; a directory of observation subdirectories is averaged over them."""
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]                                                                 # one directory given as a string
     dirs = []
     for p in paths:
         files, subdirs = _tif_files(p)

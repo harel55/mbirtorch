@@ -459,3 +459,45 @@ is count-limited (earlier estimate 0.18% / 0.06% per pixel at dose 3 / 30).
 Wavelength-axis audit (same day): nothing in `bragg.py` assumes a spectral range; the reflection index range follows
 from `(2 a / lam_min)^2` (a fixed `hmax = 8` missed edges below 1.5 A), bin-relative widths use the median bin width,
 the spline knots span the data, and the phantom basis's axis lives in `simulate.material_basis_wavelengths`.
+
+### 9.4 Measured data: the Ni cylinder (2026-09-20, night)
+
+Data: `ORNL/2_4c/Ni_cylinder_projections` counts with the five open-beam observations, loaded through the CLI at
+4x spatial downsampling and 2 source bins per bin (128x128 pixels, 1391 bins, 91.7 open-beam counts per pixel and
+bin). The dataset carries no wavelength axis. The mean spectrum of the cylinder pixels shows five drops at the
+positions of the Ni fcc edges (222, 311, 220, 200, 111) and, in addition, upward steps at six bins (15, 239, 493,
+699, 1041 and a smaller one near 420) where the smooth part continues with a different slope: the signature of
+detector shutter segments with their own time-bin widths and count-rate corrections. A linear axis through the
+111 and 200 edges misses the other edges by 8-21 bins (1-3%), so the axis was taken piecewise linear with
+breakpoints at the steps, slopes fitted to the five edge positions with a smoothness tie between segments
+(`hybrid/real/real_ni2.py`; bin widths 1.6-2.4 mA, range 1.90-4.49 A). Because the axis is pinned to the Ni
+edges the recovered lattice parameter is not an independent test; the edge pattern, the edge shapes, the smooth
+part and the fit against the free per-bin bilinear fit are.
+
+Results (bilinear rank 1: loss 180719, reduced chi-square 1.449; the chi-square floor of 1.45 is the count scaling
+of these floats, seen at every rank):
+- discovery with no material knowledge picks fcc a = 3.5229 A (BIC -10817) over the bcc sqrt2 and fcc 2a aliases
+  (-9483, -9240); five edges in range;
+- default hybrid (10-knot spline, ridge 1): loss +0.65% above the bilinear, chi-square 1.460, a = 3.5222,
+  resolution sigma / lam 0.16%, tau / lam 0.19%. The mean-spectrum residual against the bilinear's own average
+  cylinder pixel is 0.014 rms in the smooth regions and 0.13 at worst, in a notch at 2.6-2.95 A;
+- 24-knot spline, ridge 1e-2: loss +0.06%, chi-square 1.4503, a = 3.5226, resolution 0.13% / 0.13%; residual
+  0.005 rms in the smooth regions, 0.006 at the edges, 0.019 at the detector steps, 0.021 in the notch (max 0.05);
+  40 knots change little more (+0.04%). Runtime 7 s for 16k pixels x 1391 bins on the laptop (bilinear 1.3 s).
+- The Ni thickness map is the cylinder's chord profile; a second component (free row or second lattice) is not
+  supported: from the rank-2 rows the discovery picked the bcc alias once, the second lattice landed at the top of
+  the search range with a map 0.995-correlated with the first, and the free row's map is noise-like.
+
+Reading. The physical part of the model is right for this measurement: five edges at the fcc positions with the
+correct relative heights emerge from the data alone, and the fitted resolution (0.13% Gaussian, 0.13% tail) is a
+plausible time-of-flight figure. The smooth part is not a low-order spline plus lambda and lambda^2 here: the
+default 10 knots leave systematic sawtooth residuals between edges (thick sample: the cylinder's attenuation is
+1.0-1.6, where extinction and multiple scattering flatten the coherent lambda^2 rise), and two instrument features
+have no term in the model: the shutter steps and the 2.7 A notch (0.1 deep, 0.3 A wide; not a Ni edge). A free row
+does not absorb them, because they are per-bin multiplicative errors shared by every pixel (an open-beam
+normalisation defect), which a factorization can only represent as a spectrum with a constant map; the free row
+found a noise-like map instead. Remedies in order of cost: a per-bin gain vector g_k fitted jointly (one parameter
+per bin, shared by all pixels: exactly the missing term), a wavelength axis from the instrument's shutter-time
+file instead of self-calibration, and a transmission-domain resolution operator once thick samples are the aim.
+Pipelines that expect edge data should also downsample less: the map here is 128x128 because the full TIFF stack
+does not fit in this machine's memory.
