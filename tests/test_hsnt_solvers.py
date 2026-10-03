@@ -507,3 +507,39 @@ def test_streaming_matches_the_full_solve(dev):
     Ws, Hs, Sm, _ = _support_selected_spectra(T, Wm, Hm, dose=10.0)
     assert abs(S.sum(1).double().mean().item() - Sm.sum(1).double().mean().item()) < 0.1
     assert _loss(W, H, T) <= 1.01 * _loss(Ws, Hs, T)
+
+
+def test_weights_of_one_change_nothing(dev):
+    """Per-entry weights of 1 give the unweighted solve exactly; a constant factor on the weights does not move the
+    minimizer (exp/overlap-weights)."""
+    T, _, _ = _problem(dev, P=1024, K=120)[:3]
+    W0, H0, _ = _nnal_factorization(T, 3, compile_mode='off')
+    W1, H1, _ = _nnal_factorization(T, 3, compile_mode='off', weights=torch.ones_like(T))
+    assert torch.equal(W0 @ H0, W1 @ H1)
+    A = 0.7 + 0.3 * torch.rand(T.shape, generator=torch.Generator().manual_seed(1)).to(T)
+    Wa, Ha, _ = _nnal_factorization(T, 3, compile_mode='off', weights=A)
+    Wb, Hb, _ = _nnal_factorization(T, 3, compile_mode='off', weights=2.5 * A)
+    assert torch.allclose(Wa @ Ha, Wb @ Hb, rtol=0, atol=1e-4)
+
+
+def test_weighted_loss_and_derivatives(dev):
+    """The weighted loss and its derivatives are the unweighted ones times the weights, entry by entry."""
+    T, _, _ = _problem(dev, P=256, K=40)[:3]
+    X = torch.rand(T.shape, generator=torch.Generator().manual_seed(2)).to(T)
+    A = torch.rand(T.shape, generator=torch.Generator().manual_seed(3)).to(T)
+    G, Z = stable_nnal_derivatives(X, T)
+    Gw, Zw = stable_nnal_derivatives(X, T, _nnal_prep(T, A))
+    assert torch.allclose(Gw, G * A) and torch.allclose(Zw, Z * A)
+    from mbirtorch.hsnt._loss import _nnal_elementwise
+    assert torch.allclose(_nnal_elementwise(X, T, _nnal_prep(T, A)), _nnal_elementwise(X, T, _nnal_prep(T)) * A)
+
+
+def test_weighted_stream_matches_full(dev):
+    """A streamed weighted fit reaches the full weighted fit's loss."""
+    from mbirtorch.hsnt._fit import _fit
+    T, _, _ = _problem(dev, P=2048, K=120)[:3]
+    Tn = T.cpu().numpy()
+    A = (0.7 + 0.3 * np.random.default_rng(4).random(Tn.shape)).astype(np.float32)
+    _, _, rf = _fit(Tn, 3, device=dev, weights=A, mode='full')
+    _, _, rs = _fit(Tn, 3, device=dev, weights=A, mode='stream', chunk_pixels=600, max_passes=10)
+    assert abs(rs['loss_mle'] - rf['loss_mle']) <= 1e-5 * abs(rf['loss_mle'])

@@ -95,16 +95,18 @@ def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None, compile_m
     return mode, chunk_pixels, warmup, note
 
 
-def _loss(W, H, T_host, device):
-    """The float64 NNAL loss of W @ H against the host data, in pixel chunks so no P x K float64 array is formed."""
-    from ._loss import stable_nnal
+def _loss(W, H, T_host, device, weights=None):
+    """The float64 NNAL loss of W @ H against the host data, in pixel chunks so no P x K float64 array is formed;
+    weights (host numpy, as T) multiply each entry's term."""
+    from ._loss import stable_nnal, _nnal_prep
     from .outputs import _CHUNK_ELEMENTS
     Hd = H.to(device).double()
     chunk = max(1, _CHUNK_ELEMENTS // T_host.shape[1])
     total = 0.0
     for i in range(0, T_host.shape[0], chunk):
         Tc = torch.from_numpy(T_host[i:i + chunk]).to(device).double()
-        total += stable_nnal(W[i:i + chunk].to(device).double() @ Hd, Tc).item()
+        prep = None if weights is None else _nnal_prep(Tc, torch.from_numpy(weights[i:i + chunk]).to(device).double())
+        total += stable_nnal(W[i:i + chunk].to(device).double() @ Hd, Tc, prep).item()
     return total
 
 
@@ -183,7 +185,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
 
 def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, device="cpu",
          mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5, warmup_pixels=16384,
-         compile_mode="auto", report=None):
+         compile_mode="auto", report=None, weights=None):
     """Fit T (host numpy, pixels x bins, float32) at the given rank. Returns (W, H, report): numpy factors and a dict
     of what was done (mode, steps or passes, seconds, losses, support size).
 
@@ -191,11 +193,15 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     'auto' or a multiple of log K. compile_mode applies to the full solve; a streamed solve compiles only with 'on'.
     rel_tol stops a full solve after five steps in a row below it and a streamed one on the first pass below it, within
     max_passes. warmup_pixels is the streamed warm-up's subsample, capped by the memory plan. report, a dict, is
-    filled in place of a new one, so that a caller has the memory plan even when the solve fails.
+    filled in place of a new one, so that a caller has the memory plan even when the solve fails. weights (host numpy,
+    as T, >= 0; maximum-likelihood spectra only) multiply each entry's loss: e.g. 1 - P for overlap-corrected
+    MCP/Timepix counts (see _loss._nnal_prep).
     """
     from ._streaming import _stream_factorization
     from .factorization import _nnal_factorization
     from .spectra import _support_selected_spectra, _unconstrained_spectra
+    if weights is not None and spectra != "mle":
+        raise ValueError("weights are supported with the maximum-likelihood spectra only")
     if spectra not in SPECTRA:
         raise ValueError(f"spectra must be one of {SPECTRA}, got {spectra!r}")
     if spectra == "support" and dose is None:
@@ -213,7 +219,10 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     stats = {}
     if mode == "full":
         Td = torch.from_numpy(T).to(device)
-        W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode)
+        Ad = torch.from_numpy(weights).to(device) if weights is not None else None
+        W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode,
+                                          weights=Ad)
+        del Ad
         rep["steps"] = int(steps)
     else:
         chunks = [torch.from_numpy(T[i:i + chunk]) for i in range(0, P, chunk)]
@@ -224,7 +233,9 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
                                                     verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,
                                                     nonneg_W=(spectra != "unconstrained"), support_selection=support,
                                                     compile_mode="on" if compile_mode == "on" else "off",
-                                                    chunk_sizes=[c.shape[0] for c in chunks])
+                                                    chunk_sizes=[c.shape[0] for c in chunks],
+                                                    weight_chunks=None if weights is None else
+                                                    [torch.from_numpy(weights[i:i + chunk]) for i in range(0, P, chunk)])
         W = torch.cat(W_chunks)
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         Td = None
@@ -232,7 +243,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
         torch.cuda.synchronize(device)
     rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
     if mode == "full":
-        rep["loss_mle"] = _loss(W, H, T, device)
+        rep["loss_mle"] = _loss(W, H, T, device, weights)
     else:       # the last polish pass's loss is at the final W and H; with free-signed W it is not the MLE's
         rep["loss_mle"] = stats["loss"][-1] if spectra != "unconstrained" else None
     steps_text = f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes"

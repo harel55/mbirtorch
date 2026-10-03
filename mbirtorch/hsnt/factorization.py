@@ -17,7 +17,7 @@ def _initial_factors(T, num_materials):
 
 
 def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_mode='auto', W_init=None,
-                        H_init=None):
+                        H_init=None, weights=None):
     """Factorize the transmission ratio T ~= exp(-W @ H), W, H >= 0, by minimizing the non-negative attenuation loss.
 
     The loss sum[exp(-X) + T X], X = W @ H, is the Poisson negative log-likelihood of the counts up to a constant
@@ -42,6 +42,9 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
             'on' always compiles; 'off' never does. Defaults to 'auto'.
         W_init, H_init (torch.Tensor, optional): A start; the missing factor is fitted to the attenuation by
             nonnegative least squares. Defaults to None: an NNDSVDa start.
+        weights (torch.Tensor, optional): Per-entry weights (pixels, bins), >= 0, multiplying each entry's loss: the
+            likelihood of counts recorded with efficiency `weights` (e.g. 1 - P for overlap-corrected MCP/Timepix
+            data). Defaults to None, all ones.
 
     Returns:
         (W, H, steps): W (pixels, num_materials) and H (num_materials, bins) on T's device and in T's dtype, and the
@@ -57,7 +60,7 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
     elif H_init is None:
         H_init = _nonneg_least_squares_start(_attenuation_for_start(T).T, W_init.T).T
     return joint_newton_optimize(T, num_materials, max_steps, rel_tol, W_init=W_init, H_init=H_init,
-                                 compile_mode=compile_mode)
+                                 compile_mode=compile_mode, weights=weights)
 
 
 # A zero-count entry whose attenuation reaches this share of the solver's bound (_newton._X_MAX) sits at the bound.

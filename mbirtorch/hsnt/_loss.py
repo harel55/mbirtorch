@@ -1,27 +1,32 @@
 import torch
 
 
-def _nnal_prep(T):
+def _nnal_prep(T, weights=None):
     """
     Precompute the quantities that depend only on T.
 
     These are constant for a whole solve, so hoisting them out of the iteration
     removes a full log over T from every loss and derivative evaluation.
 
+    weights (optional, broadcastable to T, >= 0) multiplies every entry's loss and derivatives: the likelihood of
+    counts recorded with a per-entry efficiency, e.g. 1 - P for MCP/Timepix data corrected for overlap (Tremsin et
+    al., JINST 9 C05026, 2014), whose recorded counts are Poisson with mean (1 - P) times the corrected mean.
+
     Returns:
-        (log_T, positive, all_positive)
+        (log_T, positive, all_positive, weights)
     """
     positive = T > 0
     Tsafe = torch.where(positive, T, torch.ones((), dtype=T.dtype, device=T.device))
     log_T = torch.log(Tsafe)
     all_positive = bool(positive.all())
-    return log_T, positive, all_positive
+    return log_T, positive, all_positive, weights
 
 
 def _nnal_elementwise(X, T, prep):
     """The shifted NNAL term by term: T * phi(X + log T) with phi(u) = exp(-u) - 1 + u, and exp(-X) where
     T == 0. stable_nnal and _nnal_rowwise are reductions of this one tensor."""
-    log_T, positive, all_positive = prep
+    log_T, positive, all_positive = prep[:3]
+    weights = prep[3] if len(prep) > 3 else None
     Xp = X + log_T
     loss = T * (torch.expm1(-Xp) + Xp)
     if not all_positive:
@@ -29,7 +34,7 @@ def _nnal_elementwise(X, T, prep):
         # real exp: expm1(-Xp) saturates at exactly -1 for Xp above ~37 in
         # float64, so reconstructing it as expm1(-Xp) + 1 underflows to zero.
         loss = torch.where(positive, loss, torch.exp(-Xp))
-    return loss
+    return loss if weights is None else loss * weights
 
 
 def stable_nnal(X, T, prep=None, dtype=None):
@@ -66,7 +71,9 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
     where L is the non-negative attenuation loss in a
     numerically stable way that handles T = 0 appropriately.
     """
-    log_T, positive, all_positive = _nnal_prep(T) if prep is None else prep
+    prep = _nnal_prep(T) if prep is None else prep
+    log_T, positive, all_positive = prep[:3]
+    weights = prep[3] if len(prep) > 3 else None
 
     Xp = X + log_T
 
@@ -84,6 +91,9 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
         G = torch.where(positive, G, -eXp)
         Z = torch.where(positive, Z, eXp)
 
+    if weights is not None:
+        G = G * weights
+        Z = Z * weights
     return G, Z
 
 

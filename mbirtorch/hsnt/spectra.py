@@ -128,12 +128,14 @@ def _scatter_support(idx, valid, w, R):
 
 def _empty_fit_loss(T, prep):
     """Per-pixel loss of the empty subset, f_p(0), in pixel chunks, so a zero X the size of T is never built whole."""
-    log_T, positive, all_positive = prep
+    log_T, positive, all_positive = prep[:3]
+    weights = prep[3] if len(prep) > 3 else None
     chunk = max(1, 2 ** 23 // T.shape[1])
     out = []
     for s in range(0, T.shape[0], chunk):
         Tc = T[s:s + chunk]
-        prep_c = (log_T[s:s + chunk], positive[s:s + chunk], all_positive)
+        prep_c = (log_T[s:s + chunk], positive[s:s + chunk], all_positive,
+                  None if weights is None else weights[s:s + chunk])
         out.append(_nnal_rowwise(torch.zeros_like(Tc), Tc, prep_c, 1, dtype=torch.float64))
     return torch.cat(out)
 
