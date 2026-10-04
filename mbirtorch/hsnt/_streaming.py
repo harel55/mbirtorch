@@ -42,7 +42,7 @@ _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
 
 def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384, device=None,
                           compile_mode='off', verbose=0, stats=None, nonneg_W=True, support_selection=None,
-                          chunk_sizes=None, weight_chunks=None):
+                          chunk_sizes=None, weight_chunks=None, H_init=None):
     """Factorize a dataset too large for device memory, one chunk of pixels at a time.
 
     W is separable over pixels, so it is solved chunk by chunk and never held whole on the device. H holds only R * K
@@ -80,6 +80,9 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             read for them. Defaults to None, from the chunks.
         weight_chunks (sequence of torch.Tensor, optional): Per-entry weights aligned with the chunks (see
             _nnal_prep); maximum-likelihood spectra only. Defaults to None, all ones.
+        H_init (torch.Tensor, optional): Starting spectra (num_materials, bins) for the warm-up fit, e.g. tabulated
+            material spectra; the warm-up maps then start from their nonnegative least-squares fit. Defaults to
+            None: the NNDSVDa start.
 
     Returns:
         (W_chunks, H, passes): W as a list of CPU tensors aligned with the chunks, H, and the polish passes made.
@@ -105,7 +108,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 wparts.append(weight_chunks[i][torch.from_numpy(local).to(weight_chunks[i].device)])
     T_sub = torch.cat(parts, 0).to(device)
     A_sub = torch.cat(wparts, 0).to(device) if weight_chunks is not None else None
-    _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode, weights=A_sub)
+    _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode, weights=A_sub,
+                                  H_init=None if H_init is None else H_init.to(T_sub))
     del T_sub, A_sub
     rows, cols = torch.triu_indices(R, R, device=H.device)
     pin = torch.device(device).type == 'cuda'

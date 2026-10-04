@@ -185,7 +185,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
 
 def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, device="cpu",
          mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5, warmup_pixels=16384,
-         compile_mode="auto", report=None, weights=None):
+         compile_mode="auto", report=None, weights=None, H_init=None):
     """Fit T (host numpy, pixels x bins, float32) at the given rank. Returns (W, H, report): numpy factors and a dict
     of what was done (mode, steps or passes, seconds, losses, support size).
 
@@ -195,7 +195,8 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     max_passes. warmup_pixels is the streamed warm-up's subsample, capped by the memory plan. report, a dict, is
     filled in place of a new one, so that a caller has the memory plan even when the solve fails. weights (host numpy,
     as T, >= 0; maximum-likelihood spectra only) multiply each entry's loss: e.g. 1 - P for overlap-corrected
-    MCP/Timepix counts (see _loss._nnal_prep).
+    MCP/Timepix counts (see _loss._nnal_prep). H_init (numpy, rank x bins): starting spectra, e.g. tabulated ones,
+    for the full solve or the streamed warm-up.
     """
     from ._streaming import _stream_factorization
     from .factorization import _nnal_factorization
@@ -221,7 +222,8 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
         Td = torch.from_numpy(T).to(device)
         Ad = torch.from_numpy(weights).to(device) if weights is not None else None
         W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode,
-                                          weights=Ad)
+                                          weights=Ad, H_init=None if H_init is None else
+                                          torch.as_tensor(np.asarray(H_init), dtype=Td.dtype, device=device))
         del Ad
         rep["steps"] = int(steps)
     else:
@@ -235,7 +237,9 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
                                                     compile_mode="on" if compile_mode == "on" else "off",
                                                     chunk_sizes=[c.shape[0] for c in chunks],
                                                     weight_chunks=None if weights is None else
-                                                    [torch.from_numpy(weights[i:i + chunk]) for i in range(0, P, chunk)])
+                                                    [torch.from_numpy(weights[i:i + chunk]) for i in range(0, P, chunk)],
+                                                    H_init=None if H_init is None else
+                                                    torch.as_tensor(np.asarray(H_init), dtype=torch.float32))
         W = torch.cat(W_chunks)
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         Td = None
