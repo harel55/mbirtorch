@@ -338,3 +338,147 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
     return dict(T=T, lam=lam, dose_per_bin=d, n=n, views=views, angles=angles, W_true=W_true, eps_bar=eps_bar,
                 V_true=V_true, E_true=E_true, voxel=voxel, mu_true=mu0, lamf=M.lamf.cpu().numpy(), g_true=g.cpu().numpy(),
                 f_true=f.cpu().numpy(), materials=MATERIALS)
+
+
+# The Fe cube phantom: one bcc Fe cube seen by three rotation series, each with its own mount and a holder rod.
+FE = dict(name='Fe', lattice='bcc', a=2.8665)
+FE_ELASTIC = (211e9, 0.29)                  # Young's modulus (Pa) and Poisson ratio of Fe
+FE_MAXWELL = (1.0, -0.6, 0.8)               # Maxwell stress-function amplitudes for the cube's residual stress
+FE_PEAK = 1.5e-3                            # the largest strain component in the cube
+FE_CUBE = dict(half=19.0 / 64, centre=(-0.5 / 64, -0.5 / 64, 7.0 / 64))   # half side and centre (y, x, z), units of n
+FE_ATTEN_3A = 0.1 * 64                      # the cube's attenuation per unit length at 3 Angstrom, times n per voxel
+FE_AXIS = (1.035, 6.027, 2841)              # wavelength range (Angstrom) and bins of the default axis
+HOLDER = dict(radius=14.0 / 64, gap=1.0 / 64, atten=0.27)  # rod radius and gap past the cube (units of n); attenuation
+#                                                            relative to the cube's mean attenuation
+
+
+def fe_cube_tensor(N):
+    """Indicator (N, N, N) of the Fe cube and its strain tensor (N, N, N, 6), COMPONENTS order, in the projector
+    layout (rows y, cols x, slices z). The residual stress comes from Maxwell stress functions S_i b^3 with b the
+    product of (1 - u^2 / h^2) over the cube's three axes: it satisfies equilibrium and is traction-free."""
+    c = (N - 1) / 2.0
+    h = FE_CUBE['half'] * N
+    cy, cx, cz = (v * N for v in FE_CUBE['centre'])
+    yy, xx, zz = np.meshgrid(np.arange(N) - c - cy, np.arange(N) - c - cx, np.arange(N) - c - cz, indexing='ij')
+    cube = (np.abs(yy) < h) & (np.abs(xx) < h) & (np.abs(zz) < h)
+    pts = torch.tensor(np.stack([xx, yy, zz], -1).reshape(-1, 3)[cube.reshape(-1)], dtype=torch.float64)
+    bump = lambda p: (1 - p[0] ** 2 / h ** 2) * (1 - p[1] ** 2 / h ** 2) * (1 - p[2] ** 2 / h ** 2)
+    Hs = [torch.func.vmap(torch.func.hessian(lambda p, S=S: S * bump(p) ** 3))(pts) for S in FE_MAXWELL]
+    h1, h2, h3 = Hs
+    sig = torch.stack([h2[:, 2, 2] + h3[:, 1, 1], h3[:, 0, 0] + h1[:, 2, 2], h1[:, 1, 1] + h2[:, 0, 0],
+                       -h3[:, 0, 1], -h1[:, 1, 2], -h2[:, 0, 2]], -1).numpy()
+    Em, nu = FE_ELASTIC
+    tr = sig[:, :3].sum(1, keepdims=True)
+    e = np.concatenate([((1 + nu) * sig[:, :3] - nu * tr) / Em, (1 + nu) * sig[:, 3:] / Em], 1)
+    eps = np.zeros((N, N, N, 6))
+    eps.reshape(-1, 6)[cube.reshape(-1)] = e * FE_PEAK / np.abs(e).max()
+    return cube, eps
+
+
+def fe_spectrum_model(lam, dose_per_bin, n, device='cpu'):
+    """A Hybrid2 model for bcc Fe on the axis lam and its parameter vector: Bragg heights j d, a smooth part, the
+    two-scale kernel, scaled so the attenuation per voxel at 3 Angstrom is FE_ATTEN_3A / n."""
+    M = Hybrid2(lam, dose_per_bin, [(FE['lattice'], (FE['a'] * 0.99, FE['a'] * 1.01))], n_spline=8, n_contam=2,
+                device=device, two_scale=True)
+    g = torch.zeros(M.n_global, dtype=torch.float64, device=device)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = FE['a']
+    ns = M.mats[0]['ns'].cpu().numpy(); d = FE['a'] / np.sqrt(ns)
+    g[sl['h'][0]:sl['h'][1]] = torch.as_tensor(np.array(multiplicities(FE['lattice'], ns), float) * d)
+    g[sl['c'][0]] = 0.3; g[sl['c'][0] + 1] = 0.2
+    with torch.no_grad():
+        mu = M.spectra(g)[0].cpu().numpy()
+    k3 = np.abs(M.lamf.cpu().numpy() - 3.0).argmin()
+    scale = (FE_ATTEN_3A / n) / mu[k3]
+    g[sl['h'][0]:sl['h'][1]] *= scale; g[sl['c'][0]:sl['c'][1]] *= scale
+    return M, g
+
+
+def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, offsets=None, levels=31, fine=2, seed=1,
+                 device='cuda', axis=None, holder=True, contamination=True):
+    """Synthetic data shaped like the Fe cube measurement: a bcc Fe cube with a residual-stress strain tensor
+    (fe_cube_tensor), seen by rotation series with their own mounts and a holder rod each.
+
+    mounts: per series (perm, signs, shift, rot) as tomo.MultiProjector takes them (shift in voxels of n, rot in
+    degrees); default: rotations about the three axes with no shifts. offsets: per series centre-of-rotation offsets
+    (detector channels). The holder is a rod on each series' rotation axis past the cube's end, with a flat attenuation
+    spectrum; it is not part of the sample, so a fit should leave its detector rows out (holder_rows). Counts are
+    Poisson with their variance inflated by `inflation` (counts drawn at dose / inflation, scaled back), as the
+    measured detector's correlated counts. The volume is generated on a grid `fine` times finer and the detector
+    binned back to n x n. Rays are series-major, then (view, row, channel), as MultiProjector orders them.
+    Returns a dict with T, lam, dose_per_bin, angles, mounts, offsets, V_true (n, n, n, 1), E_true (n, n, n, 1, 6),
+    the true spectrum, and holder_rows (the first detector row of the holder in each series)."""
+    import mbirtorch
+    from .geometry import series_weights
+    from .tomo import MultiProjector
+    angles = np.linspace(0, np.pi, 51) if angles is None else np.asarray(angles)
+    mounts = [((0, 1, 2), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ((1, 2, 0), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+              ((2, 0, 1), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))] if mounts is None else \
+        [tuple(m) + ((0.0, 0.0, 0.0),) * (4 - len(m)) for m in mounts]
+    offsets = [0.0] * len(mounts) if offsets is None else list(offsets)
+    if axis is None:
+        lam = np.linspace(*FE_AXIS[:2], FE_AXIS[2]); flux = np.ones_like(lam)
+    else:
+        lam, flux = np.asarray(axis[0]), np.asarray(axis[1])
+    d = dose * flux / np.mean(flux)
+    M, g = fe_spectrum_model(lam, d, n, device)
+    N = fine * n; V_ = len(angles); S = len(mounts)
+    cube, et = fe_cube_tensor(N)
+    wts = series_weights([((m[0], m[1], m[2]), angles) for m in mounts])         # (S views, 6)
+    seen_all = [(et * w).sum(-1) for w in wts]
+    lv = np.linspace(min(s[cube].min() for s in seen_all), max(s[cube].max() for s in seen_all), levels)
+    proj = np.zeros((levels, S * V_, n, n))                                      # path length per strain level
+    hold = np.zeros((S * V_, n, n))
+    holder_rows = []
+    zc = (N - 1) / 2.0
+    for k, (perm, signs, shift, rot) in enumerate(mounts):
+        tr = (tuple(perm), tuple(signs), tuple(float(v) * fine for v in shift), tuple(float(v) for v in rot))
+        # the holder: a rod in the series frame on the rotation axis (slices), from just past the cube's far end
+        cube_s = MultiProjector._to_series(torch.as_tensor(cube[..., None], dtype=torch.float32, device=device), tr)[..., 0]
+        zs = torch.nonzero(cube_s.sum((0, 1)) > 0.5)[:, 0]
+        z0 = int(zs.max()) + 1 + int(round(HOLDER['gap'] * N))
+        yy, xx = np.meshgrid(np.arange(N) - zc, np.arange(N) - zc, indexing='ij')     # the axis is the grid's centre
+        rod = np.zeros((N, N, N), np.float32)
+        if holder and z0 < N:
+            rod[(yy ** 2 + xx ** 2 < (HOLDER['radius'] * N) ** 2), z0:] = 1.0
+        holder_rows.append(z0 // fine)
+        for v in range(V_):
+            idx = np.abs(seen_all[k * V_ + v][..., None] - lv).argmin(-1)
+            inds = torch.as_tensor(np.stack([(cube & (idx == l)) for l in range(levels)], -1), dtype=torch.float32, device=device)
+            vol = torch.cat([MultiProjector._to_series(inds, tr), torch.as_tensor(rod, device=device)[..., None]], -1)
+            stack = torch.cat([vol[..., q] for q in range(levels + 1)], 2).contiguous()
+            mv = mbirtorch.ParallelBeamModel((1, N * (levels + 1), N), angles[v:v + 1])
+            mv.set_params(use_ror_mask=False, det_channel_offset=float(offsets[k]) * fine)
+            sino = mv.forward_project(stack, output_sharded=True)                      # (1, (levels + 1) N, N)
+            b = (sino.reshape(levels + 1, n, fine, n, fine).mean((2, 4)) / fine).cpu().numpy()
+            proj[:, k * V_ + v] = b[:levels]; hold[k * V_ + v] = b[levels]
+    P = S * V_ * n * n
+    proj = proj.reshape(levels, P); hold = hold.reshape(P)
+    blk = lambda a: a.reshape(n, fine, n, fine, n, fine).mean((1, 3, 5))
+    frac = np.maximum(blk(cube.astype(np.float64)), 1e-12)
+    V_true = blk(cube.astype(np.float64))[..., None]
+    E_true = np.stack([blk(np.where(cube, et[..., c], 0.0)) / frac for c in range(6)], -1)[..., None, :]
+    with torch.no_grad():
+        X = torch.zeros(P, M.Kf, dtype=torch.float32, device=device)
+        for l, e_l in enumerate(lv):
+            w = torch.as_tensor(proj[l], dtype=torch.float32, device=device)
+            if float(w.max()) <= 0:
+                continue
+            eps_t = torch.full((1, 1), float(e_l), dtype=torch.float64, device=device)
+            X += w[:, None] * M.spectra(g, eps_t)[0, 0].float()[None, :]
+        mu0 = M.spectra(g)[0]
+        X += torch.as_tensor(hold, dtype=torch.float32, device=device)[:, None] * float(HOLDER['atten'] * mu0.mean())
+        n_t = M.apply_band(torch.exp(-X), M.sparse(M.band(g)))
+        f = torch.zeros(2, M.K, device=device)
+        if contamination:
+            k_spike = int(np.abs(lam - 2.638).argmin()); f[0, k_spike] = 0.04
+            bump = (lam > 2.655) & (lam < 2.77); f[1, torch.as_tensor(bump, device=device)] = torch.as_tensor(
+                0.16 * np.exp(-0.5 * ((lam[bump] - 2.70) / 0.03) ** 2), dtype=torch.float32, device=device)
+        m = (1 - f.sum(0)) * n_t + torch.ones(P, 2, device=device) @ f
+        gen = torch.Generator(device=device).manual_seed(seed)
+        dd = torch.as_tensor(d, dtype=torch.float32, device=device)
+        T = torch.poisson(dd * m / inflation, generator=gen) * inflation / dd
+    return dict(T=T, lam=lam, dose_per_bin=d, angles=angles, mounts=mounts, offsets=offsets, V_true=V_true,
+                E_true=E_true, mu_true=mu0.cpu().numpy(), lamf=M.lamf.cpu().numpy(), g_true=g.cpu().numpy(),
+                holder_rows=holder_rows, n=n, inflation=inflation)
