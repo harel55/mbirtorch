@@ -34,6 +34,7 @@ import torch
 from scipy.stats import norm
 
 from .bragg import emg_median, reflections
+from ._dist import all_sum, all_sum_float
 
 
 def multiplicities(lattice, ns):
@@ -480,12 +481,12 @@ class FitB:
         regions the model does not describe, such as a sample holder); None uses every ray."""
         self.M = model; self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
         self.ray_weight = None if ray_mask is None else ray_mask.to(T.device, T.dtype)
-        self.n_points = (T.shape[0] if ray_mask is None else int(ray_mask.sum())) * T.shape[1]
+        self.n_points = int(all_sum_float((T.shape[0] if ray_mask is None else int(ray_mask.sum())) * T.shape[1], T.device))
         # variance inflation of pixel sums from spatially correlated counts (noise.py); scales score variances
         self.inflation = float(inflation)
         self.eps = None if eps is None else eps.clone()
         self.chunk = chunk
-        self.ridge = (1e-3 * T.shape[0] * float(model.d.mean())) if ridge is None else ridge
+        self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
         self.z = norm.isf(alpha / (2 * model.K)) if z is None else z
         self.lam1 = torch.zeros_like(self.f); self.dispersion = 1.0
         self.history = []
@@ -548,6 +549,7 @@ class FitB:
                 Ws = None if W is None else W[sl]; es = None if eps is None else eps[sl]
                 m = self.mean(sl, g, Ws, f, es, cache)[0]
                 tot += float(deviance_terms(m, self.T[sl], self.dose(sl)).sum(dtype=torch.float64))
+        tot = all_sum_float(tot, self.T.device)
         pen_c = float((self.lam_c * self.c).sum()) if hasattr(self, "lam_c") else float((self.lam1 * f).sum())
         return tot + float(self.spline_penalty(g)) + pen_c
 
@@ -652,6 +654,7 @@ class FitB:
             gg += torch.einsum('pk,npk->n', r_, Jg).double()
             Fg += torch.einsum('pk,apk,bpk->ab', w_, Jg, Jg).double()
             del Jw, Jg
+        all_sum(gg); all_sum(Fg)
         gp, Hp = self.penalty_system(idx)
         return G, Fw, C, gg + gp, Fg + Hp
 
@@ -724,6 +727,7 @@ class FitB:
                 # (beta near n, a vanishing score variance) is not free
                 Fi0 += (self.dose(sl) / n.clamp_min(1e-12) * (1 - n) ** 2).sum(0).double()[:, None].expand(-1, J)
                 pear += float((self.dose(sl) * (T - m) ** 2 / mm).sum(dtype=torch.float64))
+        all_sum(grad); all_sum(Fd); all_sum(Fi0); pear = all_sum_float(pear, M.dev)
         self.dispersion = pear / self.n_points
         A = self.A.double()
         if not (self.freeze_threshold and hasattr(self, "lam_c")):
@@ -748,6 +752,7 @@ class FitB:
         with torch.no_grad():
             for sl in self.chunks():
                 dv += float(deviance_terms(self.mean(sl, f=f, cache=cache)[0], self.T[sl], self.dose(sl)).sum(dtype=torch.float64))
+        dv = all_sum_float(dv, self.T.device)
         return dv + float((self.lam_c * c).sum())
 
     # -- contamination: per bin, projected Newton with the L1 threshold
@@ -770,6 +775,7 @@ class FitB:
                 F += torch.einsum('pk,pka,pkb->kab', self.dose(sl) / mm, Dm, Dm).double()
                 Fi0 += torch.einsum('pk,pkj->kj', self.dose(sl) / n.clamp_min(1e-12), Dm * Dm).double()
                 pear += float((self.dose(sl) * (T - m) ** 2 / mm).sum(dtype=torch.float64))
+        all_sum(grad); all_sum(F); all_sum(Fi0); pear = all_sum_float(pear, M.dev)
         self.dispersion = pear / self.n_points
         self.lam1 = _l1_threshold(Fi0, self.dispersion * self.inflation, self.z).T.to(M.dt)
         grad += self.lam1.T.double()
@@ -778,6 +784,7 @@ class FitB:
             tot = torch.zeros(M.K, device=M.dev, dtype=torch.float64)
             for sl in self.chunks():
                 tot += deviance_terms(self.mean(sl, f=fT.T, cache=cache)[0], self.T[sl], self.dose(sl)).sum(0, dtype=torch.float64)
+            all_sum(tot)
             return tot + (self.lam1 * fT.T).sum(0).double()
         self.f = _projected_newton_rows(self.f.T.contiguous(), grad, F, per_bin_loss, cap=(0, 0.99)).T.contiguous()
 
@@ -878,6 +885,7 @@ class FitB:
             grad += torch.einsum('pk,npk->n', self.dose(sl) * (1 - T / mm), Jg).double()
             F += torch.einsum('pk,apk,bpk->ab', self.dose(sl) / mm, Jg, Jg).double()
             del Jg
+        all_sum(grad); all_sum(F)
         gp = g0.clone().requires_grad_(True)
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):

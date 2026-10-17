@@ -27,6 +27,7 @@ import torch
 
 from .model import Hybrid2, FitB, ls_init_material
 from .bragg import warm_start, BraggSpectrum
+from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
 STRAIN_PRIOR_SD = 1e-2          # standard deviation of the weak strain prior
 STRAIN_SMOOTH_SD = 3e-4         # standard deviation of the strain difference between neighbouring voxels
@@ -44,35 +45,107 @@ MOUNT_MAX_STEP = (0.5, 0.5, 0.5) # largest change per mount step: degrees, voxel
 ANCHOR_STIFFNESS = 1e3          # the spectrum scale pin's weight, relative to the largest global Fisher diagonal entry
 
 
+STACK_GAP = 2                    # empty slices between stacked volumes, so a fractional row offset cannot mix them
+
+
+def detector_directions(angles, n=16):
+    """Per view, the detector channel displacement of a unit shift of the volume along its rows and along its columns:
+    (d_rows, d_cols), each (views,). Measured from the package projector with probe voxels, as beam_directions."""
+    from .geometry import beam_directions
+    nd = beam_directions(np.asarray(angles), n)                 # (views, 2): n = (-t_y, t_x), t the detector direction
+    return -nd[:, 0], nd[:, 1]
+
+
 class Projector:
     """Parallel-beam projection of Q stacked volumes (n, n, n, Q) to rays (P, Q), P = views * n * n ordered (view,
-    detector row, channel), and its adjoint. One package model projects all Q volumes at once (stacked slices)."""
+    detector row, channel), and its adjoint. One package model projects all Q volumes at once (stacked slices).
+    view_offsets (views,) adds a channel offset per view and row_offset a detector row offset: together they shift the
+    object by a fraction of a voxel without resampling it (MultiAxisParallelModel at zero elevation, one model per view
+    when the view offsets differ)."""
 
-    def __init__(self, n, angles, Q, channel_offset=0.0, ror_mask=True):
+    def __init__(self, n, angles, Q, channel_offset=0.0, ror_mask=True, view_offsets=None, row_offset=0.0):
         """channel_offset: the projector's det_channel_offset (the rotation axis's offset from the detector centre);
         ror_mask=False lets the volume fill its square, for objects that reach past the inscribed circle."""
         import mbirtorch
         self.n, self.V, self.Q = n, len(angles), Q
-        self.model = mbirtorch.ParallelBeamModel((len(angles), Q * n, n), angles)
-        if channel_offset or not ror_mask:
-            self.model.set_params(det_channel_offset=float(channel_offset), use_ror_mask=bool(ror_mask))
-        self.angles, self.channel_offset, self.ror_mask = np.asarray(angles), channel_offset, ror_mask
+        self.angles, self.channel_offset, self.ror_mask = np.asarray(angles), float(channel_offset), ror_mask
+        self.view_offsets = None if view_offsets is None or not np.any(view_offsets) else np.asarray(view_offsets, float)
+        self.row_offset = float(row_offset)
+        self.kind = self._kind(self.view_offsets, self.row_offset)
+        self.gap = 0 if self.kind == 'plain' else STACK_GAP
+        h = n + self.gap
+        if self.kind == 'plain':
+            self.models = [mbirtorch.ParallelBeamModel((self.V, Q * n, n), angles)]
+        elif self.kind == 'rows':
+            self.models = [mbirtorch.MultiAxisParallelModel((self.V, Q * h, n), np.stack([angles, np.zeros(self.V)], 1))]
+        else:
+            self.models = [mbirtorch.MultiAxisParallelModel((1, Q * h, n), np.array([[a, 0.0]])) for a in angles]
+        self._set_offsets()
+
+    @staticmethod
+    def _kind(view_offsets, row_offset):
+        """'plain' (one parallel-beam model), 'rows' (one multi-axis model: a row offset) or 'views' (a model per view)."""
+        return 'views' if view_offsets is not None else ('rows' if row_offset else 'plain')
+
+    def _set_offsets(self):
+        if self.kind == 'plain':
+            self.models[0].set_params(det_channel_offset=self.channel_offset, use_ror_mask=bool(self.ror_mask))
+            return
+        offs = self.channel_offset + (self.view_offsets if self.view_offsets is not None else np.zeros(self.V))
+        if self.kind == 'rows':
+            self.models[0].set_params(det_channel_offset=self.channel_offset, det_row_offset=self.row_offset,
+                                      use_ror_mask=bool(self.ror_mask))
+        else:
+            for m, o in zip(self.models, offs):
+                m.set_params(det_channel_offset=float(o), det_row_offset=self.row_offset, use_ror_mask=bool(self.ror_mask))
 
     def with_q(self, Q):
         """The same geometry for Q stacked volumes."""
-        return self if Q == self.Q else Projector(self.n, self.angles, Q, self.channel_offset, self.ror_mask)
+        return self if Q == self.Q else Projector(self.n, self.angles, Q, self.channel_offset, self.ror_mask,
+                                                  self.view_offsets, self.row_offset)
+
+    def set_geometry(self, channel_offset, view_offsets=None, row_offset=0.0):
+        """Change the offsets: in place when the kind of model stays the same, else by rebuilding. Returns self."""
+        vo = None if view_offsets is None or not np.any(view_offsets) else np.asarray(view_offsets, float)
+        if self._kind(vo, row_offset) != self.kind:
+            self.__init__(self.n, self.angles, self.Q, channel_offset, self.ror_mask, vo, row_offset)
+            return self
+        self.channel_offset, self.view_offsets, self.row_offset = float(channel_offset), vo, float(row_offset)
+        self._set_offsets()
+        return self
+
+    def _stack(self, vols):
+        n, Q, g = self.n, self.Q, self.gap
+        parts = []
+        for q in range(Q):
+            parts.append(vols[..., q])
+            if g:
+                parts.append(torch.zeros(n, n, g, device=vols.device, dtype=vols.dtype))
+        return torch.cat(parts, 2).contiguous()
 
     def fwd(self, vols):
-        n, Q = self.n, self.Q
-        stack = torch.cat([vols[..., q] for q in range(Q)], 2).contiguous()
-        s = self.model.forward_project(stack, output_sharded=True)                  # (views, Q n, n)
-        return s.reshape(self.V, Q, n, n).permute(1, 0, 2, 3).reshape(Q, -1).T.contiguous()
+        n, Q, h = self.n, self.Q, self.n + self.gap
+        stack = self._stack(vols)
+        if len(self.models) == 1:
+            s = self.models[0].forward_project(stack, output_sharded=True)          # (views, Q h, n)
+        else:
+            s = torch.cat([m.forward_project(stack, output_sharded=True) for m in self.models], 0)
+        s = s.reshape(self.V, Q, h, n)[:, :, :n]
+        return s.permute(1, 0, 2, 3).reshape(Q, -1).T.contiguous()
 
     def back(self, rays):
-        n, Q = self.n, self.Q
-        s = rays.T.reshape(Q, self.V, n, n).permute(1, 0, 2, 3).reshape(self.V, Q * n, n).contiguous()
-        b = self.model.back_project(s, output_sharded=True)                         # (n, n, Q n)
-        return b.reshape(n, n, Q, n).permute(0, 1, 3, 2).contiguous()
+        n, Q, h = self.n, self.Q, self.n + self.gap
+        s = rays.T.reshape(Q, self.V, n, n).permute(1, 0, 2, 3)
+        if self.gap:
+            s = torch.cat([s, torch.zeros(self.V, Q, self.gap, n, device=s.device, dtype=s.dtype)], 2)
+        s = s.reshape(self.V, Q * h, n).contiguous()
+        if len(self.models) == 1:
+            b = self.models[0].back_project(s, output_sharded=True)                  # (n, n, Q h)
+        else:
+            b = sum(m.back_project(s[v:v + 1].contiguous(), output_sharded=True) for v, m in enumerate(self.models))
+        b = b.reshape(n, n, Q, h)[..., :n]
+        # with the rays split over processes, each holds some views: the back-projection is the sum over processes
+        return all_sum(b.permute(0, 1, 3, 2).contiguous())
 
 
 class MultiProjector:
@@ -82,27 +155,46 @@ class MultiProjector:
 
     def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True):
         """series: a list of (axis, angles), axis a key of beam_geometry.PERMS, or (transform, angles) with transform =
-        (perm, signs, shift): the series' volume is the sample volume permuted (frame axis i = sample axis perm[i]),
-        flipped where signs < 0, then shifted by shift voxels (a measured mount; a fractional shift is applied by linear
-        interpolation along each axis, and the volume wraps around at the grid's edges). An optional fourth entry, rot
-        (degrees about the frame's axes 0, 1, 2, as a rotation vector), adds a small rotation about the grid's centre:
-        the series' volume at voxel p is then the permuted volume at R (p - c) + c - shift, by trilinear interpolation
-        (zero outside the grid). The beam directions (beam_geometry.series_weights) do not include rot."""
+        (perm, signs, shift[, rot]): the series' volume is the sample volume permuted (frame axis i = sample axis
+        perm[i]), flipped where signs < 0, rotated by rot (degrees about the frame's axes 0, 1, 2, as a rotation vector,
+        about the grid's centre, by trilinear interpolation) and shifted by shift voxels (a measured mount). The whole
+        part of the shift rolls the volume (wrapping around); the fractional part moves the detector instead (a
+        channel offset per view and a row offset), so the volume is not resampled. The beam directions
+        (beam_geometry.series_weights) do not include rot."""
         from .geometry import PERMS
         self.n, self.Q, self.series = n, Q, list(series)
         offs = channel_offsets or [0.0] * len(self.series)
-        self.parts = []
-        for (ax, ang), off in zip(self.series, offs):
+        self.offsets, self.ror_mask = [float(o) for o in offs], ror_mask
+        self.parts, self._dirs = [], []
+        for (ax, ang), off in zip(self.series, self.offsets):
             tr = (PERMS[ax], (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)) if isinstance(ax, str) else \
                 (tuple(int(v) for v in ax[0]), tuple(int(v) for v in ax[1]), tuple(float(v) for v in ax[2]),
                  tuple(float(v) for v in ax[3]) if len(ax) > 3 else (0.0, 0.0, 0.0))
-            self.parts.append((tr, Projector(n, ang, Q, off, ror_mask)))
+            self._dirs.append(None)
+            vo, ro = self._detector_shift(len(self.parts), ang, tr[2])
+            self.parts.append((tr, Projector(n, ang, Q, off, ror_mask, vo, ro)))
         self.counts = [p.V * n * n for _, p in self.parts]
         self.V = sum(p.V for _, p in self.parts)
-        self.offsets, self.ror_mask = list(offs), ror_mask
 
     def with_q(self, Q):
         return self if Q == self.Q else MultiProjector(self.n, self.series, Q, self.offsets, self.ror_mask)
+
+    @staticmethod
+    def _split(shift):
+        """The whole part (rolled) and the fractional part (moved to the detector) of a shift."""
+        whole = tuple(int(round(v)) for v in shift)
+        return whole, tuple(v - w for v, w in zip(shift, whole))
+
+    def _detector_shift(self, s, angles, shift):
+        """Per-view channel offsets and the row offset that move series s's projections as a fractional shift of its
+        volume (rows, cols, slices) would."""
+        _, frac = self._split(shift)
+        if not any(frac[:2]) and not frac[2]:
+            return None, 0.0
+        if self._dirs[s] is None:
+            self._dirs[s] = detector_directions(angles)
+        d_rows, d_cols = self._dirs[s]
+        return frac[0] * d_rows + frac[1] * d_cols, frac[2]
 
     @staticmethod
     def _warp(v, shift, rot):
@@ -121,43 +213,30 @@ class MultiProjector:
 
     @staticmethod
     def _to_series(vols, tr):
+        """The series' volume: permuted, flipped, rotated, and rolled by the whole part of the shift (the fractional
+        part is applied by the series' projector)."""
         perm, signs, shift, rot = tr
         v = vols.permute(*perm, 3)
         flips = [i for i, sg in enumerate(signs) if sg < 0]
         if flips:
             v = v.flip(flips)
         if any(rot):
-            return MultiProjector._warp(v.contiguous(), shift, rot).contiguous()
-        for d, sh in enumerate(shift):
-            v = MultiProjector._shift(v, sh, d)
+            v = MultiProjector._warp(v.contiguous(), (0.0, 0.0, 0.0), rot)
+        whole, _ = MultiProjector._split(shift)
+        if any(whole):
+            v = torch.roll(v, whole, (0, 1, 2))
         return v.contiguous()
-
-    @staticmethod
-    def _shift(v, sh, d):
-        """Shift v by sh voxels along dim d (wrapping around); a fractional part interpolates linearly. -sh is not the
-        adjoint of a fractional shift: use _shift_adjoint."""
-        i = math.floor(sh); f = sh - i
-        if f == 0:
-            return torch.roll(v, i, d) if i else v
-        return (1 - f) * torch.roll(v, i, d) + f * torch.roll(v, i + 1, d)
-
-    @staticmethod
-    def _shift_adjoint(b, sh, d):
-        i = math.floor(sh); f = sh - i
-        if f == 0:
-            return torch.roll(b, -i, d) if i else b
-        return (1 - f) * torch.roll(b, -i, d) + f * torch.roll(b, -i - 1, d)
 
     @staticmethod
     def _from_series(b, tr):
         perm, signs, shift, rot = tr
+        whole, _ = MultiProjector._split(shift)
+        if any(whole):
+            b = torch.roll(b, tuple(-w for w in whole), (0, 1, 2))
         if any(rot):                                    # the adjoint of the interpolation, by automatic differentiation
             z = torch.zeros_like(b).requires_grad_(True)
             with torch.enable_grad():
-                b = torch.autograd.grad(MultiProjector._warp(z, shift, rot), z, b)[0]
-        else:
-            for d, sh in enumerate(shift):
-                b = MultiProjector._shift_adjoint(b, sh, d)
+                b = torch.autograd.grad(MultiProjector._warp(z, (0.0, 0.0, 0.0), rot), z, b)[0]
         flips = [i for i, sg in enumerate(signs) if sg < 0]
         if flips:
             b = b.flip(flips)
@@ -170,11 +249,17 @@ class MultiProjector:
         tr = (perm, signs, tuple(float(v) for v in (sh if shift is None else shift)),
               tuple(float(v) for v in (ro if rot is None else rot)))
         if offset is not None:
-            p.channel_offset = float(offset); self.offsets[s] = float(offset)
-            p.model.set_params(det_channel_offset=float(offset), use_ror_mask=bool(p.ror_mask))
+            self.offsets[s] = float(offset)
+        vo, row = self._detector_shift(s, p.angles, tr[2])
+        p.set_geometry(self.offsets[s], vo, row)
         self.parts[s] = (tr, p)
         ax, ang = self.series[s]
         self.series[s] = ((perm, signs, tr[2], tr[3]), ang)
+
+    def project_series(self, s, vols):
+        """Series s's rays for the sample volumes."""
+        tr, p = self.parts[s]
+        return p.fwd(self._to_series(vols, tr))
 
     def fwd(self, vols):
         return torch.cat([p.fwd(self._to_series(vols, tr)) for tr, p in self.parts], 0)
@@ -302,6 +387,7 @@ class TomoFit:
         with torch.no_grad():
             for sl in self.fit.chunks():
                 tot += float(self.fit.ray_loss(sl, W[sl], eps[sl], cache).sum())
+        tot = all_sum_float(tot, V.device)
         return tot + self.prior(V, E, mask)
 
     # ---- the Gauss-Newton step
@@ -424,7 +510,7 @@ class TomoFit:
         """One Gauss-Newton step on the mounts of a MultiProjector, for robustness to poorly calibrated view metadata:
         per series its three rotations (degrees), three shifts (voxels) and its centre-of-rotation offset (detector
         channels). refine_rigid lists the series whose rotations and shifts move (default: all but the first, which fixes
-        the sample frame); every series' offset moves. Derivatives by central differences of the transformed volume
+        the sample frame); every series' offset moves. Derivatives by central differences of the series' projections
         (MOUNT_FD), steps capped at MOUNT_MAX_STEP, then a backtracking line search on the loss. Returns the accepted
         changes per series."""
         proj, fit, R, C = self.proj, self.fit, self.R, self.C
@@ -441,54 +527,52 @@ class TomoFit:
         vols = torch.cat([self.V, (self.V[..., None] * self.E).reshape(n, n, n, R * C)], -1)
         bounds = np.cumsum([0] + proj.counts)
         to_wu = lambda d, w: torch.cat([d[:, :R], (d[:, R:].reshape(-1, R, C) * w[:, None, :]).sum(-1)], 1)
+
+        def state(s_):
+            (perm, signs, sh, ro), p = proj.parts[s_]
+            return list(ro) + list(sh) + [proj.offsets[s_]]
+
+        def put(s_, th):
+            proj.set_mount(s_, rot=th[:3], shift=th[3:6], offset=th[6])
+
         steps = []
-        for s_, ((perm, signs, sh, ro), p) in enumerate(proj.parts):
+        for s_ in range(len(proj.parts)):
             sl = slice(int(bounds[s_]), int(bounds[s_ + 1])); w = self.w_ray[sl]
-            base = vols.permute(*perm, 3)
-            flips = [i for i, sg in enumerate(signs) if sg < 0]
-            base = (base.flip(flips) if flips else base).contiguous()
-            names, cols = [], []
-            if s_ in refine_rigid:
-                for k in range(6):
-                    h = MOUNT_FD[0] if k < 3 else MOUNT_FD[1]
-                    th = list(ro) + list(sh)
-                    tp, tm = list(th), list(th); tp[k] += h; tm[k] -= h
-                    dv = (MultiProjector._warp(base, tp[3:], tp[:3]) - MultiProjector._warp(base, tm[3:], tm[:3])) / (2 * h)
-                    cols.append(to_wu(p.fwd(dv.contiguous()), w)); names.append(k)
-            off0 = p.channel_offset; h = MOUNT_FD[2]; vs = MultiProjector._to_series(vols, (perm, signs, sh, ro))
-            p.model.set_params(det_channel_offset=float(off0 + h), use_ror_mask=bool(p.ror_mask)); a_ = p.fwd(vs)
-            p.model.set_params(det_channel_offset=float(off0 - h), use_ror_mask=bool(p.ror_mask)); b_ = p.fwd(vs)
-            p.model.set_params(det_channel_offset=float(off0), use_ror_mask=bool(p.ror_mask))
-            cols.append(to_wu((a_ - b_) / (2 * h), w)); names.append(6)
+            th0 = state(s_)
+            names = (list(range(6)) if s_ in refine_rigid else []) + [6]
+            cols = []
+            for k in names:
+                h = MOUNT_FD[0] if k < 3 else MOUNT_FD[1] if k < 6 else MOUNT_FD[2]
+                tp, tm = list(th0), list(th0); tp[k] += h; tm[k] -= h
+                put(s_, tp); a_ = proj.project_series(s_, vols)
+                put(s_, tm); b_ = proj.project_series(s_, vols)
+                cols.append(to_wu((a_ - b_) / (2 * h), w))
+            put(s_, th0)
             J = torch.stack(cols, 2).double()                                         # (Ps, 2R, k)
-            g = torch.einsum('pa,pak->k', G[sl], J)
-            Fm = torch.einsum('pak,pab,pbl->kl', J, F[sl], J)
+            g = all_sum(torch.einsum('pa,pak->k', G[sl], J))
+            Fm = all_sum(torch.einsum('pak,pab,pbl->kl', J, F[sl], J))
             A = Fm + damp * torch.diag(torch.diagonal(Fm)) + 1e-12 * torch.eye(len(names), device=Fm.device, dtype=Fm.dtype)
             d = -torch.linalg.solve(A, g)
             cap = torch.tensor([MOUNT_MAX_STEP[0] if k < 3 else MOUNT_MAX_STEP[1] if k < 6 else MOUNT_MAX_STEP[2] for k in names],
                                device=d.device, dtype=d.dtype)
             d = d * min(1.0, float((cap / d.abs().clamp_min(1e-30)).min()))
-            steps.append((s_, names, d.cpu().numpy()))
-        old_state = [(tr, p.channel_offset) for tr, p in proj.parts]
+            steps.append((s_, names, th0, d.cpu().numpy()))
         l0 = self.loss()
 
         def apply(alpha):
-            for (s_, names, d), (tr, off) in zip(steps, old_state):
-                rot, shift = list(tr[3]), list(tr[2]); off = float(off)
+            for s_, names, th0, d in steps:
+                th = list(th0)
                 for k, dk in zip(names, alpha * d):
-                    if k < 3: rot[k] += float(dk)
-                    elif k < 6: shift[k - 3] += float(dk)
-                    else: off += float(dk)
-                proj.set_mount(s_, shift=shift, rot=rot, offset=off)
+                    th[k] += float(dk)
+                put(s_, th)
+        mounts = lambda: [dict(shift=list(tr[2]), rot=list(tr[3]), offset=proj.offsets[k]) for k, (tr, _) in enumerate(proj.parts)]
         for alpha in (1.0, 0.5, 0.25):
             apply(alpha); self.sync()
             l1 = self.loss()
             if l1 < l0:
-                return dict(alpha=alpha, loss_decrease=l0 - l1,
-                            mounts=[dict(shift=list(tr[2]), rot=list(tr[3]), offset=p.channel_offset) for tr, p in proj.parts])
+                return dict(alpha=alpha, loss_decrease=l0 - l1, mounts=mounts())
         apply(0.0); self.sync()
-        return dict(alpha=0.0, loss_decrease=0.0,
-                    mounts=[dict(shift=list(tr[2]), rot=list(tr[3]), offset=p.channel_offset) for tr, p in proj.parts])
+        return dict(alpha=0.0, loss_decrease=0.0, mounts=mounts())
 
     def support_mask(self):
         """(n, n, n, R, 1): where each material's strain is free (its 3 x 3 x 3 mean density above SUPPORT_REL of the
@@ -555,7 +639,7 @@ class TomoFit:
             hV = (bW + (E * bU).sum(-1) + self.smooth_V * self.laplacian(xV)) * fV
             hE = (V[..., None] * bU + 2 * self.lam_E * xE + self.smooth_E * self.laplacian(xE) + eq(xE)) * fE
             if cross == 'ray':
-                hg = (Fg @ xg) + (torch.einsum('pan,pa->n', Cx, z) * fgf).double()
+                hg = (Fg @ xg) + (all_sum(torch.einsum('pan,pa->n', Cx, z)) * fgf).double()
             else:
                 hV = hV + torch.einsum('j,j...->...', xgf, cV)
                 hE = hE + torch.einsum('j,j...->...', xgf, cE)
@@ -634,7 +718,15 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
         Wk, H0, _ = hsnt.dehydrate(T[ray_mask.to(T.device)].cpu().numpy(), 'transmission', num_materials=R, verbose=0)
         W0 = np.zeros((T.shape[0], R), dtype=Wk.dtype); W0[keep] = Wk.reshape(-1, R)
     lats = [(lt, (a * (1 - a_range), a * (1 + a_range))) for lt, a in zip(lattices, a0)]
-    thetas, found, _, _, resolution = warm_start(H0.astype(np.float64), lam, n_bragg=R, lattices=lats, device=device)
+    # with the rays split over processes, the first process's spectra start every process (the same model everywhere);
+    # each process keeps its own H0 to express its maps in that model's spectra
+    H0_local = H0
+    H0, = broadcast_objects([H0])
+    out = [None]
+    if rank() == 0:
+        th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=R, lattices=lats, device=device)
+        out = [([t.cpu() for t in th_], fd_, res_)]
+    thetas, found, resolution = broadcast_objects(out)[0]
     # warm_start orders its components by its own criterion: pair each given lattice with the found component of the
     # same type and the nearest lattice parameter
     from scipy.optimize import linear_sum_assignment
@@ -661,7 +753,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     for r in range(R):
         ls_init_material(M, g, r, targets[r], a0[r])
         M.lb[M.slices[r]['a']] = M.ub[M.slices[r]['a']] = a0[r]                    # d0 reference
-    Mx = np.linalg.lstsq(targets.T, H0.T.astype(np.float64), rcond=None)[0].T
+    Mx = np.linalg.lstsq(targets.T, H0_local.T.astype(np.float64), rcond=None)[0].T
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
     # the pipeline's per-ray fits of the maps to the initial spectra (no strain yet)
     fit0 = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), chunk=chunk)
@@ -674,7 +766,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     rm = torch.ones(Wr.shape[0], 1, device=device) if ray_mask is None else ray_mask.to(device, Wr.dtype)[:, None]
     r_ = (Wr - pr.fwd(x)) * rm; s = pr.back(r_); p = s.clone(); gam = float((s * s).sum())
     for _ in range(INIT_CG_ITERS):
-        q = pr.fwd(p) * rm; al = gam / max(float((q * q).sum()), 1e-30)
+        q = pr.fwd(p) * rm; al = gam / max(all_sum_float(float((q * q).sum()), q.device), 1e-30)
         x += al * p; r_ -= al * q; s = pr.back(r_); gnew = float((s * s).sum())
         p = s + (gnew / gam) * p; gam = gnew
     V = x.clamp_min(0)

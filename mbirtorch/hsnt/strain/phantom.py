@@ -412,7 +412,7 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     the true spectrum, and holder_rows (the first detector row of the holder in each series)."""
     import mbirtorch
     from .geometry import series_weights
-    from .tomo import MultiProjector
+    from .tomo import MultiProjector, Projector, detector_directions
     angles = np.linspace(0, np.pi, 51) if angles is None else np.asarray(angles)
     mounts = [((0, 1, 2), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ((1, 2, 0), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
               ((2, 0, 1), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))] if mounts is None else \
@@ -444,15 +444,20 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
         if holder and z0 < N:
             rod[(yy ** 2 + xx ** 2 < (HOLDER['radius'] * N) ** 2), z0:] = 1.0
         holder_rows.append(z0 // fine)
+        # the sample moves with the mount (the fractional part of the shift on the detector, as MultiProjector does);
+        # the holder rod stays on the rotation axis
+        whole, frac = MultiProjector._split(tr[2])
+        d_rows, d_cols = detector_directions(angles)
+        rod_t = torch.as_tensor(rod, device=device)[..., None]
         for v in range(V_):
             idx = np.abs(seen_all[k * V_ + v][..., None] - lv).argmin(-1)
             inds = torch.as_tensor(np.stack([(cube & (idx == l)) for l in range(levels)], -1), dtype=torch.float32, device=device)
-            vol = torch.cat([MultiProjector._to_series(inds, tr), torch.as_tensor(rod, device=device)[..., None]], -1)
-            stack = torch.cat([vol[..., q] for q in range(levels + 1)], 2).contiguous()
-            mv = mbirtorch.ParallelBeamModel((1, N * (levels + 1), N), angles[v:v + 1])
-            mv.set_params(use_ror_mask=False, det_channel_offset=float(offsets[k]) * fine)
-            sino = mv.forward_project(stack, output_sharded=True)                      # (1, (levels + 1) N, N)
-            b = (sino.reshape(levels + 1, n, fine, n, fine).mean((2, 4)) / fine).cpu().numpy()
+            vol = MultiProjector._to_series(inds, tr)
+            pv = Projector(N, angles[v:v + 1], levels, float(offsets[k]) * fine, False,
+                           np.array([frac[0] * d_rows[v] + frac[1] * d_cols[v]]), frac[2])
+            ph_ = Projector(N, angles[v:v + 1], 1, float(offsets[k]) * fine, False)
+            rays = torch.cat([pv.fwd(vol), ph_.fwd(rod_t)], 1)                         # (N N, levels + 1)
+            b = (rays.T.reshape(levels + 1, n, fine, n, fine).mean((2, 4)) / fine).cpu().numpy()
             proj[:, k * V_ + v] = b[:levels]; hold[k * V_ + v] = b[levels]
     P = S * V_ * n * n
     proj = proj.reshape(levels, P); hold = hold.reshape(P)
