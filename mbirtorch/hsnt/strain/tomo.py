@@ -1,0 +1,711 @@
+"""Tomographic hybrid fit: the hybrid model (model.py) with the per-ray maps replaced by
+projections of voxel volumes, so the views are coupled.
+
+Unknowns: per material r, a density volume V_r >= 0 and a strain volume E_r; the global spectra, kernel and
+contamination parameters of hybrid2. A ray's projected density is W = A V and its projected strain U = A (V E), with
+A the package's parallel-beam projector; the ray's attenuation is sum_r W_r mu_r(lam; U_r / W_r), the spectrum dilated
+by the density-weighted mean strain along the ray (exact to first order in the strain spread along the ray).
+
+Steps: the volume step is a Gauss-Newton step on (V, E) through the projector, solved by preconditioned conjugate
+gradients with V's active bound held, then a projected backtracking line search on the deviance. The global and
+contamination steps are those of hybrid2.FitB on the rays. A weak Gaussian prior on the strain (standard deviation
+STRAIN_PRIOR_SD) fixes E in voxels without material, and a quadratic smoothness prior on the strain differences between
+the six neighbours of each voxel (standard deviation STRAIN_SMOOTH_SD) pools the strain over nearby voxels, as MBIR
+does for densities.
+
+Warm-up (the pipeline's, with the lattice types given): the package's bilinear factorization of the transmission
+(hsnt.dehydrate), warm_start on its spectra for the given lattice types, least-squares initial spectra per material,
+the dehydrated maps mapped onto them and refitted per ray to those spectra, and a least-squares tomographic reconstruction of those maps (conjugate gradients,
+clipped to >= 0). Lattice parameters are fixed at their stress-free values (the d0 reference of strain imaging)."""
+import math
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+
+from .model import Hybrid2, FitB, ls_init_material
+from .bragg import warm_start, BraggSpectrum
+
+STRAIN_PRIOR_SD = 1e-2          # standard deviation of the weak strain prior
+STRAIN_SMOOTH_SD = 3e-4         # standard deviation of the strain difference between neighbouring voxels
+JOINT_CG_ITERS = 60             # conjugate-gradient iterations of the joint (volumes + global) step
+SUPPORT_REL = 0.1               # the support: voxels whose 3 x 3 x 3 mean density exceeds this fraction of the maximum
+EQUILIBRIUM_SD = 1e-5           # the equilibrium prior's standard deviation of div(stress) / Young's modulus per voxel
+DENSITY_SMOOTH_REL = 0.2        # the density smoothness prior's standard deviation per neighbour difference, as a
+                                # fraction of the material's typical density inside the sample (warm-up volume)
+CG_ITERS = 30                   # conjugate-gradient iterations per volume step
+INIT_CG_ITERS = 40              # conjugate-gradient iterations of the warm-up reconstruction
+EPS_W_MIN = 1e-8                # rays with less projected density carry no strain
+INIT_PIXEL_STEPS = 3            # per-ray map fits in the warm-up
+MOUNT_FD = (0.05, 0.05, 0.1)    # finite-difference steps for the mount derivatives: degrees, voxels, detector channels
+MOUNT_MAX_STEP = (0.5, 0.5, 0.5) # largest change per mount step: degrees, voxels, detector channels
+ANCHOR_STIFFNESS = 1e3          # the spectrum scale pin's weight, relative to the largest global Fisher diagonal entry
+
+
+class Projector:
+    """Parallel-beam projection of Q stacked volumes (n, n, n, Q) to rays (P, Q), P = views * n * n ordered (view,
+    detector row, channel), and its adjoint. One package model projects all Q volumes at once (stacked slices)."""
+
+    def __init__(self, n, angles, Q, channel_offset=0.0, ror_mask=True):
+        """channel_offset: the projector's det_channel_offset (the rotation axis's offset from the detector centre);
+        ror_mask=False lets the volume fill its square, for objects that reach past the inscribed circle."""
+        import mbirtorch
+        self.n, self.V, self.Q = n, len(angles), Q
+        self.model = mbirtorch.ParallelBeamModel((len(angles), Q * n, n), angles)
+        if channel_offset or not ror_mask:
+            self.model.set_params(det_channel_offset=float(channel_offset), use_ror_mask=bool(ror_mask))
+        self.angles, self.channel_offset, self.ror_mask = np.asarray(angles), channel_offset, ror_mask
+
+    def with_q(self, Q):
+        """The same geometry for Q stacked volumes."""
+        return self if Q == self.Q else Projector(self.n, self.angles, Q, self.channel_offset, self.ror_mask)
+
+    def fwd(self, vols):
+        n, Q = self.n, self.Q
+        stack = torch.cat([vols[..., q] for q in range(Q)], 2).contiguous()
+        s = self.model.forward_project(stack, output_sharded=True)                  # (views, Q n, n)
+        return s.reshape(self.V, Q, n, n).permute(1, 0, 2, 3).reshape(Q, -1).T.contiguous()
+
+    def back(self, rays):
+        n, Q = self.n, self.Q
+        s = rays.T.reshape(Q, self.V, n, n).permute(1, 0, 2, 3).reshape(self.V, Q * n, n).contiguous()
+        b = self.model.back_project(s, output_sharded=True)                         # (n, n, Q n)
+        return b.reshape(n, n, Q, n).permute(0, 1, 3, 2).contiguous()
+
+
+class MultiProjector:
+    """Several rotation series of one sample: each series projects the sample volume permuted by its axis permutation
+    (beam_geometry.PERMS) with its own angles. fwd stacks the series' rays (series-major); back sums the series'
+    back-projections, permuted back to the sample frame. One series with the identity permutation is a Projector."""
+
+    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True):
+        """series: a list of (axis, angles), axis a key of beam_geometry.PERMS, or (transform, angles) with transform =
+        (perm, signs, shift): the series' volume is the sample volume permuted (frame axis i = sample axis perm[i]),
+        flipped where signs < 0, then shifted by shift voxels (a measured mount; a fractional shift is applied by linear
+        interpolation along each axis, and the volume wraps around at the grid's edges). An optional fourth entry, rot
+        (degrees about the frame's axes 0, 1, 2, as a rotation vector), adds a small rotation about the grid's centre:
+        the series' volume at voxel p is then the permuted volume at R (p - c) + c - shift, by trilinear interpolation
+        (zero outside the grid). The beam directions (beam_geometry.series_weights) do not include rot."""
+        from .geometry import PERMS
+        self.n, self.Q, self.series = n, Q, list(series)
+        offs = channel_offsets or [0.0] * len(self.series)
+        self.parts = []
+        for (ax, ang), off in zip(self.series, offs):
+            tr = (PERMS[ax], (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)) if isinstance(ax, str) else \
+                (tuple(int(v) for v in ax[0]), tuple(int(v) for v in ax[1]), tuple(float(v) for v in ax[2]),
+                 tuple(float(v) for v in ax[3]) if len(ax) > 3 else (0.0, 0.0, 0.0))
+            self.parts.append((tr, Projector(n, ang, Q, off, ror_mask)))
+        self.counts = [p.V * n * n for _, p in self.parts]
+        self.V = sum(p.V for _, p in self.parts)
+        self.offsets, self.ror_mask = list(offs), ror_mask
+
+    def with_q(self, Q):
+        return self if Q == self.Q else MultiProjector(self.n, self.series, Q, self.offsets, self.ror_mask)
+
+    @staticmethod
+    def _warp(v, shift, rot):
+        """v (n, n, n, Q) -> its rotation by rot (degrees) about the grid's centre, then shift, by trilinear interpolation."""
+        n = v.shape[0]; c = (n - 1) / 2
+        w = torch.tensor(np.radians(rot), dtype=torch.float64)
+        th = float(w.norm()); k = w / max(th, 1e-30)
+        K = torch.tensor([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]], dtype=torch.float64)
+        R = (torch.eye(3, dtype=torch.float64) + math.sin(th) * K + (1 - math.cos(th)) * K @ K).to(v.device, torch.float32)
+        ax = torch.arange(n, device=v.device, dtype=torch.float32) - c
+        P = torch.stack(torch.meshgrid(ax, ax, ax, indexing='ij'), -1)
+        q = P @ R.T + c - torch.tensor(shift, device=v.device, dtype=torch.float32)
+        g = (2 * q / (n - 1) - 1).flip(-1)
+        return torch.nn.functional.grid_sample(v.permute(3, 0, 1, 2)[None], g[None], mode='bilinear', padding_mode='zeros',
+                                               align_corners=True)[0].permute(1, 2, 3, 0)
+
+    @staticmethod
+    def _to_series(vols, tr):
+        perm, signs, shift, rot = tr
+        v = vols.permute(*perm, 3)
+        flips = [i for i, sg in enumerate(signs) if sg < 0]
+        if flips:
+            v = v.flip(flips)
+        if any(rot):
+            return MultiProjector._warp(v.contiguous(), shift, rot).contiguous()
+        for d, sh in enumerate(shift):
+            v = MultiProjector._shift(v, sh, d)
+        return v.contiguous()
+
+    @staticmethod
+    def _shift(v, sh, d):
+        """Shift v by sh voxels along dim d (wrapping around); a fractional part interpolates linearly. -sh is not the
+        adjoint of a fractional shift: use _shift_adjoint."""
+        i = math.floor(sh); f = sh - i
+        if f == 0:
+            return torch.roll(v, i, d) if i else v
+        return (1 - f) * torch.roll(v, i, d) + f * torch.roll(v, i + 1, d)
+
+    @staticmethod
+    def _shift_adjoint(b, sh, d):
+        i = math.floor(sh); f = sh - i
+        if f == 0:
+            return torch.roll(b, -i, d) if i else b
+        return (1 - f) * torch.roll(b, -i, d) + f * torch.roll(b, -i - 1, d)
+
+    @staticmethod
+    def _from_series(b, tr):
+        perm, signs, shift, rot = tr
+        if any(rot):                                    # the adjoint of the interpolation, by automatic differentiation
+            z = torch.zeros_like(b).requires_grad_(True)
+            with torch.enable_grad():
+                b = torch.autograd.grad(MultiProjector._warp(z, shift, rot), z, b)[0]
+        else:
+            for d, sh in enumerate(shift):
+                b = MultiProjector._shift_adjoint(b, sh, d)
+        flips = [i for i, sg in enumerate(signs) if sg < 0]
+        if flips:
+            b = b.flip(flips)
+        inv = tuple(int(i) for i in np.argsort(perm))
+        return b.permute(*inv, 3)
+
+    def set_mount(self, s, shift=None, rot=None, offset=None):
+        """Change series s's mount (shift in voxels, rot in degrees, as in __init__) and its centre-of-rotation offset."""
+        (perm, signs, sh, ro), p = self.parts[s]
+        tr = (perm, signs, tuple(float(v) for v in (sh if shift is None else shift)),
+              tuple(float(v) for v in (ro if rot is None else rot)))
+        if offset is not None:
+            p.channel_offset = float(offset); self.offsets[s] = float(offset)
+            p.model.set_params(det_channel_offset=float(offset), use_ror_mask=bool(p.ror_mask))
+        self.parts[s] = (tr, p)
+        ax, ang = self.series[s]
+        self.series[s] = ((perm, signs, tr[2], tr[3]), ang)
+
+    def fwd(self, vols):
+        return torch.cat([p.fwd(self._to_series(vols, tr)) for tr, p in self.parts], 0)
+
+    def back(self, rays):
+        out = None
+        for (tr, p), r in zip(self.parts, torch.split(rays, self.counts, 0)):
+            b = self._from_series(p.back(r.contiguous()), tr)                # in the sample frame
+            out = b if out is None else out + b
+        return out.contiguous()
+
+
+class TomoFit:
+    """The volume part of the tomographic fit. Per material r: a density volume V (n, n, n, R) and strain volumes E
+    (n, n, n, R, C), C = 1 (a scalar dilation, the same in every view) or 6 (the strain tensor, COMPONENTS order xx,
+    yy, zz, xy, yz, xz with tensor shears). A view sees the weighted sum w_v . E: weights 1 for C = 1; for C = 6 the
+    longitudinal ray transform n . eps . n of its beam direction n (beam_geometry.view_weights). A ray's strain is
+    U / W with W = A V and U = sum_k w_k A(V E_k). Priors: a weak Gaussian on E (STRAIN_PRIOR_SD), a smoothness prior
+    on E (smooth_sd per neighbour difference), optionally on V (density_smooth), and for C = 6 optionally 3D stress
+    equilibrium (elastic: (Young's modulus, Poisson ratio) per material) on the voxels whose six neighbours hold the
+    material, with standard deviation EQUILIBRIUM_SD of the divergence of stress / Young's modulus per voxel."""
+
+    def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
+                 eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi'):
+        self.fit = fit
+        # the volume solves' preconditioner: 'jacobi' (each unknown's diagonal) or 'block' (per voxel and material, the
+        # inverse of the (1 + C) x (1 + C) block coupling its density and strain components)
+        assert precond in ('jacobi', 'block'), precond
+        self.precond = precond
+        # support=True: MONSTR's support prior in place of the weak strain ridge (strain held at 0 outside the sample)
+        self.support = support
+        self.R = fit.M.R
+        self.V = V.clone()
+        self.E = (E[..., None] if E.dim() == 4 else E).clone()
+        self.C = self.E.shape[-1]
+        n = V.shape[0]
+        w = torch.ones(proj.V, 1, device=V.device) if weights is None else torch.as_tensor(weights, device=V.device, dtype=V.dtype)
+        assert w.shape == (proj.V, self.C), (w.shape, proj.V, self.C)
+        self.w_ray = w.repeat_interleave(n * n, 0)                                   # (P, C): rays are view-major
+        self.proj = proj.with_q(self.R * (1 + self.C))
+        self.lam_E = 0.0 if support else 0.5 / STRAIN_PRIOR_SD ** 2             # negative log-likelihood scale
+        self.smooth_E = 0.0 if smooth_sd is None else 1.0 / smooth_sd ** 2
+        # density smoothness, per material: 1 / sd^2 with sd = DENSITY_SMOOTH_REL x the median density over the
+        # voxels above half the material's maximum
+        self.smooth_V = torch.zeros(self.R, device=V.device, dtype=V.dtype)
+        if density_smooth:
+            for r in range(self.R):
+                v = V[..., r]; typ = v[v > 0.5 * v.max()].median() if float(v.max()) > 0 else torch.ones(())
+                self.smooth_V[r] = 1.0 / float(DENSITY_SMOOTH_REL * typ) ** 2
+        self.elastic = elastic if (elastic is not None and self.C == 6) else None
+        self.eq_w = 1.0 / eq_sd ** 2
+        self.cg_iters = cg_iters
+        self.damp = 1e-3
+        self.sync()
+
+    # ---- projections
+    def _fwd(self, V, VE):
+        """W (P, R) and the view-weighted U (P, R) from a density-like and a (density x strain)-like volume."""
+        n, R, C = V.shape[0], self.R, self.C
+        out = self.proj.fwd(torch.cat([V, VE.reshape(n, n, n, R * C)], -1))
+        return out[:, :R], (out[:, R:].reshape(-1, R, C) * self.w_ray[:, None, :]).sum(-1)
+
+    def _back(self, gW, gU):
+        """The adjoint of _fwd: volumes (n, n, n, R) and (n, n, n, R, C)."""
+        P, R, C = gW.shape[0], self.R, self.C
+        b = self.proj.back(torch.cat([gW, (gU[:, :, None] * self.w_ray[:, None, :]).reshape(P, R * C)], 1))
+        return b[..., :R], b[..., R:].reshape(*b.shape[:3], R, C)
+
+    def rays(self, V, E):
+        W, U = self._fwd(V, V[..., None] * E)
+        eps = torch.where(W > EPS_W_MIN, U / W.clamp_min(EPS_W_MIN), torch.zeros_like(U))
+        return W.clamp_min(0), eps
+
+    def sync(self):
+        self.fit.W, self.fit.eps = self.rays(self.V, self.E)
+
+    # ---- priors
+    @staticmethod
+    def laplacian(E):
+        """Sum over the six neighbours of (E_i - E_j), with no neighbours past the volume's faces (first 3 axes)."""
+        out = torch.zeros_like(E)
+        for d in range(3):
+            df = E.diff(dim=d)                                                      # E_(k+1) - E_k
+            n = E.shape[d]
+            out.narrow(d, 0, n - 1).sub_(df); out.narrow(d, 1, n - 1).add_(df)
+        return out
+
+    def _eq_mask(self):
+        """Per material, the voxels whose six neighbours all hold the material (density above half its maximum)."""
+        Vd = self.V
+        inside = Vd > 0.5 * Vd.amax((0, 1, 2), keepdim=True)
+        m = inside.clone()
+        for d in range(3):
+            m &= torch.roll(inside, 1, d) & torch.roll(inside, -1, d)
+            m.narrow(d, 0, 1).zero_(); m.narrow(d, m.shape[d] - 1, 1).zero_()
+        return m                                                                    # (n, n, n, R)
+
+    def _divergence(self, E, mask):
+        """div(sigma) / Young's modulus on the mask, (n, n, n, R, 3); volume axes (y, x, z), E in COMPONENTS order."""
+        out = []
+        D = lambda a, ax: 0.5 * (torch.roll(a, -1, ax) - torch.roll(a, 1, ax))
+        for r, (Em, nu) in enumerate(self.elastic):
+            lam_, mu_ = nu / ((1 + nu) * (1 - 2 * nu)), 1 / (2 * (1 + nu))       # Lame constants / Young's modulus
+            e = E[..., r, :]; tr = e[..., 0] + e[..., 1] + e[..., 2]
+            sxx, syy, szz = (lam_ * tr + 2 * mu_ * e[..., k] for k in range(3))
+            sxy, syz, sxz = (2 * mu_ * e[..., k] for k in (3, 4, 5))
+            dx, dy, dz = (lambda a: D(a, 1)), (lambda a: D(a, 0)), (lambda a: D(a, 2))
+            f = torch.stack([dx(sxx) + dy(sxy) + dz(sxz), dx(sxy) + dy(syy) + dz(syz), dx(sxz) + dy(syz) + dz(szz)], -1)
+            out.append(f * mask[..., r, None])
+        return torch.stack(out, -2)
+
+    def prior(self, V, E, mask=None):
+        sq = lambda X: sum((d.double() ** 2).sum((0, 1, 2)) for d in (X.diff(dim=0), X.diff(dim=1), X.diff(dim=2)))
+        tot = (self.lam_E * float((E.double() ** 2).sum()) + 0.5 * self.smooth_E * float(sq(E).sum())
+               + 0.5 * float((self.smooth_V.double() * sq(V)).sum()))
+        if self.elastic is not None:
+            mask = self._eq_mask() if mask is None else mask
+            tot += 0.5 * self.eq_w * float((self._divergence(E, mask).double() ** 2).sum())
+        return tot
+
+    def loss(self, V=None, E=None, mask=None):
+        V = self.V if V is None else V; E = self.E if E is None else E
+        W, eps = self.rays(V, E)
+        cache = self.fit._state(self.fit.g); tot = 0.0
+        with torch.no_grad():
+            for sl in self.fit.chunks():
+                tot += float(self.fit.ray_loss(sl, W[sl], eps[sl], cache).sum())
+        return tot + self.prior(V, E, mask)
+
+    # ---- the Gauss-Newton step
+    def volume_step(self):
+        """One Gauss-Newton step on (V, E). Returns the step's Newton decrement per volume parameter (noise units)."""
+        fit, R, C = self.fit, self.R, self.C
+        self.sync()
+        cache = fit._state(fit.g)
+        P = fit.T.shape[0]
+        G = torch.zeros(P, 2 * R, device=fit.T.device, dtype=torch.float64)
+        F = torch.zeros(P, 2 * R, 2 * R, device=fit.T.device, dtype=torch.float64)
+        with torch.no_grad():
+            for sl in fit.chunks():
+                G[sl], F[sl] = fit.ray_system(sl, cache)
+        G, F = G.float(), F.float()
+        V, E = self.V, self.E
+        mask = self._eq_mask() if self.elastic is not None else None
+        eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]) \
+            if self.elastic is not None else (lambda X: torch.zeros_like(X))
+        bGW, bGU = self._back(G[:, :R], G[:, R:])
+        gV = bGW + (E * bGU).sum(-1) + self.smooth_V * self.laplacian(V)
+        gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
+        free = ~((V <= 0) & (gV > 0))                                               # V's active bound held
+        fE = self.support_mask().expand_as(E)                                       # strain free inside the support
+        # Jacobi preconditioner from the ray Fisher diagonals (for the strain parts, each view's weight squared)
+        dWW = torch.diagonal(F[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
+        dWU = torch.diagonal(F[:, :R, R:], dim1=1, dim2=2)
+        P_ = dWW.shape[0]
+        bWW = self.proj.back(torch.cat([dWW, torch.zeros(P_, R * C, device=dWW.device)], 1))[..., :R]
+        bUU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dUU[:, :, None] * self.w_ray[:, None, :] ** 2).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
+        bWU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dWU[:, :, None] * self.w_ray[:, None, :]).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
+        eq_diag = 12.0 * self.eq_w if self.elastic is not None else 0.0          # rough scale of the equilibrium curvature
+        dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + 6 * self.smooth_V
+        dE_ = V[..., None] ** 2 * bUU + 2 * self.lam_E + 6 * self.smooth_E + eq_diag
+
+        def H(xV, xE):
+            zW, zU = self._fwd(xV, E * xV[..., None] + V[..., None] * xE)
+            y = torch.einsum('pab,pb->pa', F, torch.cat([zW, zU], 1))
+            bW, bU = self._back(y[:, :R], y[:, R:])
+            return ((bW + (E * bU).sum(-1) + self.smooth_V * self.laplacian(xV)) * free,
+                    (V[..., None] * bU + 2 * self.lam_E * xE + self.smooth_E * self.laplacian(xE) + eq(xE)) * fE)
+
+        for _ in range(6):
+            lam_ = self.damp
+            pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
+            prec = self._block_preconditioner(F, lam_, dV_, dE_, free, fE, mask) if self.precond == 'block' \
+                else (lambda rV, rE: (rV / pV, rE / pE))
+            bV, bE = -gV * free, -gE * fE
+            xV, xE = torch.zeros_like(V), torch.zeros_like(E)
+            rV, rE = bV.clone(), bE.clone()
+            zV, zE = prec(rV, rE)
+            dV, dE = zV.clone(), zE.clone()
+            rz = float((rV * zV).sum() + (rE * zE).sum())
+            for _ in range(self.cg_iters):
+                hV, hE = H(dV, dE)
+                hV = hV + lam_ * dV_ * dV; hE = hE + lam_ * dE_ * dE
+                a = rz / max(float((dV * hV).sum() + (dE * hE).sum()), 1e-30)
+                xV += a * dV; xE += a * dE; rV -= a * hV; rE -= a * hE
+                zV, zE = prec(rV, rE)
+                rz_new = float((rV * zV).sum() + (rE * zE).sum())
+                dV, dE = zV + (rz_new / rz) * dV, zE + (rz_new / rz) * dE; rz = rz_new
+            dec = float(-(gV * free * xV).sum() - (gE * fE * xE).sum())            # Newton decrement^2 (deviance)
+            l0 = self.loss(mask=mask)
+            for alpha in (1.0, 0.5, 0.25):
+                Vn = (V + alpha * xV).clamp_min(0); En = E + alpha * xE
+                l1 = self.loss(Vn, En, mask=mask)
+                if l1 < l0:
+                    self.V, self.E = Vn, En; self.sync()
+                    self.damp = max(self.damp / 3, 1e-6)
+                    return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l1
+            self.damp *= 10
+        return float('nan'), 0.0
+
+    def _block_preconditioner(self, F, lam_, dV_, dE_, fV, fE, mask):
+        """The 'block' preconditioner: per voxel and material, the zero-lag block of the volume Hessian over (V, E_1..C)
+        (the data term through the ray Fisher blocks of that material, the priors' zero-lag terms, the equilibrium
+        prior's zero-lag block from an impulse response) plus the damping, inverted. Returns z = P(rV, rE)."""
+        R, C, V, E = self.R, self.C, self.V, self.E
+        n = V.shape[0]; P_ = F.shape[0]; w = self.w_ray
+        dWW = torch.diagonal(F[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
+        dWU = torch.diagonal(F[:, :R, R:], dim1=1, dim2=2)
+        b = self.proj.back(torch.cat([dWW, (dWU[:, :, None] * w[:, None, :]).reshape(P_, R * C)], 1))
+        bWW, bWU = b[..., :R], b[..., R:].reshape(n, n, n, R, C)
+        bUU = torch.stack([self.proj.back(torch.cat([torch.zeros_like(dWW), (dUU[:, :, None] * (w[:, k:k + 1] * w)[:, None, :]).reshape(P_, R * C)], 1))
+                           [..., R:].reshape(n, n, n, R, C) for k in range(C)], -2)              # (n, n, n, R, C, C)
+        B = torch.zeros(n, n, n, R, 1 + C, 1 + C, device=V.device, dtype=V.dtype)
+        EbUU = torch.einsum('xyzrk,xyzrkl->xyzrl', E, bUU)
+        B[..., 0, 0] = bWW + 2 * (E * bWU).sum(-1) + (EbUU * E).sum(-1) + 6 * self.smooth_V
+        B[..., 0, 1:] = V[..., None] * (bWU + EbUU); B[..., 1:, 0] = B[..., 0, 1:]
+        B[..., 1:, 1:] = V[..., None, None] ** 2 * bUU + (2 * self.lam_E + 6 * self.smooth_E) * torch.eye(C, device=V.device)
+        if self.elastic is not None:
+            # the equilibrium prior's zero-lag block, from its response to unit impulses at an interior voxel
+            for r in range(R):
+                deep = mask[..., r].clone()
+                for d in range(3):
+                    deep &= torch.roll(mask[..., r], 1, d) & torch.roll(mask[..., r], -1, d)
+                idx = deep.nonzero()
+                if len(idx) == 0:
+                    continue
+                j = tuple(int(v) for v in idx[len(idx) // 2])
+                blk = torch.zeros(C, C, device=V.device, dtype=V.dtype)
+                for k in range(C):
+                    X = torch.zeros_like(E); X[j + (r, k)] = 1.0
+                    resp = self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]
+                    blk[:, k] = resp[j + (r,)]
+                B[..., r, 1:, 1:] += mask[..., r, None, None].to(V.dtype) * blk
+        # damping as in the Jacobi version, then the held unknowns' rows and columns replaced by the identity
+        B = B + lam_ * torch.diag_embed(torch.cat([dV_[..., None], dE_], -1))
+        free = torch.cat([fV[..., None], fE], -1).to(V.dtype)                              # (n, n, n, R, 1 + C)
+        B = B * free[..., :, None] * free[..., None, :] + torch.diag_embed(1 - free)
+        B = B + 1e-12 * torch.eye(1 + C, device=V.device)
+        Binv = torch.linalg.inv(B.double()).to(V.dtype)
+
+        def apply(rV, rE):
+            z = torch.einsum('xyzrab,xyzrb->xyzra', Binv, torch.cat([rV[..., None], rE], -1)) * free
+            return z[..., 0], z[..., 1:]
+        return apply
+
+    def mount_step(self, refine_rigid=None, damp=1e-2):
+        """One Gauss-Newton step on the mounts of a MultiProjector, for robustness to poorly calibrated view metadata:
+        per series its three rotations (degrees), three shifts (voxels) and its centre-of-rotation offset (detector
+        channels). refine_rigid lists the series whose rotations and shifts move (default: all but the first, which fixes
+        the sample frame); every series' offset moves. Derivatives by central differences of the transformed volume
+        (MOUNT_FD), steps capped at MOUNT_MAX_STEP, then a backtracking line search on the loss. Returns the accepted
+        changes per series."""
+        proj, fit, R, C = self.proj, self.fit, self.R, self.C
+        refine_rigid = list(range(1, len(proj.parts))) if refine_rigid is None else list(refine_rigid)
+        self.sync()
+        cache = fit._state(fit.g)
+        P = fit.T.shape[0]
+        G = torch.zeros(P, 2 * R, device=fit.T.device, dtype=torch.float64)
+        F = torch.zeros(P, 2 * R, 2 * R, device=fit.T.device, dtype=torch.float64)
+        with torch.no_grad():
+            for sl in fit.chunks():
+                G[sl], F[sl] = fit.ray_system(sl, cache)
+        n = self.V.shape[0]
+        vols = torch.cat([self.V, (self.V[..., None] * self.E).reshape(n, n, n, R * C)], -1)
+        bounds = np.cumsum([0] + proj.counts)
+        to_wu = lambda d, w: torch.cat([d[:, :R], (d[:, R:].reshape(-1, R, C) * w[:, None, :]).sum(-1)], 1)
+        steps = []
+        for s_, ((perm, signs, sh, ro), p) in enumerate(proj.parts):
+            sl = slice(int(bounds[s_]), int(bounds[s_ + 1])); w = self.w_ray[sl]
+            base = vols.permute(*perm, 3)
+            flips = [i for i, sg in enumerate(signs) if sg < 0]
+            base = (base.flip(flips) if flips else base).contiguous()
+            names, cols = [], []
+            if s_ in refine_rigid:
+                for k in range(6):
+                    h = MOUNT_FD[0] if k < 3 else MOUNT_FD[1]
+                    th = list(ro) + list(sh)
+                    tp, tm = list(th), list(th); tp[k] += h; tm[k] -= h
+                    dv = (MultiProjector._warp(base, tp[3:], tp[:3]) - MultiProjector._warp(base, tm[3:], tm[:3])) / (2 * h)
+                    cols.append(to_wu(p.fwd(dv.contiguous()), w)); names.append(k)
+            off0 = p.channel_offset; h = MOUNT_FD[2]; vs = MultiProjector._to_series(vols, (perm, signs, sh, ro))
+            p.model.set_params(det_channel_offset=float(off0 + h), use_ror_mask=bool(p.ror_mask)); a_ = p.fwd(vs)
+            p.model.set_params(det_channel_offset=float(off0 - h), use_ror_mask=bool(p.ror_mask)); b_ = p.fwd(vs)
+            p.model.set_params(det_channel_offset=float(off0), use_ror_mask=bool(p.ror_mask))
+            cols.append(to_wu((a_ - b_) / (2 * h), w)); names.append(6)
+            J = torch.stack(cols, 2).double()                                         # (Ps, 2R, k)
+            g = torch.einsum('pa,pak->k', G[sl], J)
+            Fm = torch.einsum('pak,pab,pbl->kl', J, F[sl], J)
+            A = Fm + damp * torch.diag(torch.diagonal(Fm)) + 1e-12 * torch.eye(len(names), device=Fm.device, dtype=Fm.dtype)
+            d = -torch.linalg.solve(A, g)
+            cap = torch.tensor([MOUNT_MAX_STEP[0] if k < 3 else MOUNT_MAX_STEP[1] if k < 6 else MOUNT_MAX_STEP[2] for k in names],
+                               device=d.device, dtype=d.dtype)
+            d = d * min(1.0, float((cap / d.abs().clamp_min(1e-30)).min()))
+            steps.append((s_, names, d.cpu().numpy()))
+        old_state = [(tr, p.channel_offset) for tr, p in proj.parts]
+        l0 = self.loss()
+
+        def apply(alpha):
+            for (s_, names, d), (tr, off) in zip(steps, old_state):
+                rot, shift = list(tr[3]), list(tr[2]); off = float(off)
+                for k, dk in zip(names, alpha * d):
+                    if k < 3: rot[k] += float(dk)
+                    elif k < 6: shift[k - 3] += float(dk)
+                    else: off += float(dk)
+                proj.set_mount(s_, shift=shift, rot=rot, offset=off)
+        for alpha in (1.0, 0.5, 0.25):
+            apply(alpha); self.sync()
+            l1 = self.loss()
+            if l1 < l0:
+                return dict(alpha=alpha, loss_decrease=l0 - l1,
+                            mounts=[dict(shift=list(tr[2]), rot=list(tr[3]), offset=p.channel_offset) for tr, p in proj.parts])
+        apply(0.0); self.sync()
+        return dict(alpha=0.0, loss_decrease=0.0,
+                    mounts=[dict(shift=list(tr[2]), rot=list(tr[3]), offset=p.channel_offset) for tr, p in proj.parts])
+
+    def support_mask(self):
+        """(n, n, n, R, 1): where each material's strain is free (its 3 x 3 x 3 mean density above SUPPORT_REL of the
+        maximum), or everywhere without the support prior."""
+        if not self.support:
+            return torch.ones_like(self.V)[..., None].bool()
+        Vs = torch.nn.functional.avg_pool3d(self.V.permute(3, 0, 1, 2)[None], 3, stride=1, padding=1,
+                                            count_include_pad=False)[0].permute(1, 2, 3, 0)
+        return (Vs > SUPPORT_REL * Vs.amax((0, 1, 2), keepdim=True))[..., None]
+
+    def joint_step(self, idx, cross='ray'):
+        """One Gauss-Newton step on the volumes (V, E) and the global parameters idx together: the cross information
+        between them comes from the rays (FitB.joint_system), back-projected into one volume pair per global parameter;
+        the joint system is solved by preconditioned CG (Jacobi on the volumes, the exact inverse of the free global
+        block), then a projected backtracking line search on the full loss. Returns (decrement per parameter, loss
+        decrease). cross='ray' keeps the cross information per ray (memory ~ rays x 2R x n_global) and applies it on
+        the projections the volume block already makes; cross='volume' back-projects it into one volume pair per global
+        parameter (memory ~ n_global x voxels x R (1 + C)), the first implementation, kept for comparison."""
+        fit, R, C = self.fit, self.R, self.C
+        M = fit.M
+        self.sync()
+        G, Fw, Cx, gg, Fg = fit.joint_system(idx)
+        G, Fw = G.float(), Fw.float()
+        V, E = self.V, self.E
+        mask = self._eq_mask() if self.elastic is not None else None
+        eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]) \
+            if self.elastic is not None else (lambda X: torch.zeros_like(X))
+        bGW, bGU = self._back(G[:, :R], G[:, R:])
+        gV = bGW + (E * bGU).sum(-1) + self.smooth_V * self.laplacian(V)
+        gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
+        fV = ~((V <= 0) & (gV > 0)); fE = self.support_mask().expand_as(E)
+        # the global parameters that move: informative and not held at a bound
+        gi = fit.g[idx]; lb, ub = M.lb[idx], M.ub[idx]
+        d = torch.diagonal(Fg)
+        fg = (d > 1e-12 * d.max()) & ~((gi <= lb) & (gg > 0)) & ~((gi >= ub) & (gg < 0))
+        gg = gg * fg
+        fgf = fg.float()
+        if cross == 'volume':                       # the cross columns, one volume pair per global parameter
+            cV, cE = [], []
+            for j in range(len(idx)):
+                bW, bU = self._back(Cx[:, :R, j].contiguous(), Cx[:, R:, j].contiguous())
+                cV.append((bW + (E * bU).sum(-1)) * fV); cE.append(V[..., None] * bU * fE)
+            cV, cE = torch.stack(cV), torch.stack(cE)
+            cV, cE = cV * fgf[:, None, None, None, None], cE * fgf[:, None, None, None, None, None]
+        Fg = Fg * (fg[:, None] & fg[None, :]) + torch.diag((~fg).double())
+        # Jacobi preconditioner for the volumes (as volume_step)
+        dWW = torch.diagonal(Fw[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(Fw[:, R:, R:], dim1=1, dim2=2)
+        dWU = torch.diagonal(Fw[:, :R, R:], dim1=1, dim2=2); P_ = dWW.shape[0]
+        bWW = self.proj.back(torch.cat([dWW, torch.zeros(P_, R * C, device=dWW.device)], 1))[..., :R]
+        bUU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dUU[:, :, None] * self.w_ray[:, None, :] ** 2).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
+        bWU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dWU[:, :, None] * self.w_ray[:, None, :]).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
+        eq_diag = 12.0 * self.eq_w if self.elastic is not None else 0.0
+        dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + 6 * self.smooth_V
+        dE_ = V[..., None] ** 2 * bUU + 2 * self.lam_E + 6 * self.smooth_E + eq_diag
+
+        def H(xV, xE, xg):
+            xgf = xg.float() * fgf
+            zW, zU = self._fwd(xV * fV, E * (xV * fV)[..., None] + V[..., None] * (xE * fE))
+            z = torch.cat([zW, zU], 1)
+            y = torch.einsum('pab,pb->pa', Fw, z)
+            if cross == 'ray':                      # the cross block applied on the same rays: no extra projections
+                y = y + torch.einsum('pan,n->pa', Cx, xgf)
+            bW, bU = self._back(y[:, :R], y[:, R:])
+            hV = (bW + (E * bU).sum(-1) + self.smooth_V * self.laplacian(xV)) * fV
+            hE = (V[..., None] * bU + 2 * self.lam_E * xE + self.smooth_E * self.laplacian(xE) + eq(xE)) * fE
+            if cross == 'ray':
+                hg = (Fg @ xg) + (torch.einsum('pan,pa->n', Cx, z) * fgf).double()
+            else:
+                hV = hV + torch.einsum('j,j...->...', xgf, cV)
+                hE = hE + torch.einsum('j,j...->...', xgf, cE)
+                hg = (Fg @ xg) + (torch.einsum('j...,...->j', cV, xV) + torch.einsum('j...,...->j', cE, xE)).double()
+            return hV, hE, hg
+
+        def total(Vn, En, gn):
+            g_keep = fit.g; fit.g = gn
+            try:
+                return self.loss(Vn, En, mask=mask) + float(fit.spline_penalty(gn))
+            finally:
+                fit.g = g_keep
+
+        l0 = total(V, E, fit.g)
+        for _ in range(6):
+            lam_ = self.damp
+            Ag = Fg + lam_ * torch.diag(torch.diagonal(Fg))
+            Ag_inv = torch.linalg.inv(Ag)
+            pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
+            if self.precond == 'block':
+                pvol = self._block_preconditioner(Fw, lam_, dV_, dE_, fV, fE, mask)
+                prec = lambda rV, rE, rg: (*pvol(rV, rE), Ag_inv @ rg)
+            else:
+                prec = lambda rV, rE, rg: (rV / pV, rE / pE, Ag_inv @ rg)
+            bV, bE, bg = -gV * fV, -gE * fE, -gg
+            xV, xE, xg = torch.zeros_like(V), torch.zeros_like(E), torch.zeros_like(gg)
+            rV, rE, rg = bV.clone(), bE.clone(), bg.clone()
+            zV, zE, zg = prec(rV, rE, rg)
+            dV, dE, dg = zV.clone(), zE.clone(), zg.clone()
+            rz = float((rV * zV).sum() + (rE * zE).sum() + (rg * zg).sum()); rz0 = rz
+            for _ in range(JOINT_CG_ITERS):
+                hV, hE, hg = H(dV, dE, dg)
+                hV = hV + lam_ * dV_ * dV; hE = hE + lam_ * dE_ * dE; hg = hg + lam_ * torch.diagonal(Fg) * dg
+                den = float((dV * hV).sum() + (dE * hE).sum() + (dg * hg).sum())
+                if den <= 0:
+                    break
+                a = rz / den
+                xV += a * dV; xE += a * dE; xg += a * dg; rV -= a * hV; rE -= a * hE; rg -= a * hg
+                zV, zE, zg = prec(rV, rE, rg)
+                rz_new = float((rV * zV).sum() + (rE * zE).sum() + (rg * zg).sum())
+                b = rz_new / max(rz, 1e-30)
+                dV, dE, dg = zV + b * dV, zE + b * dE, zg + b * dg; rz = rz_new
+            self.last_cg = math.sqrt(max(rz, 0.0) / max(rz0, 1e-300))                 # the CG's final relative residual
+            dec = float(-(gV * fV * xV).sum() - (gE * fE * xE).sum() - (gg * xg).sum())
+            for alpha in (1.0, 0.5, 0.25):
+                Vn = (V + alpha * xV).clamp_min(0); En = E + alpha * xE
+                gn = fit.g.clone(); gn[idx] = gn[idx] + alpha * xg
+                gn = torch.maximum(torch.minimum(gn, M.ub), M.lb)
+                l1 = total(Vn, En, gn)
+                if l1 < l0:
+                    self.V, self.E, fit.g = Vn, En, gn; self.sync()
+                    self.damp = max(self.damp / 3, 1e-6)
+                    return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel() + len(idx))), l0 - l1
+            self.damp *= 10
+        return float('nan'), 0.0
+
+
+def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2, chunk=1024, a_range=0.01,
+           d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
+           eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi'):
+    """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
+    within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
+    d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
+    spectrum is pinned at one wavelength to its warm-up value, which removes the density-spectrum scale trade-off.
+    inflation is the variance inflation of the counts (count correlation; it scales the contamination thresholds);
+    density_smooth adds the density smoothness prior. weights (views, C) select the strain model (None: a scalar
+    dilation; beam_geometry tensor weights: the strain tensor) and elastic the equilibrium prior (see TomoFit).
+    ray_mask (rays,) bool leaves the rays where it is False out of the reconstruction and the likelihood (FitB)."""
+    from mbirtorch import hsnt
+    R = len(lattices)
+    if ray_mask is None:
+        W0, H0, _ = hsnt.dehydrate(T.cpu().numpy(), 'transmission', num_materials=R, verbose=0)
+        W0 = W0.reshape(-1, R)
+    else:                                       # the spectra from the kept rays only; left-out rays start at zero
+        keep = ray_mask.cpu().numpy().astype(bool)
+        Wk, H0, _ = hsnt.dehydrate(T[ray_mask.to(T.device)].cpu().numpy(), 'transmission', num_materials=R, verbose=0)
+        W0 = np.zeros((T.shape[0], R), dtype=Wk.dtype); W0[keep] = Wk.reshape(-1, R)
+    lats = [(lt, (a * (1 - a_range), a * (1 + a_range))) for lt, a in zip(lattices, a0)]
+    thetas, found, _, _, resolution = warm_start(H0.astype(np.float64), lam, n_bragg=R, lattices=lats, device=device)
+    # warm_start orders its components by its own criterion: pair each given lattice with the found component of the
+    # same type and the nearest lattice parameter
+    from scipy.optimize import linear_sum_assignment
+    cost = np.array([[abs(float(th[0]) / a - 1) if lf == lt else np.inf for (lf, _), th in zip(found, thetas)]
+                     for lt, a in zip(lattices, a0)])
+    assert len(found) == R and np.isfinite(cost).any(axis=1).all(), (found, lattices)
+    _, order = linear_sum_assignment(np.where(np.isfinite(cost), cost, 1e9))
+    found = [found[j] for j in order]; thetas = [thetas[j] for j in order]
+    assert all(np.isfinite(cost[i, j]) for i, j in enumerate(order)), (found, lattices)
+    targets = []
+    for (lt, ar), th in zip(found, thetas):
+        tgt = BraggSpectrum(lam, lattice=lt, a_range=ar, n_spline=8, resolution=resolution)(th.cpu()).detach().numpy()
+        targets.append(tgt / max(np.abs(tgt).mean(), 1e-12) * float(np.abs(H0).mean()))
+    targets = np.stack(targets)
+    if d0_from_data:
+        a0 = [float(th[0]) for th in thetas]
+    M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True)
+    g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    mu_bar = float(np.mean(targets))
+    for j in range(M.J):
+        for r in range(M.R):
+            g[M.kap_sl[0] + j * M.R + r] = mu_bar * (0.1 + 0.4 * j)
+    for r in range(R):
+        ls_init_material(M, g, r, targets[r], a0[r])
+        M.lb[M.slices[r]['a']] = M.ub[M.slices[r]['a']] = a0[r]                    # d0 reference
+    Mx = np.linalg.lstsq(targets.T, H0.T.astype(np.float64), rcond=None)[0].T
+    Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
+    # the pipeline's per-ray fits of the maps to the initial spectra (no strain yet)
+    fit0 = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), chunk=chunk)
+    for _ in range(INIT_PIXEL_STEPS):
+        fit0.pixel_step()
+    Wr = fit0.W; del fit0
+    # least-squares reconstruction of the ray maps (CGLS), clipped to >= 0
+    n = proj.n; pr = proj.with_q(R)
+    x = torch.zeros(n, n, n, R, device=device)
+    rm = torch.ones(Wr.shape[0], 1, device=device) if ray_mask is None else ray_mask.to(device, Wr.dtype)[:, None]
+    r_ = (Wr - pr.fwd(x)) * rm; s = pr.back(r_); p = s.clone(); gam = float((s * s).sum())
+    for _ in range(INIT_CG_ITERS):
+        q = pr.fwd(p) * rm; al = gam / max(float((q * q).sum()), 1e-30)
+        x += al * p; r_ -= al * q; s = pr.back(r_); gnew = float((s * s).sum())
+        p = s + (gnew / gam) * p; gam = gnew
+    V = x.clamp_min(0)
+    fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
+               ray_mask=ray_mask)
+    if kappa_prior is not None:
+        # the standard deviation as a multiple of the warm-up spectra's mean attenuation (kappa's own units)
+        fit.kappa_prior = kappa_prior * float(np.abs(targets).mean())
+    if anchor_scale:
+        # pin each spectrum at the fine grid's middle to its warm-up value: the stiffness is ANCHOR_STIFFNESS times
+        # the largest diagonal entry of the global Fisher information, so the pin dominates the data along the scale
+        with torch.no_grad():
+            k = M.Kf // 2; targets = M.spectra(g)[:, k].clone()
+        fit.scale_anchor = (k, targets, 0.0)
+        idx = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]
+        _, F0 = fit.global_system(idx)
+        fit.scale_anchor = (k, targets, ANCHOR_STIFFNESS * float(torch.diagonal(F0).max()))
+    C = 1 if weights is None else np.asarray(weights).shape[1]
+    E0 = torch.zeros(*V.shape, C, device=device, dtype=V.dtype)
+    return TomoFit(fit, proj, V, E0, weights=weights, density_smooth=density_smooth, elastic=elastic, eq_sd=eq_sd,
+                   cg_iters=cg_iters, support=support, precond=precond), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
+                                                           resolution=[float(v) for v in resolution])
+
+
+def newton_step(F, g, rcond=1e-8):
+    """F^-1 g on the directions the data determine: a Jacobi-scaled eigendecomposition, keeping the eigenvalues above
+    rcond times the largest. The global parameters' Fisher diagonal spans many orders of magnitude (kernel widths
+    against edge heights), and some parameters carry no information at all (the absorption of a contamination
+    component that is off, an edge outside the measured range), so a plain solve is dominated by those directions."""
+    d = torch.diagonal(F)
+    s = torch.where(d > rcond * d.max(), 1.0 / torch.sqrt(d.clamp_min(torch.finfo(F.dtype).tiny)), torch.zeros_like(d))
+    lam, Q = torch.linalg.eigh(s[:, None] * F * s[None, :])
+    keep = lam > rcond * lam.max()
+    return s * (Q[:, keep] @ ((Q[:, keep].T @ (s * g)) / lam[keep]))
