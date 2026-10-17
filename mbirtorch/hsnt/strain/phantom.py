@@ -348,6 +348,7 @@ FE_PEAK = 1.5e-3                            # the largest strain component in th
 FE_CUBE = dict(half=19.0 / 64, centre=(-0.5 / 64, -0.5 / 64, 7.0 / 64))   # half side and centre (y, x, z), units of n
 FE_ATTEN_3A = 0.1 * 64                      # the cube's attenuation per unit length at 3 Angstrom, times n per voxel
 FE_AXIS = (1.035, 6.027, 2841)              # wavelength range (Angstrom) and bins of the default axis
+FE_A_RANGE = 0.02                           # relative lattice-parameter range of the model (as the Fe cube fits use)
 HOLDER = dict(radius=14.0 / 64, gap=1.0 / 64, atten=0.27)  # rod radius and gap past the cube (units of n); attenuation
 #                                                            relative to the cube's mean attenuation
 
@@ -378,7 +379,7 @@ def fe_cube_tensor(N):
 def fe_spectrum_model(lam, dose_per_bin, n, device='cpu'):
     """A Hybrid2 model for bcc Fe on the axis lam and its parameter vector: Bragg heights j d, a smooth part, the
     two-scale kernel, scaled so the attenuation per voxel at 3 Angstrom is FE_ATTEN_3A / n."""
-    M = Hybrid2(lam, dose_per_bin, [(FE['lattice'], (FE['a'] * 0.99, FE['a'] * 1.01))], n_spline=8, n_contam=2,
+    M = Hybrid2(lam, dose_per_bin, [(FE['lattice'], (FE['a'] * (1 - FE_A_RANGE), FE['a'] * (1 + FE_A_RANGE)))], n_spline=8, n_contam=2,
                 device=device, two_scale=True)
     g = torch.zeros(M.n_global, dtype=torch.float64, device=device)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL, dtype=torch.float64)
