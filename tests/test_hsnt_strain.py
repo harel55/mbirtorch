@@ -38,3 +38,22 @@ def test_set_mount_round_trip(proj):
     assert not torch.allclose(proj.fwd(x), before)
     proj.set_mount(1, shift=shift, rot=rot, offset=off)
     assert torch.allclose(proj.fwd(x), before)
+
+
+@pytest.mark.parametrize("prior", ["quadratic", "qggmrf"])
+def test_density_prior_gradient(prior):
+    """The density prior's gradient (dens_lap at V) matches central differences of its value."""
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    tf = TomoFit.__new__(TomoFit)
+    tf.R, tf.voxel_scale, tf.density_prior = 1, 0.7, prior
+    tf.sigma_V = torch.tensor([0.05], dtype=torch.float64)
+    tf.smooth_V = tf.voxel_scale / tf.sigma_V ** 2
+    V = torch.rand(6, 6, 6, 1, dtype=torch.float64, generator=torch.Generator().manual_seed(2)) * 0.1
+    V[3:] += 0.5                                          # a sharp jump
+    tf.V = V
+    g = tf.dens_lap(V, tf._dens_wts(V))
+    h = 1e-6
+    for idx in [(0, 0, 0, 0), (2, 3, 1, 0), (3, 3, 3, 0)]:
+        Vp, Vm = V.clone(), V.clone(); Vp[idx] += h; Vm[idx] -= h
+        num = (tf._dens_prior_value(Vp) - tf._dens_prior_value(Vm)) / (2 * h)
+        assert abs(float(g[idx]) - num) <= 1e-5 * max(1.0, abs(num))

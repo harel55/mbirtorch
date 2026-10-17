@@ -34,6 +34,8 @@ STRAIN_SMOOTH_SD = 3e-4         # standard deviation of the strain difference be
 JOINT_CG_ITERS = 60             # conjugate-gradient iterations of the joint (volumes + global) step
 SUPPORT_REL = 0.1               # the support: voxels whose 3 x 3 x 3 mean density exceeds this fraction of the maximum
 EQUILIBRIUM_SD = 1e-5           # the equilibrium prior's standard deviation of div(stress) / Young's modulus per voxel
+QGGMRF_P, QGGMRF_Q, QGGMRF_T = 2.0, 1.2, 1.0   # the edge-preserving density prior's exponents and threshold (the
+#                                              package's q-GGMRF defaults)
 DENSITY_SMOOTH_REL = 0.2        # the density smoothness prior's standard deviation per neighbour difference, as a
                                 # fraction of the material's typical density inside the sample (warm-up volume)
 CG_ITERS = 30                   # conjugate-gradient iterations per volume step
@@ -283,8 +285,16 @@ class TomoFit:
     material, with standard deviation EQUILIBRIUM_SD of the divergence of stress / Young's modulus per voxel."""
 
     def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
-                 eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi'):
+                 eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi', density_prior='quadratic',
+                 voxel_scale=1.0):
+        """density_prior: 'quadratic' (a Gaussian prior on neighbour differences) or 'qggmrf' (edge-preserving: the
+        same for small differences, much weaker for large jumps, so sharp interfaces are kept). voxel_scale: the voxel
+        size relative to the grid the prior strengths are set for; the smoothness and equilibrium weights scale with it
+        and the weak strain ridge with its cube, as discretized integrals over the volume, so the priors mean the same
+        at any binning."""
         self.fit = fit
+        assert density_prior in ('quadratic', 'qggmrf'), density_prior
+        self.density_prior, self.voxel_scale = density_prior, float(voxel_scale)
         # the volume solves' preconditioner: 'jacobi' (each unknown's diagonal) or 'block' (per voxel and material, the
         # inverse of the (1 + C) x (1 + C) block coupling its density and strain components)
         assert precond in ('jacobi', 'block'), precond
@@ -300,17 +310,21 @@ class TomoFit:
         assert w.shape == (proj.V, self.C), (w.shape, proj.V, self.C)
         self.w_ray = w.repeat_interleave(n * n, 0)                                   # (P, C): rays are view-major
         self.proj = proj.with_q(self.R * (1 + self.C))
-        self.lam_E = 0.0 if support else 0.5 / STRAIN_PRIOR_SD ** 2             # negative log-likelihood scale
-        self.smooth_E = 0.0 if smooth_sd is None else 1.0 / smooth_sd ** 2
+        vs = self.voxel_scale
+        self.lam_E = 0.0 if support else vs ** 3 * 0.5 / STRAIN_PRIOR_SD ** 2    # negative log-likelihood scale
+        self.smooth_E = 0.0 if smooth_sd is None else vs / smooth_sd ** 2
         # density smoothness, per material: 1 / sd^2 with sd = DENSITY_SMOOTH_REL x the median density over the
         # voxels above half the material's maximum
         self.smooth_V = torch.zeros(self.R, device=V.device, dtype=V.dtype)
+        self.sigma_V = torch.full((self.R,), float('inf'), device=V.device, dtype=V.dtype)
         if density_smooth:
             for r in range(self.R):
                 v = V[..., r]; typ = v[v > 0.5 * v.max()].median() if float(v.max()) > 0 else torch.ones(())
-                self.smooth_V[r] = 1.0 / float(DENSITY_SMOOTH_REL * typ) ** 2
+                self.sigma_V[r] = float(DENSITY_SMOOTH_REL * typ)
+                self.smooth_V[r] = vs / float(DENSITY_SMOOTH_REL * typ) ** 2
         self.elastic = elastic if (elastic is not None and self.C == 6) else None
-        self.eq_w = 1.0 / eq_sd ** 2
+        self.eq_w = vs / eq_sd ** 2
+        self._wts = None
         self.cg_iters = cg_iters
         self.damp = 1e-3
         self.sync()
@@ -347,6 +361,55 @@ class TomoFit:
             out.narrow(d, 0, n - 1).sub_(df); out.narrow(d, 1, n - 1).add_(df)
         return out
 
+    def _dens_wts(self, V):
+        """Per-axis neighbour weights of the q-GGMRF density prior at V (its surrogate curvature rho'(d) / d per
+        neighbour pair), or None for the quadratic prior."""
+        if self.density_prior == 'quadratic' or not bool(torch.isfinite(self.sigma_V).any()):
+            return None
+        from mbirtorch.qggmrf import b_tilde_by_definition
+        out = []
+        for d in range(3):
+            df = V.diff(dim=d)
+            w = torch.stack([2 * b_tilde_by_definition(df[..., r], float(self.sigma_V[r]), QGGMRF_P, QGGMRF_Q, QGGMRF_T)
+                             if torch.isfinite(self.sigma_V[r]) else torch.zeros_like(df[..., r]) for r in range(self.R)], -1)
+            out.append(self.voxel_scale * w)
+        return out
+
+    def dens_lap(self, x, wts):
+        """The density prior's curvature (or, at x = V, its gradient) applied to x: a Laplacian, weighted per pair."""
+        if wts is None:
+            return self.smooth_V * self.laplacian(x)
+        out = torch.zeros_like(x)
+        for d in range(3):
+            df = x.diff(dim=d) * wts[d]; k = x.shape[d]
+            out.narrow(d, 0, k - 1).sub_(df); out.narrow(d, 1, k - 1).add_(df)
+        return out
+
+    def dens_diag(self, wts):
+        """The diagonal of dens_lap: per voxel, the sum of its pairs' weights."""
+        if wts is None:
+            return 6 * self.smooth_V
+        out = torch.zeros(*wts[0].shape[:0], *self.V.shape, device=self.V.device, dtype=self.V.dtype)
+        for d in range(3):
+            k = self.V.shape[d]
+            out.narrow(d, 0, k - 1).add_(wts[d]); out.narrow(d, 1, k - 1).add_(wts[d])
+        return out
+
+    def _dens_prior_value(self, V):
+        if self.density_prior == 'quadratic':
+            sq = lambda X: sum((d.double() ** 2).sum((0, 1, 2)) for d in (X.diff(dim=0), X.diff(dim=1), X.diff(dim=2)))
+            return 0.5 * float((self.smooth_V.double() * sq(V)).sum())
+        tot = 0.0
+        for r in range(self.R):
+            sx = float(self.sigma_V[r])
+            if not np.isfinite(sx):
+                continue
+            for d in range(3):
+                a = V[..., r].diff(dim=d).double().abs().clamp_min(QGGMRF_T * sx * 1e-7)
+                ds = (a / (QGGMRF_T * sx)) ** (QGGMRF_Q - QGGMRF_P)
+                tot += float((a ** QGGMRF_P / (QGGMRF_P * sx ** QGGMRF_P) * ds / (1 + ds)).sum())
+        return self.voxel_scale * tot
+
     def _eq_mask(self):
         """Per material, the voxels whose six neighbours all hold the material (density above half its maximum)."""
         Vd = self.V
@@ -374,7 +437,7 @@ class TomoFit:
     def prior(self, V, E, mask=None):
         sq = lambda X: sum((d.double() ** 2).sum((0, 1, 2)) for d in (X.diff(dim=0), X.diff(dim=1), X.diff(dim=2)))
         tot = (self.lam_E * float((E.double() ** 2).sum()) + 0.5 * self.smooth_E * float(sq(E).sum())
-               + 0.5 * float((self.smooth_V.double() * sq(V)).sum()))
+               + self._dens_prior_value(V))
         if self.elastic is not None:
             mask = self._eq_mask() if mask is None else mask
             tot += 0.5 * self.eq_w * float((self._divergence(E, mask).double() ** 2).sum())
@@ -408,7 +471,8 @@ class TomoFit:
         eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]) \
             if self.elastic is not None else (lambda X: torch.zeros_like(X))
         bGW, bGU = self._back(G[:, :R], G[:, R:])
-        gV = bGW + (E * bGU).sum(-1) + self.smooth_V * self.laplacian(V)
+        self._wts = wts = self._dens_wts(V)
+        gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
         free = ~((V <= 0) & (gV > 0))                                               # V's active bound held
         fE = self.support_mask().expand_as(E)                                       # strain free inside the support
@@ -420,14 +484,14 @@ class TomoFit:
         bUU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dUU[:, :, None] * self.w_ray[:, None, :] ** 2).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
         bWU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dWU[:, :, None] * self.w_ray[:, None, :]).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
         eq_diag = 12.0 * self.eq_w if self.elastic is not None else 0.0          # rough scale of the equilibrium curvature
-        dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + 6 * self.smooth_V
+        dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + self.dens_diag(wts)
         dE_ = V[..., None] ** 2 * bUU + 2 * self.lam_E + 6 * self.smooth_E + eq_diag
 
         def H(xV, xE):
             zW, zU = self._fwd(xV, E * xV[..., None] + V[..., None] * xE)
             y = torch.einsum('pab,pb->pa', F, torch.cat([zW, zU], 1))
             bW, bU = self._back(y[:, :R], y[:, R:])
-            return ((bW + (E * bU).sum(-1) + self.smooth_V * self.laplacian(xV)) * free,
+            return ((bW + (E * bU).sum(-1) + self.dens_lap(xV, wts)) * free,
                     (V[..., None] * bU + 2 * self.lam_E * xE + self.smooth_E * self.laplacian(xE) + eq(xE)) * fE)
 
         for _ in range(6):
@@ -475,7 +539,7 @@ class TomoFit:
                            [..., R:].reshape(n, n, n, R, C) for k in range(C)], -2)              # (n, n, n, R, C, C)
         B = torch.zeros(n, n, n, R, 1 + C, 1 + C, device=V.device, dtype=V.dtype)
         EbUU = torch.einsum('xyzrk,xyzrkl->xyzrl', E, bUU)
-        B[..., 0, 0] = bWW + 2 * (E * bWU).sum(-1) + (EbUU * E).sum(-1) + 6 * self.smooth_V
+        B[..., 0, 0] = bWW + 2 * (E * bWU).sum(-1) + (EbUU * E).sum(-1) + self.dens_diag(self._wts)
         B[..., 0, 1:] = V[..., None] * (bWU + EbUU); B[..., 1:, 0] = B[..., 0, 1:]
         B[..., 1:, 1:] = V[..., None, None] ** 2 * bUU + (2 * self.lam_E + 6 * self.smooth_E) * torch.eye(C, device=V.device)
         if self.elastic is not None:
@@ -601,7 +665,8 @@ class TomoFit:
         eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]) \
             if self.elastic is not None else (lambda X: torch.zeros_like(X))
         bGW, bGU = self._back(G[:, :R], G[:, R:])
-        gV = bGW + (E * bGU).sum(-1) + self.smooth_V * self.laplacian(V)
+        self._wts = wts = self._dens_wts(V)
+        gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
         fV = ~((V <= 0) & (gV > 0)); fE = self.support_mask().expand_as(E)
         # the global parameters that move: informative and not held at a bound
@@ -625,7 +690,7 @@ class TomoFit:
         bUU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dUU[:, :, None] * self.w_ray[:, None, :] ** 2).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
         bWU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dWU[:, :, None] * self.w_ray[:, None, :]).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
         eq_diag = 12.0 * self.eq_w if self.elastic is not None else 0.0
-        dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + 6 * self.smooth_V
+        dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + self.dens_diag(wts)
         dE_ = V[..., None] ** 2 * bUU + 2 * self.lam_E + 6 * self.smooth_E + eq_diag
 
         def H(xV, xE, xg):
@@ -636,7 +701,7 @@ class TomoFit:
             if cross == 'ray':                      # the cross block applied on the same rays: no extra projections
                 y = y + torch.einsum('pan,n->pa', Cx, xgf)
             bW, bU = self._back(y[:, :R], y[:, R:])
-            hV = (bW + (E * bU).sum(-1) + self.smooth_V * self.laplacian(xV)) * fV
+            hV = (bW + (E * bU).sum(-1) + self.dens_lap(xV, wts)) * fV
             hE = (V[..., None] * bU + 2 * self.lam_E * xE + self.smooth_E * self.laplacian(xE) + eq(xE)) * fE
             if cross == 'ray':
                 hg = (Fg @ xg) + (all_sum(torch.einsum('pan,pa->n', Cx, z)) * fgf).double()
@@ -699,7 +764,8 @@ class TomoFit:
 
 def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2, chunk=1024, a_range=0.01,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
-           eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi'):
+           eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
+           density_prior='quadratic', voxel_scale=1.0):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -787,7 +853,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     C = 1 if weights is None else np.asarray(weights).shape[1]
     E0 = torch.zeros(*V.shape, C, device=device, dtype=V.dtype)
     return TomoFit(fit, proj, V, E0, weights=weights, density_smooth=density_smooth, elastic=elastic, eq_sd=eq_sd,
-                   cg_iters=cg_iters, support=support, precond=precond), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
+                   cg_iters=cg_iters, support=support, precond=precond, density_prior=density_prior,
+                   voxel_scale=voxel_scale), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
                                                            resolution=[float(v) for v in resolution])
 
 
