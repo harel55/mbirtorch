@@ -481,4 +481,4 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
         T = torch.poisson(dd * m / inflation, generator=gen) * inflation / dd
     return dict(T=T, lam=lam, dose_per_bin=d, angles=angles, mounts=mounts, offsets=offsets, V_true=V_true,
                 E_true=E_true, mu_true=mu0.cpu().numpy(), lamf=M.lamf.cpu().numpy(), g_true=g.cpu().numpy(),
-                holder_rows=holder_rows, n=n, inflation=inflation)
+                f_true=f.cpu().numpy(), holder_rows=holder_rows, n=n, inflation=inflation)
