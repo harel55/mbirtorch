@@ -644,8 +644,8 @@ class TomoFit:
     def recenter_strain(self):
         """Move each material's mean isotropic strain into its lattice parameter, so the strain is measured from the
         sample's mean lattice and carries no uniform offset. Use it after a volume step. The predicted data are unchanged
-        to second order in the strain. The lattice parameter stays fixed in the global steps; only this step moves it.
-        Returns the offsets moved, one per material."""
+        to second order in the strain. A pinned lattice parameter (equal bounds) moves with its bounds; a free one, fitted
+        by the global steps, moves within its bounds. Returns the offsets moved, one per material."""
         M, R, C = self.fit.M, self.R, self.C
         moved = []
         with torch.no_grad():
@@ -662,7 +662,11 @@ class TomoFit:
                     self.E[..., r, 0] -= d
                 ia = M.slices[r]['a']
                 a_new = float(self.fit.g[ia]) * (1 + d)
-                self.fit.g[ia] = a_new; M.lb[ia] = a_new; M.ub[ia] = a_new
+                if float(M.lb[ia]) == float(M.ub[ia]):
+                    M.lb[ia] = a_new; M.ub[ia] = a_new
+                else:
+                    a_new = min(max(a_new, float(M.lb[ia])), float(M.ub[ia]))
+                self.fit.g[ia] = a_new
                 moved.append(d)
         self.sync()
         return moved
