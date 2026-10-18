@@ -325,6 +325,9 @@ class TomoFit:
         self.elastic = elastic if (elastic is not None and self.C == 6) else None
         self.eq_w = vs / eq_sd ** 2
         self._wts = None
+        # hold_strain=True keeps the strain where it is (the volume steps move the density only), e.g. for the first
+        # iterations, so the spectrum and the density settle before the strain is fitted
+        self.hold_strain = False
         self.cg_iters = cg_iters
         self.damp = 1e-3
         self.sync()
@@ -475,7 +478,7 @@ class TomoFit:
         gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
         free = ~((V <= 0) & (gV > 0))                                               # V's active bound held
-        fE = self.support_mask().expand_as(E)                                       # strain free inside the support
+        fE = self.support_mask().expand_as(E) & (not self.hold_strain)              # strain free inside the support
         # Jacobi preconditioner from the ray Fisher diagonals (for the strain parts, each view's weight squared)
         dWW = torch.diagonal(F[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
         dWU = torch.diagonal(F[:, :R, R:], dim1=1, dim2=2)
@@ -668,7 +671,7 @@ class TomoFit:
         self._wts = wts = self._dens_wts(V)
         gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
-        fV = ~((V <= 0) & (gV > 0)); fE = self.support_mask().expand_as(E)
+        fV = ~((V <= 0) & (gV > 0)); fE = self.support_mask().expand_as(E) & (not self.hold_strain)
         # the global parameters that move: informative and not held at a bound
         gi = fit.g[idx]; lb, ub = M.lb[idx], M.ub[idx]
         d = torch.diagonal(Fg)
