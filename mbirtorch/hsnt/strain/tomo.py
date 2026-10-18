@@ -641,6 +641,32 @@ class TomoFit:
         apply(0.0); self.sync()
         return dict(alpha=0.0, loss_decrease=0.0, mounts=mounts())
 
+    def recenter_strain(self):
+        """Move each material's mean isotropic strain into its lattice parameter, so the strain is measured from the
+        sample's mean lattice and carries no uniform offset. Use it after a volume step. The predicted data are unchanged
+        to second order in the strain. The lattice parameter stays fixed in the global steps; only this step moves it.
+        Returns the offsets moved, one per material."""
+        M, R, C = self.fit.M, self.R, self.C
+        moved = []
+        with torch.no_grad():
+            for r in range(R):
+                V = self.V[..., r]
+                w = (V > 0.5 * V.max()).to(V.dtype) * V                         # the material's own voxels, density weighted
+                if float(w.sum()) <= 0:
+                    moved.append(0.0); continue
+                iso = self.E[..., r, :3].mean(-1) if C == 6 else self.E[..., r, 0]
+                d = float((w * iso).sum() / w.sum())
+                if C == 6:
+                    self.E[..., r, :3] -= d
+                else:
+                    self.E[..., r, 0] -= d
+                ia = M.slices[r]['a']
+                a_new = float(self.fit.g[ia]) * (1 + d)
+                self.fit.g[ia] = a_new; M.lb[ia] = a_new; M.ub[ia] = a_new
+                moved.append(d)
+        self.sync()
+        return moved
+
     def support_mask(self):
         """(n, n, n, R, 1): where each material's strain is free (its 3 x 3 x 3 mean density above SUPPORT_REL of the
         maximum), or everywhere without the support prior."""
