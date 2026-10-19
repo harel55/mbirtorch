@@ -376,13 +376,14 @@ def fe_cube_tensor(N):
     return cube, eps
 
 
-def fe_spectrum_model(lam, dose_per_bin, n, device='cpu'):
+def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', kernel_values=None):
     """A Hybrid2 model for bcc Fe on the axis lam and its parameter vector: Bragg heights j d, a smooth part, the
-    two-scale kernel, scaled so the attenuation per voxel at 3 Angstrom is FE_ATTEN_3A / n."""
+    resolution kernel, scaled so the attenuation per voxel at 3 Angstrom is FE_ATTEN_3A / n. kernel: the kernel's form
+    (model.Hybrid2); kernel_values: its 8 parameters (default: JOINT_KERNEL, a two-scale kernel)."""
     M = Hybrid2(lam, dose_per_bin, [(FE['lattice'], (FE['a'] * (1 - FE_A_RANGE), FE['a'] * (1 + FE_A_RANGE)))], n_spline=8, n_contam=2,
-                device=device, two_scale=True)
+                device=device, two_scale=True, kernel=kernel)
     g = torch.zeros(M.n_global, dtype=torch.float64, device=device)
-    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL if kernel_values is None else kernel_values, dtype=torch.float64)
     sl = M.slices[0]
     g[sl['a']] = FE['a']
     ns = M.mats[0]['ns'].cpu().numpy(); d = FE['a'] / np.sqrt(ns)
@@ -397,7 +398,7 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu'):
 
 
 def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, offsets=None, levels=31, fine=2, seed=1,
-                 device='cuda', axis=None, holder=True, contamination=True):
+                 device='cuda', axis=None, holder=True, contamination=True, kernel='two_scale', kernel_values=None):
     """Synthetic data shaped like the Fe cube measurement: a bcc Fe cube with a residual-stress strain tensor
     (fe_cube_tensor), seen by rotation series with their own mounts and a holder rod each.
 
@@ -409,7 +410,8 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     measured detector's correlated counts. The volume is generated on a grid `fine` times finer and the detector
     binned back to n x n. Rays are series-major, then (view, row, channel), as MultiProjector orders them.
     Returns a dict with T, lam, dose_per_bin, angles, mounts, offsets, V_true (n, n, n, 1), E_true (n, n, n, 1, 6),
-    the true spectrum, and holder_rows (the first detector row of the holder in each series)."""
+    the true spectrum, and holder_rows (the first detector row of the holder in each series). kernel, kernel_values:
+    the resolution kernel the data are generated with (see fe_spectrum_model)."""
     import mbirtorch
     from .geometry import series_weights
     from .tomo import MultiProjector, Projector, detector_directions
@@ -423,7 +425,7 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     else:
         lam, flux = np.asarray(axis[0]), np.asarray(axis[1])
     d = dose * flux / np.mean(flux)
-    M, g = fe_spectrum_model(lam, d, n, device)
+    M, g = fe_spectrum_model(lam, d, n, device, kernel=kernel, kernel_values=kernel_values)
     N = fine * n; V_ = len(angles); S = len(mounts)
     cube, et = fe_cube_tensor(N)
     wts = series_weights([((m[0], m[1], m[2]), angles) for m in mounts])         # (S views, 6)
