@@ -207,6 +207,10 @@ def _projected_newton_rows(V, grad, F, row_loss, cap=None):
 
 
 # ================================================================================================ stage B
+IC_OVERSAMPLE = 4          # the Ikeda-Carpenter kernel's offset grid: this many points per fine wavelength bin
+IC_MARGIN = 20             # fine bins of offset grid beyond the band on each side
+
+
 def bin_intervals(lam):
     lam = np.asarray(lam, dtype=np.float64)
     d = np.diff(lam); med = np.median(d)
@@ -308,6 +312,12 @@ class Hybrid2:
             # R(lam) = exp(-(lam_R / lam)^2), storage decay t_s (constant in time, so in wavelength)
             lb[self.res_sl[0] + 4], ub[self.res_sl[0] + 4] = 0.0, 10.0
             lb[self.res_sl[0] + 5], ub[self.res_sl[0] + 5] = 0.002, 0.04
+        if kernel == "ikeda_carpenter":
+            # slots (s0, s1, a0, a1, lam_R, t_s): Gaussian sqrt(s0^2 + (s1 lam)^2); the moderator's slowing-down pulse
+            # gamma-shaped, x^2 exp(-x / tau) with tau = a0 + a1 lam; its storage part an exponential of length t_s with
+            # the share R = exp(-(lam_R / lam)^2) (Ikeda and Carpenter 1985), all in wavelength units
+            lb[self.res_sl[0]:self.res_sl[0] + 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.002]
+            ub[self.res_sl[0]:self.res_sl[0] + 6] = [0.006, 0.002, 0.01, 0.004, 10.0, 0.04]
         lb[self.kap_sl[0]:self.kap_sl[1]] = 0.0
         self.lb = torch.as_tensor(lb, **f64); self.ub = torch.as_tensor(ub, **f64)
 
@@ -381,6 +391,8 @@ class Hybrid2:
     def band(self, g):
         """Banded operator values (K, bw), float64, rows normalized."""
         s0, s1, t0, t1, wb, sb, b1, w1 = [g[self.res_sl[0] + i] for i in range(8)]
+        if self.kernel == "ikeda_carpenter":
+            return self._band_ikeda_carpenter(s0, s1, t0, t1, wb, sb)
         lamj = self.lamf[self.band_idx]                                               # (K, bw)
         sigma = torch.sqrt(s0 * s0 + (s1 * lamj) ** 2).clamp_min(1e-6)
         tau = (t0 + t1 * lamj).clamp_min(1e-7)
@@ -400,6 +412,47 @@ class Hybrid2:
         broad = 0.5 * (torch.erf((self.lam_hi[:, None] - lamj) / (math.sqrt(2.0) * sbc))
                        - torch.erf((self.lam_lo[:, None] - lamj) / (math.sqrt(2.0) * sbc)))
         Rb = ((1 - wb) * core + wb * broad).clamp_min(0) * self.phi[self.band_idx] * self.band_valid
+        return Rb / Rb.sum(1, keepdim=True).clamp_min(1e-30)
+
+    def _band_ikeda_carpenter(self, s0, s1, a0, a1, lam_R, t_s):
+        """The Ikeda-Carpenter kernel: for each fine wavelength, the distribution of the measured minus the true
+        wavelength is a Gaussian convolved with the moderator's emission (a gamma-shaped slowing-down pulse, and its
+        convolution with an exponential storage decay, mixed with the storage share), built from its exact Fourier
+        transform on an offset grid IC_OVERSAMPLE times finer than the wavelength grid, centred on its median, and
+        integrated over each data bin."""
+        dx = self.hf / IC_OVERSAMPLE
+        lo = (self.BAND[0] - IC_MARGIN) * self.hf; n = int(round((self.BAND[1] - self.BAND[0] + 2 * IC_MARGIN) * self.hf / dx))
+        x = lo + dx * torch.arange(n, device=self.dev, dtype=torch.float64)          # measured - true wavelength
+        nfft = 2 * n
+        w = 2 * math.pi * torch.fft.rfftfreq(nfft, d=dx).to(self.dev)                  # angular frequency
+        lamf = self.lamf[:, None]
+        sigma = torch.sqrt(s0 * s0 + (s1 * lamf) ** 2).clamp_min(1e-6)
+        tau = (a0 + a1 * lamf).clamp_min(1e-7)
+        R = torch.exp(-(lam_R / lamf) ** 2)
+        iw = 1j * w[None, :]
+        emit = (1 + iw * tau) ** -3 * ((1 - R) + R / (1 + iw * t_s.clamp_min(1e-7)))
+        ft = emit * torch.exp(-0.5 * (sigma * w[None, :]) ** 2) * torch.exp(iw * lo)    # samples from the grid's start
+        pdf = torch.fft.irfft(ft, n=nfft, dim=1)[:, :n] / dx                           # (Kf, n), a density on x
+        cdf = torch.cumsum(pdf, 1) * dx
+        cdf = cdf / cdf[:, -1:].clamp_min(1e-30)
+        with torch.no_grad():                                                           # the median, held fixed for derivatives
+            j = torch.searchsorted(cdf.detach().contiguous(), torch.full((cdf.shape[0], 1), 0.5, device=self.dev, dtype=torch.float64))
+            j = j.clamp(1, n - 1)
+            c0 = cdf.gather(1, j - 1); c1 = cdf.gather(1, j)
+            med = (x[j - 1] + dx * (0.5 - c0) / (c1 - c0).clamp_min(1e-30))[:, 0]       # (Kf,)
+
+        flat = cdf.reshape(-1)
+
+        def at(xq, rows):                                                              # cdf of fine rows at offsets xq
+            t = ((xq - lo) / dx).clamp(0, n - 1 - 1e-9)
+            i0 = t.floor().long(); f = t - i0
+            base = rows * n
+            return (1 - f) * flat[base + i0] + f * flat[base + (i0 + 1).clamp(max=n - 1)]
+        lamj = self.lamf[self.band_idx]
+        medj = med[self.band_idx]
+        hi = at(self.lam_hi[:, None] - lamj + medj, self.band_idx)
+        loc = at(self.lam_lo[:, None] - lamj + medj, self.band_idx)
+        Rb = (hi - loc).clamp_min(0) * self.phi[self.band_idx] * self.band_valid
         return Rb / Rb.sum(1, keepdim=True).clamp_min(1e-30)
 
     def sparse(self, Rb, dtype=None):

@@ -26,7 +26,7 @@ TEXTURE_START = (1.0, 0.5)              # March-Dollase r (1 = random powder) an
 
 
 def fit_open_beam_kernel(counts, lam, material=AL, exclude=(), gaps=(), window_half=WINDOW_HALF, device='cpu',
-                         kernel_start=KERNEL_START, edge_slope=True, texture=False):
+                         kernel_start=KERNEL_START, edge_slope=True, texture=False, broad=True, fit_kernel=True):
     """Fit the resolution kernel to the window-material Bragg edges in an open-beam spectrum.
 
     counts: the open beam's counts per wavelength bin, summed over the detector (and observations); lam: the bins'
@@ -34,7 +34,9 @@ def fit_open_beam_kernel(counts, lam, material=AL, exclude=(), gaps=(), window_h
     to leave out (other materials' edges, artifacts). gaps: bin indices after which the wavelength axis jumps (the
     windows do not cross them). Each window around an edge gets its own baseline (exp of a cubic); the edges' heights,
     the material's lattice parameter and the kernel are shared. With edge_slope, each edge also gets a slope below
-    it; with texture, the material gets a texture (March-Dollase), as rolled window foils have. Returns a dict: kernel (the 8 kernel parameters of
+    it; with texture, the material gets a texture (March-Dollase), as rolled window foils have. broad=False fits the
+    kernel's core only (its broad component's weight held at zero). fit_kernel=False holds the kernel at kernel_start
+    (to test a kernel from another measurement against these edges). Returns a dict: kernel (the 8 kernel parameters of
     model.Hybrid2), lattice (the fitted lattice parameter: the wavelength scale's check), heights, windows, the reduced
     chi-square per window, and the model and data in the windows."""
     lam = np.asarray(lam, dtype=np.float64); counts = np.asarray(counts, dtype=np.float64)
@@ -79,6 +81,9 @@ def fit_open_beam_kernel(counts, lam, material=AL, exclude=(), gaps=(), window_h
         g0[sl['x'][0]] = TEXTURE_START[0]; g0[sl['x'][0] + 1] = TEXTURE_START[1]
     free = lambda lo, hi: [i for i in range(lo, hi) if float(M.ub[i]) > float(M.lb[i])]
     res_free = free(*M.res_sl)
+    if not broad:
+        g0[M.res_sl[0] + 4] = 0.0
+        res_free = [i for i in res_free if i not in (M.res_sl[0] + 4, M.res_sl[0] + 5)]
     n_k = len(res_free)
     gl_free = res_free + [sl['a']] + free(*sl['h']) + free(*sl['t']) + free(*sl['x'])
     gl_free_t = torch.as_tensor(gl_free, device=device)
@@ -163,7 +168,8 @@ def fit_open_beam_kernel(counts, lam, material=AL, exclude=(), gaps=(), window_h
     if n_shape:
         stage[n_gl - n_shape:n_gl] = True
         p = lm(p, stage, LM_ITERS)
-    p = lm(p, torch.ones_like(stage), LM_ITERS)
+    if fit_kernel:
+        p = lm(p, torch.ones_like(stage), LM_ITERS)
     g_fit = g0.clone(); g_fit[gl_free_t] = p[:len(gl_free)]
     kernel = g_fit[M.res_sl[0]:M.res_sl[1]]
     with torch.no_grad():

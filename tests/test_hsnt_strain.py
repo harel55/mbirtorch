@@ -57,3 +57,18 @@ def test_density_prior_gradient(prior):
         Vp, Vm = V.clone(), V.clone(); Vp[idx] += h; Vm[idx] -= h
         num = (tf._dens_prior_value(Vp) - tf._dens_prior_value(Vm)) / (2 * h)
         assert abs(float(g[idx]) - num) <= 1e-5 * max(1.0, abs(num))
+
+
+def test_ikeda_carpenter_kernel():
+    """The Ikeda-Carpenter kernel's rows are normalized and a sharp edge keeps its 50% point (median centring)."""
+    from mbirtorch.hsnt.strain.model import Hybrid2
+    lam = np.linspace(1.9, 4.41, 1400)
+    M = Hybrid2(lam, np.ones_like(lam), [('fcc', (3.52 * 0.99, 3.52 * 1.01))], n_spline=4, n_contam=1, device='cpu',
+                two_scale=True, kernel='ikeda_carpenter')
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[0] + 6] = torch.tensor([0.0, 0.0008, 0.001, 0.0004, 1.6, 0.004], dtype=torch.float64)
+    Rb = M.band(g)
+    assert torch.allclose(Rb.sum(1), torch.ones(Rb.shape[0], dtype=torch.float64), atol=1e-9)
+    for e in (2.5, 3.5):
+        T = (Rb * (M.lamf > e).double()[M.band_idx]).sum(1).numpy()
+        assert abs(lam[np.argmin(np.abs(T - 0.5))] - e) < 2 * (lam[1] - lam[0])
