@@ -798,7 +798,7 @@ class TomoFit:
 def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2, chunk=1024, a_range=0.01,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
-           density_prior='quadratic', voxel_scale=1.0):
+           density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -806,7 +806,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     inflation is the variance inflation of the counts (count correlation; it scales the contamination thresholds);
     density_smooth adds the density smoothness prior. weights (views, C) select the strain model (None: a scalar
     dilation; beam_geometry tensor weights: the strain tensor) and elastic the equilibrium prior (see TomoFit).
-    ray_mask (rays,) bool leaves the rays where it is False out of the reconstruction and the likelihood (FitB)."""
+    ray_mask (rays,) bool leaves the rays where it is False out of the reconstruction and the likelihood (FitB).
+    kernel: the resolution kernel's form (model.Hybrid2); kernel_values: its 8 parameters from a calibration (for
+    example on a Ni cylinder), held fixed; None fits the kernel from the warm start's estimate."""
     from mbirtorch import hsnt
     R = len(lattices)
     if ray_mask is None:
@@ -842,9 +844,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     targets = np.stack(targets)
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
-    M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True)
+    M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True, kernel=kernel)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    if kernel_values is not None:                       # a calibrated kernel, held fixed
+        kv = torch.as_tensor(np.asarray(kernel_values, dtype=np.float64), device=device)
+        g[M.res_sl[0]:M.res_sl[1]] = kv; M.lb[M.res_sl[0]:M.res_sl[1]] = kv; M.ub[M.res_sl[0]:M.res_sl[1]] = kv
     mu_bar = float(np.mean(targets))
     for j in range(M.J):
         for r in range(M.R):

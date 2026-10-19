@@ -316,7 +316,7 @@ class Hybrid2:
             # slots (s0, s1, a0, a1, lam_R, t_s): Gaussian sqrt(s0^2 + (s1 lam)^2); the moderator's slowing-down pulse
             # gamma-shaped, x^2 exp(-x / tau) with tau = a0 + a1 lam; its storage part an exponential of length t_s with
             # the share R = exp(-(lam_R / lam)^2) (Ikeda and Carpenter 1985), all in wavelength units
-            lb[self.res_sl[0]:self.res_sl[0] + 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.002]
+            lb[self.res_sl[0]:self.res_sl[0] + 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0002]
             ub[self.res_sl[0]:self.res_sl[0] + 6] = [0.006, 0.002, 0.01, 0.004, 10.0, 0.04]
         lb[self.kap_sl[0]:self.kap_sl[1]] = 0.0
         self.lb = torch.as_tensor(lb, **f64); self.ub = torch.as_tensor(ub, **f64)
