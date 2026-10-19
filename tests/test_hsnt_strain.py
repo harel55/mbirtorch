@@ -72,3 +72,24 @@ def test_ikeda_carpenter_kernel():
     for e in (2.5, 3.5):
         T = (Rb * (M.lamf > e).double()[M.band_idx]).sum(1).numpy()
         assert abs(lam[np.argmin(np.abs(T - 0.5))] - e) < 2 * (lam[1] - lam[0])
+
+
+def test_traction_free_faces():
+    """A uniform uniaxial strain along x gives traction only on the faces normal to x; zero strain gives none."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    n = 6
+    tf = object.__new__(TomoFit)
+    tf.elastic = [(211e9, 0.29)]
+    inside = torch.zeros(n, n, n, 1, dtype=torch.bool); inside[1:-1, 1:-1, 1:-1] = True
+    tf._eq_inside = inside
+    E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
+    assert float(tf._traction(E).abs().max()) == 0.0
+    E[..., 0] = 1e-3 * inside[..., None].double()[..., 0]                          # exx inside the sample
+    t = tf._traction(E)[..., 0, :, :]                                               # (n, n, n, 3 normals, 3)
+    nu = 0.29; lam_, mu_ = nu / ((1 + nu) * (1 - 2 * nu)), 1 / (2 * (1 + nu))
+    x_face = t[2, 1, 2, 0]                                                          # volume axes (y, x, z): x = 1 is a face
+    assert abs(float(x_face[0]) - (lam_ + 2 * mu_) * 1e-3) < 1e-12 and float(x_face[1:].abs().max()) == 0.0
+    y_face = t[1, 2, 2, 1]                                                          # y face: normal (0, 1, 0)
+    assert abs(float(y_face[1]) - lam_ * 1e-3) < 1e-12                               # sigma_yy from the Poisson term
+    assert float(t[2, 2, 2].abs().max()) == 0.0                                     # an interior voxel

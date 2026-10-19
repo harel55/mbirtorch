@@ -286,8 +286,10 @@ class TomoFit:
 
     def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
                  eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi', density_prior='quadratic',
-                 voxel_scale=1.0):
-        """density_prior: 'quadratic' (a Gaussian prior on neighbour differences) or 'qggmrf' (edge-preserving: the
+                 voxel_scale=1.0, traction=False):
+        """traction=True adds traction-free faces to the equilibrium prior: on the voxels at the sample's faces, the
+        traction sigma . n / Young's modulus (n the outward normal) has the equilibrium prior's standard deviation.
+        density_prior: 'quadratic' (a Gaussian prior on neighbour differences) or 'qggmrf' (edge-preserving: the
         same for small differences, much weaker for large jumps, so sharp interfaces are kept). voxel_scale: the voxel
         size relative to the grid the prior strengths are set for; the smoothness and equilibrium weights scale with it
         and the weak strain ridge with its cube, as discretized integrals over the volume, so the priors mean the same
@@ -323,6 +325,7 @@ class TomoFit:
                 self.sigma_V[r] = float(DENSITY_SMOOTH_REL * typ)
                 self.smooth_V[r] = vs / float(DENSITY_SMOOTH_REL * typ) ** 2
         self.elastic = elastic if (elastic is not None and self.C == 6) else None
+        self.traction = bool(traction) and self.elastic is not None
         self.eq_w = vs / eq_sd ** 2
         self._wts = None
         # hold_strain=True keeps the strain where it is (the volume steps move the density only), e.g. for the first
@@ -417,11 +420,42 @@ class TomoFit:
         """Per material, the voxels whose six neighbours all hold the material (density above half its maximum)."""
         Vd = self.V
         inside = Vd > 0.5 * Vd.amax((0, 1, 2), keepdim=True)
+        self._eq_inside = inside                                                    # for the traction-free faces
         m = inside.clone()
         for d in range(3):
             m &= torch.roll(inside, 1, d) & torch.roll(inside, -1, d)
             m.narrow(d, 0, 1).zero_(); m.narrow(d, m.shape[d] - 1, 1).zero_()
         return m                                                                    # (n, n, n, R)
+
+    @staticmethod
+    def _stress(e, nu):
+        """Stress / Young's modulus from strain (isotropic elasticity), in COMPONENTS order xx, yy, zz, xy, yz, xz."""
+        lam_, mu_ = nu / ((1 + nu) * (1 - 2 * nu)), 1 / (2 * (1 + nu))
+        tr = e[..., 0] + e[..., 1] + e[..., 2]
+        return [lam_ * tr + 2 * mu_ * e[..., k] for k in range(3)] + [2 * mu_ * e[..., k] for k in (3, 4, 5)]
+
+    def _traction(self, E):
+        """Traction / Young's modulus on the sample's faces, (n, n, n, R, 3 normals, 3): for each volume axis, at the
+        inside voxels with an outside neighbour along it, the stress times that axis' unit normal."""
+        out = []
+        inside = self._eq_inside
+        for r, (Em, nu) in enumerate(self.elastic):
+            sxx, syy, szz, sxy, syz, sxz = self._stress(E[..., r, :], nu)
+            ins = inside[..., r]
+            faces = []
+            for ax, t in ((1, (sxx, sxy, sxz)), (0, (sxy, syy, syz)), (2, (sxz, syz, szz))):   # volume axes (y, x, z)
+                face = ins & ~(torch.roll(ins, 1, ax) & torch.roll(ins, -1, ax))
+                faces.append(torch.stack(t, -1) * face[..., None])
+            out.append(torch.stack(faces, -2))
+        return torch.stack(out, -3)
+
+    def _eq_residual(self, E, mask):
+        """The equilibrium prior's residual: div(sigma) / Young's modulus on the interior, and with traction=True the
+        face tractions, flattened per voxel."""
+        div = self._divergence(E, mask).reshape(*E.shape[:3], -1)
+        if not self.traction:
+            return div
+        return torch.cat([div, self._traction(E).reshape(*E.shape[:3], -1)], -1)
 
     def _divergence(self, E, mask):
         """div(sigma) / Young's modulus on the mask, (n, n, n, R, 3); volume axes (y, x, z), E in COMPONENTS order."""
@@ -443,7 +477,7 @@ class TomoFit:
                + self._dens_prior_value(V))
         if self.elastic is not None:
             mask = self._eq_mask() if mask is None else mask
-            tot += 0.5 * self.eq_w * float((self._divergence(E, mask).double() ** 2).sum())
+            tot += 0.5 * self.eq_w * float((self._eq_residual(E, mask).double() ** 2).sum())
         return tot
 
     def loss(self, V=None, E=None, mask=None):
@@ -471,7 +505,7 @@ class TomoFit:
         G, F = G.float(), F.float()
         V, E = self.V, self.E
         mask = self._eq_mask() if self.elastic is not None else None
-        eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]) \
+        eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._eq_residual(Y, mask), X)[1](self._eq_residual(X, mask))[0]) \
             if self.elastic is not None else (lambda X: torch.zeros_like(X))
         bGW, bGU = self._back(G[:, :R], G[:, R:])
         self._wts = wts = self._dens_wts(V)
@@ -558,7 +592,7 @@ class TomoFit:
                 blk = torch.zeros(C, C, device=V.device, dtype=V.dtype)
                 for k in range(C):
                     X = torch.zeros_like(E); X[j + (r, k)] = 1.0
-                    resp = self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]
+                    resp = self.eq_w * torch.func.vjp(lambda Y: self._eq_residual(Y, mask), X)[1](self._eq_residual(X, mask))[0]
                     blk[:, k] = resp[j + (r,)]
                 B[..., r, 1:, 1:] += mask[..., r, None, None].to(V.dtype) * blk
         # damping as in the Jacobi version, then the held unknowns' rows and columns replaced by the identity
@@ -695,7 +729,7 @@ class TomoFit:
         G, Fw = G.float(), Fw.float()
         V, E = self.V, self.E
         mask = self._eq_mask() if self.elastic is not None else None
-        eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._divergence(Y, mask), X)[1](self._divergence(X, mask))[0]) \
+        eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._eq_residual(Y, mask), X)[1](self._eq_residual(X, mask))[0]) \
             if self.elastic is not None else (lambda X: torch.zeros_like(X))
         bGW, bGU = self._back(G[:, :R], G[:, R:])
         self._wts = wts = self._dens_wts(V)
@@ -798,7 +832,8 @@ class TomoFit:
 def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2, chunk=1024, a_range=0.01,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
-           density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None):
+           density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
+           smooth_sd=STRAIN_SMOOTH_SD):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -808,7 +843,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     dilation; beam_geometry tensor weights: the strain tensor) and elastic the equilibrium prior (see TomoFit).
     ray_mask (rays,) bool leaves the rays where it is False out of the reconstruction and the likelihood (FitB).
     kernel: the resolution kernel's form (model.Hybrid2); kernel_values: its 8 parameters from a calibration (for
-    example on a Ni cylinder), held fixed; None fits the kernel from the warm start's estimate."""
+    example on a Ni cylinder), held fixed; None fits the kernel from the warm start's estimate. traction: traction-free faces in the
+    equilibrium prior (TomoFit); smooth_sd: the strain smoothness prior's standard deviation (None: no smoothness prior)."""
     from mbirtorch import hsnt
     R = len(lattices)
     if ray_mask is None:
@@ -892,8 +928,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     E0 = torch.zeros(*V.shape, C, device=device, dtype=V.dtype)
     return TomoFit(fit, proj, V, E0, weights=weights, density_smooth=density_smooth, elastic=elastic, eq_sd=eq_sd,
                    cg_iters=cg_iters, support=support, precond=precond, density_prior=density_prior,
-                   voxel_scale=voxel_scale), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
-                                                           resolution=[float(v) for v in resolution])
+                   voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
+                                                           resolution=[float(v) for v in resolution], traction=traction, smooth_sd=smooth_sd)
 
 
 def newton_step(F, g, rcond=1e-8):
