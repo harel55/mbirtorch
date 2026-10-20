@@ -237,7 +237,8 @@ def test_spike_phantom_equilibrium():
     away from the interfaces), the same three materials as voxels, and a largest strain component of SPIKE_PEAK."""
     from scipy import ndimage as nd
     from mbirtorch.hsnt.strain.phantom import spike_tensor, SPIKE_ELASTIC, SPIKE_MATERIALS, SPIKE_PEAK
-    N = 64
+    N = 96                                       # fine enough that finite differences of the 1/r^2 field near the hole
+    #                                              stay well under the tolerance (1.25% of a voxel's jump at 64)
     mat, eps = spike_tensor(N)
     assert all(int((mat == r).sum()) > 0 for r in range(3))
     assert abs(float(np.abs(eps).max()) - SPIKE_PEAK) < 1e-12
