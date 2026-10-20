@@ -197,7 +197,7 @@ def make(n=64, views=4, dose=50.0, levels=31, seed=1, device="cuda", contaminati
                 eps_t = torch.full((1, 3), 0.0, dtype=torch.float64, device=device); eps_t[0, r] = e_l
                 mu_l = M.spectra(g, eps_t)[0, r].float()                              # dilated spectrum (Kf,)
                 X += w[:, None] * mu_l[None, :]
-        n_t = M.apply_band(torch.exp(-X), M.sparse(M.band(g)))
+        n_t = M.apply_band(torch.exp(-X), M.band_matrix(M.band(g)))
         f = torch.zeros(2, M.K, device=device)
         if contamination:                                                         # spike at 2.638 A, bump to the gap
             k_spike = int(np.abs(lam - 2.638).argmin()); f[0, k_spike] = 0.04
@@ -324,7 +324,7 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
                     continue
                 eps_t = torch.zeros((1, 3), dtype=torch.float64, device=device); eps_t[0, r] = e_l
                 X += w[:, None] * M.spectra(g, eps_t)[0, r].float()[None, :]
-        n_t = M.apply_band(torch.exp(-X), M.sparse(M.band(g)))
+        n_t = M.apply_band(torch.exp(-X), M.band_matrix(M.band(g)))
         f = torch.zeros(2, M.K, device=device)
         if contamination:
             k_spike = int(np.abs(lam - 2.638).argmin()); f[0, k_spike] = 0.04
@@ -477,7 +477,7 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
             X += w[:, None] * M.spectra(g, eps_t)[0, 0].float()[None, :]
         mu0 = M.spectra(g)[0]
         X += torch.as_tensor(hold, dtype=torch.float32, device=device)[:, None] * float(HOLDER['atten'] * mu0.mean())
-        n_t = M.apply_band(torch.exp(-X), M.sparse(M.band(g)))
+        n_t = M.apply_band(torch.exp(-X), M.band_matrix(M.band(g)))
         f = torch.zeros(2, M.K, device=device)
         if contamination:
             k_spike = int(np.abs(lam - 2.638).argmin()); f[0, k_spike] = 0.04

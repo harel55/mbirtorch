@@ -515,10 +515,17 @@ class Hybrid2:
         Rb = (hi_c - lo_c).clamp_min(0) * self.phi[self.band_idx] * self.band_valid
         return Rb / Rb.sum(1, keepdim=True).clamp_min(1e-30)
 
+    def band_matrix(self, Rb, dtype=None):
+        """The band as a dense (K, Kf) matrix. A dense product is several times faster on a GPU than the sparse one
+        (the band covers about a sixth of the fine grid), and the matrix is small (K x Kf)."""
+        return self.sparse(Rb, dtype).to_dense()
+
     def apply_band(self, E, Rb):
-        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw) or its sparse matrix."""
-        S = Rb if Rb.layout == torch.sparse_csr else self.sparse(Rb, E.dtype)
-        return (S @ E.T).T
+        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw), its sparse matrix, or its dense matrix."""
+        if Rb.layout == torch.sparse_csr:
+            return (Rb @ E.T).T
+        S = Rb if Rb.shape == (self.K, self.Kf) else self.band_matrix(Rb, E.dtype)
+        return E @ S.T.to(E.dtype)
 
     def kappa(self, g):
         return g[self.kap_sl[0]:self.kap_sl[1]].reshape(self.J, self.R)
@@ -556,7 +563,7 @@ class FitB:
 
     def _state(self, g):
         M = self.M
-        return M.spectra(g).to(M.dt), M.sparse(M.band(g)), M.kappa(g).to(M.dt)
+        return M.spectra(g).to(M.dt), M.band_matrix(M.band(g)), M.kappa(g).to(M.dt)
 
     def mean(self, sl, g=None, W=None, f=None, eps=None, cache=None):
         M = self.M; g = self.g if g is None else g
@@ -670,7 +677,7 @@ class FitB:
                 return M.band(torch.cat([g0[:r0], res, g0[r1:]]))
             jb = torch.func.jacfwd(band_of)(g0[r0:r1])                                # (K, bw, 8)
             for q in range(r1 - r0):
-                dRb[q] = M.sparse(jb[..., q])
+                dRb[q] = M.band_matrix(jb[..., q])
         return cache, dmu, dRb
 
     def penalty_system(self, idx):
@@ -928,7 +935,7 @@ class FitB:
                 return M.band(torch.cat([g0[:r0], res, g0[r1:]]))
             jb = torch.func.jacfwd(band_of)(g0[r0:r1])                                # (K, bw, 8)
             for q in range(r1 - r0):
-                dRb[q] = M.sparse(jb[..., q])
+                dRb[q] = M.band_matrix(jb[..., q])
         grad = torch.zeros(len(idx), device=M.dev, dtype=torch.float64)
         F = torch.zeros(len(idx), len(idx), device=M.dev, dtype=torch.float64)
         P = self.T.shape[0]; gch = max(64, self.chunk // 4)
