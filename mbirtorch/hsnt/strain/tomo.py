@@ -486,16 +486,18 @@ class TomoFit:
         return [lam_ * tr + 2 * mu_ * e[..., k] for k in range(3)] + [2 * mu_ * e[..., k] for k in (3, 4, 5)]
 
     def _traction(self, E):
-        """Traction / Young's modulus on the sample's faces, (n, n, n, R, 3 normals, 3): for each volume axis, at the
-        inside voxels with an outside neighbour along it, the stress times that axis' unit normal."""
+        """Traction / Young's modulus on the sample's free faces, (n, n, n, R, 3 normals, 3): for each volume axis, at a
+        material's voxels with an empty neighbour along it (no material at all), the stress times that axis' unit
+        normal. A face against another material is bonded, not free, so it carries no traction condition."""
         out = []
         inside = self._eq_inside
+        occupied = inside.any(-1)
         for r, (Em, nu) in enumerate(self.elastic):
             sxx, syy, szz, sxy, syz, sxz = self._stress(E[..., r, :], nu)
             ins = inside[..., r]
             faces = []
             for ax, t in ((1, (sxx, sxy, sxz)), (0, (sxy, syy, syz)), (2, (sxz, syz, szz))):   # volume axes (y, x, z)
-                face = ins & ~(torch.roll(ins, 1, ax) & torch.roll(ins, -1, ax))
+                face = ins & ~(torch.roll(occupied, 1, ax) & torch.roll(occupied, -1, ax))
                 faces.append(torch.stack(t, -1) * face[..., None])
             out.append(torch.stack(faces, -2))
         return torch.stack(out, -3)

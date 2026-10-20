@@ -210,3 +210,23 @@ def test_material_mask_face_overshoot(method):
     m = tf.material_voxels()
     assert int((m & cube).sum()) >= 0.9 * int(cube.sum()) and int((m & ~cube).sum()) <= 0.1 * int(cube.sum())
     assert int(tf._eq_mask().sum()) >= 0.5 * 8 ** 3
+
+
+def test_traction_faces_bonded_interface():
+    """Two materials side by side: the faces they share are bonded and get no traction condition; their faces against
+    empty space do."""
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    n = 8
+    tf = object.__new__(TomoFit)
+    tf.elastic = [(211e9, 0.29), (117e9, 0.34)]
+    inside = torch.zeros(n, n, n, 2, dtype=torch.bool)
+    inside[2:6, 2:4, 2:6, 0] = True                                                 # material 0: x in [2, 4)
+    inside[2:6, 4:6, 2:6, 1] = True                                                 # material 1: x in [4, 6)
+    tf._eq_inside = inside
+    E = torch.zeros(n, n, n, 2, 6, dtype=torch.float64)
+    E[..., 0, 0] = 1e-3 * inside[..., 0].double(); E[..., 1, 0] = 1e-3 * inside[..., 1].double()
+    t = tf._traction(E)                                                             # (n, n, n, R, 3 normals, 3)
+    assert float(t[3, 3, 3, 0, 0].abs().max()) == 0.0                               # material 0 at the interface (x = 3)
+    assert float(t[3, 4, 3, 1, 0].abs().max()) == 0.0                               # material 1 at the interface (x = 4)
+    assert float(t[3, 2, 3, 0, 0].abs().max()) > 0.0                                # material 0's free face (x = 2)
+    assert float(t[3, 5, 3, 1, 0].abs().max()) > 0.0                                # material 1's free face (x = 5)
