@@ -134,21 +134,23 @@ def project(ind, angles):
     return out
 
 
-def spectra_model(lam, dose_per_bin, device='cpu'):
+def spectra_model(lam, dose_per_bin, device='cpu', materials=None):
     """A Hybrid2 instance for the three materials (on the measured axis), the parameter vector with the phantom's
-    heights / absorption / kernel, and the material scale factors. Used both to generate and to score."""
-    M = Hybrid2(lam, dose_per_bin, [(m['lattice'], (m['a'] * 0.99, m['a'] * 1.01)) for m in MATERIALS], n_spline=8,
+    heights / absorption / kernel, and the material scale factors. Used both to generate and to score. materials:
+    the scene's materials (default MATERIALS)."""
+    MATERIALS_ = MATERIALS if materials is None else materials
+    M = Hybrid2(lam, dose_per_bin, [(m['lattice'], (m['a'] * 0.99, m['a'] * 1.01)) for m in MATERIALS_], n_spline=8,
                 n_contam=2, device=device, two_scale=True)
     g = torch.zeros(M.n_global, dtype=torch.float64, device=device)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL, dtype=torch.float64)
-    for r, (m, sl) in enumerate(zip(MATERIALS, M.slices)):
+    for r, (m, sl) in enumerate(zip(MATERIALS_, M.slices)):
         g[sl['a']] = m['a']
         ns = M.mats[r]['ns'].cpu().numpy(); d = m['a'] / np.sqrt(ns)
         h = np.array(multiplicities(m['lattice'], ns), float) * d                       # j d (|F|^2 constant)
         g[sl['h'][0]:sl['h'][1]] = torch.as_tensor(h)
         g[sl['c'][0]] = 0.3; g[sl['c'][0] + 1] = 0.2                                     # constant + absorption
     lamf = M.lamf.cpu().numpy(); at3 = np.abs(lamf - 3.0).argmin()
-    for r, (m, sl) in enumerate(zip(MATERIALS, M.slices)):
+    for r, (m, sl) in enumerate(zip(MATERIALS_, M.slices)):
         # coherent part just below the longest-wavelength edge = 0.8 x the smooth part there (real metals keep a large
         # absorption + incoherent attenuation past the last edge), then the whole spectrum scaled to the target at 3 A
         with torch.no_grad():
@@ -239,8 +241,16 @@ if __name__ == '__main__':
     print('written')
 
 
+def blk_mat(mat, n, fine):
+    """The coarse material map (n, n, n): each coarse voxel's majority material on the fine grid (-1 empty)."""
+    counts = np.stack([(mat == r).reshape(n, fine, n, fine, n, fine).sum((1, 3, 5)) for r in range(int(mat.max()) + 1)], -1)
+    out = counts.argmax(-1).astype(np.int8)
+    out[counts.max(-1) * 2 <= fine ** 3] = -1
+    return out
+
+
 def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", contamination=True, voxel=None, fine=2,
-              tensor=False, series=('z',), axis=None):
+              tensor=False, series=('z',), axis=None, scene='ni_cu_al'):
     """Tomographic version of `make`: `views` parallel-beam views over [0, pi) through the package projector. The
     volume is built and projected on a grid `fine` times finer than the n^3 reconstruction grid, and the detector is
     binned back to n x n, so the data are not generated on the reconstruction grid. `voxel` is the attenuation scale
@@ -251,13 +261,17 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
     strain is the 3D tensor of strain_tensor: E_true is (n, n, n, 3 materials, 6 components, COMPONENTS order) and each
     view sees n . eps . n with n its beam direction (beam_geometry), projected exactly over strain levels view by view.
     series: the rotation axes measured, each with the same angles (beam_geometry.PERMS); rays are series-major.
-    A series about x or y sees the sample's other strain components, so three series see all six."""
+    A series about x or y sees the sample's other strain components, so three series see all six.
+    scene: 'ni_cu_al' (MATERIALS, strain_tensor) or 'spike' (SPIKE_MATERIALS, spike_tensor; tensor strain only)."""
     import mbirtorch
+    assert scene in ('ni_cu_al', 'spike'), scene
+    assert scene == 'ni_cu_al' or tensor, 'the spike phantom has a tensor strain only'
+    mats = MATERIALS if scene == 'ni_cu_al' else SPIKE_MATERIALS
     voxel = 2.56 / n if voxel is None else voxel
     lam, flux = default_axis() if axis is None else axis
     lam = np.asarray(lam); flux = np.asarray(flux) / np.mean(flux)
     d = dose * flux
-    M, g = spectra_model(lam, d, device)
+    M, g = spectra_model(lam, d, device, materials=mats)
     N = fine * n
     angles = np.linspace(0, np.pi, views, endpoint=False)
     blk = lambda a: a.reshape(n, fine, n, fine, n, fine).mean((1, 3, 5))
@@ -268,6 +282,10 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
         mat, eps = volume(N)                                                   # (z, y, x)
         mat = mat.transpose(1, 2, 0); eps = eps.transpose(1, 2, 0)            # projector layout (y, x, z)
         seen = [eps] * (S * views)                                             # every view sees the same scalar
+    elif scene == 'spike':
+        mat, et = spike_tensor(N)                                              # already (y, x, z, 6)
+        wts = series_weights([(ax, angles) for ax in series])
+        seen = [(et * w).sum(-1) for w in wts]
     else:
         mat, et = strain_tensor(N)
         mat = mat.transpose(1, 2, 0); et = et.transpose(1, 2, 0, 3)          # (y, x, z, 6)
@@ -337,7 +355,67 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
         mu0 = M.spectra(g).cpu().numpy()
     return dict(T=T, lam=lam, dose_per_bin=d, n=n, views=views, angles=angles, W_true=W_true, eps_bar=eps_bar,
                 V_true=V_true, E_true=E_true, voxel=voxel, mu_true=mu0, lamf=M.lamf.cpu().numpy(), g_true=g.cpu().numpy(),
-                f_true=f.cpu().numpy(), materials=MATERIALS)
+                f_true=f.cpu().numpy(), materials=mats, mat_true=blk_mat(mat, n, fine))
+
+
+# The spike phantom (user, 2026-10-20): a steel spike pressed through a copper washer into a nickel plate. Three
+# materials with distinct Bragg edges (bcc Fe and fcc Al would nearly coincide), bonded interfaces carrying a contact
+# pressure, curved faces off the voxel grid everywhere. Geometry in units of n about the volume's centre, z the spike's
+# axis; the plate is a disk so the press-fit (Lame) solution is exact.
+SPIKE_MATERIALS = [dict(name='Fe', lattice='bcc', a=2.8665, mu=0.90),
+                   dict(name='Cu', lattice='fcc', a=3.6149, mu=1.10),
+                   dict(name='Ni', lattice='fcc', a=3.5240, mu=1.00)]
+SPIKE_ELASTIC = dict(Fe=(211e9, 0.29), Cu=(117e9, 0.34), Ni=(200e9, 0.31))
+SPIKE = dict(radius=0.08, top=0.34, tip_start=-0.18, tip=-0.30,           # spike: cylinder, then a cone down to the tip
+             washer_outer=0.20, washer_z=(0.10, 0.18),                    # washer: annulus on top of the plate
+             plate_outer=0.30, plate_z=(-0.10, 0.10))                     # plate: disk
+SPIKE_PEAK = 1.5e-3                         # the largest strain component (sets the interference)
+
+
+def spike_tensor(N):
+    """Material index (N, N, N) (-1 empty; 0 Fe spike, 1 Cu washer, 2 Ni plate) and strain tensor (N, N, N, 6),
+    COMPONENTS order, in the projector layout (rows y, cols x, slices z). Press fit: the spike, radius a, sits in holes
+    of radius a with the same radial interference; in each contact zone (the washer's and the plate's thickness) the
+    contact pressure is p = delta / (a / E_h ((b^2 + a^2) / (b^2 - a^2) + nu_h) + a / E_s (1 - nu_s)), b the hub's outer
+    radius (Lame, plane stress through the thickness). The spike carries sigma_rr = sigma_tt = -p there and no stress
+    elsewhere; a hub carries sigma_rr = -p a^2 / (b^2 - a^2) (b^2 / r^2 - 1), sigma_tt = p a^2 / (b^2 - a^2)
+    (b^2 / r^2 + 1). This stress satisfies equilibrium, carries the contact pressure across each interface, and is
+    traction-free on every outer surface; delta is scaled so the largest strain component is SPIKE_PEAK."""
+    G = SPIKE
+    c = (N - 1) / 2.0
+    yy, xx, zz = np.meshgrid((np.arange(N) - c) / N, (np.arange(N) - c) / N, (np.arange(N) - c) / N, indexing='ij')
+    r = np.sqrt(xx ** 2 + yy ** 2); a = G['radius']
+    in_z = lambda zr: (zz >= zr[0]) & (zz < zr[1])
+    cone = np.where(zz < G['tip_start'], a * (zz - G['tip']) / (G['tip_start'] - G['tip']), a)
+    spike = (r < cone) & (zz >= G['tip']) & (zz < G['top'])
+    washer = (r >= a) & (r < G['washer_outer']) & in_z(G['washer_z'])
+    plate = (r >= a) & (r < G['plate_outer']) & in_z(G['plate_z'])
+    mat = -np.ones((N, N, N), np.int8); mat[spike] = 0; mat[washer] = 1; mat[plate] = 2
+    Es, nus = SPIKE_ELASTIC['Fe']
+
+    def pressure(hub, b, delta):
+        Eh, nuh = SPIKE_ELASTIC[hub]
+        return delta / (a / Eh * ((b * b + a * a) / (b * b - a * a) + nuh) + a / Es * (1 - nus))
+
+    def strains(srr, stt, E, nu):
+        err = (srr - nu * stt) / E; ett = (stt - nu * srr) / E; ezz = -nu * (srr + stt) / E
+        th = np.arctan2(yy, xx); cs, sn = np.cos(th), np.sin(th)
+        return np.stack([err * cs ** 2 + ett * sn ** 2, err * sn ** 2 + ett * cs ** 2, ezz, (err - ett) * sn * cs,
+                         np.zeros_like(err), np.zeros_like(err)], -1)
+
+    def field(delta):
+        eps = np.zeros((N, N, N, 6))
+        rr = np.maximum(r, 1e-9)
+        for hub, b, zr, sel in (('Cu', G['washer_outer'], G['washer_z'], washer), ('Ni', G['plate_outer'], G['plate_z'], plate)):
+            p = pressure(hub, b, delta); k = p * a * a / (b * b - a * a)
+            Eh, nuh = SPIKE_ELASTIC[hub]
+            e = strains(-k * (b * b / rr ** 2 - 1), k * (b * b / rr ** 2 + 1), Eh, nuh); eps[sel] = e[sel]
+            zone = spike & in_z(zr)
+            e = strains(-p * np.ones_like(r), -p * np.ones_like(r), Es, nus); eps[zone] = e[zone]
+        return eps
+
+    eps1 = field(1.0)
+    return mat, eps1 * (SPIKE_PEAK / np.abs(eps1).max())
 
 
 # The Fe cube phantom: one bcc Fe cube seen by three rotation series, each with its own mount and a holder rod.

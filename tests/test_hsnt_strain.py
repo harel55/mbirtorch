@@ -230,3 +230,29 @@ def test_traction_faces_bonded_interface():
     assert float(t[3, 4, 3, 1, 0].abs().max()) == 0.0                               # material 1 at the interface (x = 4)
     assert float(t[3, 2, 3, 0, 0].abs().max()) > 0.0                                # material 0's free face (x = 2)
     assert float(t[3, 5, 3, 1, 0].abs().max()) > 0.0                                # material 1's free face (x = 5)
+
+
+def test_spike_phantom_equilibrium():
+    """The spike phantom's press-fit strain gives a stress with zero divergence inside each part (finite differences,
+    away from the interfaces), the same three materials as voxels, and a largest strain component of SPIKE_PEAK."""
+    from scipy import ndimage as nd
+    from mbirtorch.hsnt.strain.phantom import spike_tensor, SPIKE_ELASTIC, SPIKE_MATERIALS, SPIKE_PEAK
+    N = 64
+    mat, eps = spike_tensor(N)
+    assert all(int((mat == r).sum()) > 0 for r in range(3))
+    assert abs(float(np.abs(eps).max()) - SPIKE_PEAK) < 1e-12
+    sig = np.zeros_like(eps)
+    for r, m in enumerate(SPIKE_MATERIALS):
+        E, nu = SPIKE_ELASTIC[m['name']]; lam_, mu_ = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+        sel = mat == r; tr = eps[..., :3].sum(-1)
+        for k in range(3):
+            sig[..., k] = np.where(sel, lam_ * tr + 2 * mu_ * eps[..., k], sig[..., k])
+        for k in (3, 4, 5):
+            sig[..., k] = np.where(sel, 2 * mu_ * eps[..., k], sig[..., k])
+    D = lambda a, ax: np.gradient(a, 1.0 / N, axis=ax)                        # volume axes (y, x, z)
+    sxx, syy, szz, sxy, syz, sxz = (sig[..., k] for k in range(6))
+    f = np.sqrt((D(sxx, 1) + D(sxy, 0) + D(sxz, 2)) ** 2 + (D(sxy, 1) + D(syy, 0) + D(syz, 2)) ** 2 + (D(sxz, 1) + D(syz, 0) + D(szz, 2)) ** 2)
+    jump = float(np.abs(sig).max()) * N                                        # a full stress jump over one voxel
+    for r in range(3):
+        interior = nd.binary_erosion(mat == r, iterations=2)
+        assert float(np.percentile(f[interior], 99)) < 1e-2 * jump
