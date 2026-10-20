@@ -51,6 +51,9 @@ def multiplicities(lattice, ns):
 
 # A global parameter whose Fisher information is below this fraction of the largest is held in the global step.
 INFO_FLOOR = 1e-12
+CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
+CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
+CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvature)
 
 
 def deviance_terms(m, T, d):
@@ -550,6 +553,14 @@ class FitB:
         self.z = norm.isf(alpha / (2 * model.K)) if z is None else z
         self.lam1 = torch.zeros_like(self.f); self.dispersion = 1.0
         self.history = []
+        # fisher_every > 1: the global step recomputes its Fisher information only every this many calls and uses the
+        # gradient alone in between (about 3 times cheaper; the steps are still accepted only if the loss falls).
+        # Not with a free resolution kernel, whose band enters the gradient without derivatives.
+        self.fisher_every = 1
+        self._fisher = None
+        # contamination_newton: the contamination step takes a full Newton step on the atom coefficients
+        # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
+        self.contamination_newton = False
 
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask."""
@@ -764,6 +775,11 @@ class FitB:
         self.freeze_threshold = False
 
     def contamination_atoms_step(self, iters=4):
+        """One step on the contamination atoms' coefficients c (f = c A^T), with the L1 thresholds lam_c and c >= 0.
+        The default step uses each atom's own curvature only. The atoms overlap (single bins and bumps of several
+        widths), so that step overshoots and is halved repeatedly, and the contamination converges slowly. With
+        contamination_newton, the step minimizes the full quadratic model in all atoms of all components (the bin-wise
+        Fisher information, including the coupling between the components) by FISTA, then takes the same line search."""
         M = self.M; J = M.J
         if not J:
             return
@@ -771,7 +787,7 @@ class FitB:
             self.build_atoms()
         cache = self._state(self.g)
         grad = torch.zeros(M.K, J, device=M.dev, dtype=torch.float64)
-        Fd = torch.zeros(M.K, J, device=M.dev, dtype=torch.float64)
+        Fx = torch.zeros(M.K, J, J, device=M.dev, dtype=torch.float64)
         Fi0 = torch.zeros(M.K, J, device=M.dev, dtype=torch.float64)
         pear = 0.0
         with torch.no_grad():
@@ -781,21 +797,25 @@ class FitB:
                 mm = m.clamp_min(1e-12)
                 Dm = beta[:, None, :] - n[:, :, None]
                 grad += torch.einsum('pk,pkj->kj', self.dose(sl) * (1 - T / mm), Dm).double()
-                Fd += torch.einsum('pk,pkj->kj', self.dose(sl) / mm, Dm * Dm).double()
+                Fx += torch.einsum('pk,pka,pkb->kab', self.dose(sl) / mm, Dm, Dm).double()
                 # the price of a unit share: the score's standard deviation at f = 0 against a fixed reference
                 # contrast, a fully penetrating contaminant (beta = 1), so a contaminant that imitates the neutrons
                 # (beta near n, a vanishing score variance) is not free
                 Fi0 += (self.dose(sl) / n.clamp_min(1e-12) * (1 - n) ** 2).sum(0).double()[:, None].expand(-1, J)
                 pear += float((self.dose(sl) * (T - m) ** 2 / mm).sum(dtype=torch.float64))
-        all_sum(grad); all_sum(Fd); all_sum(Fi0); pear = all_sum_float(pear, M.dev)
+        all_sum(grad); all_sum(Fx); all_sum(Fi0); pear = all_sum_float(pear, M.dev)
+        Fd = torch.diagonal(Fx, dim1=1, dim2=2)
         self.dispersion = pear / self.n_points
         A = self.A.double()
         if not (self.freeze_threshold and hasattr(self, "lam_c")):
             self.lam_c = (self.z_atoms * torch.sqrt(self.dispersion * self.inflation * ((A * A).T @ Fi0))).T.to(M.dt)   # (J, n_atoms)
         gc = (A.T @ grad).T                                                           # (J, n_atoms)
-        Hc = ((A * A).T @ Fd).T.clamp_min(1e-30)
         c_old = self.c.double()
-        c_new = (c_old - (gc + self.lam_c.double()) / Hc).clamp_min(0)
+        if self.contamination_newton:
+            c_new = self._contamination_newton(A, gc, Fx, c_old)
+        else:
+            Hc = ((A * A).T @ Fd).T.clamp_min(1e-30)
+            c_new = (c_old - (gc + self.lam_c.double()) / Hc).clamp_min(0)
         l0 = self.loss_c(self.c)
         for _ in range(10):
             if self.loss_c(c_new.to(M.dt)) <= l0:
@@ -804,6 +824,26 @@ class FitB:
         self.f = (self.c @ self.A.T)
         tot = self.f.sum(0)
         self.f = torch.where(tot[None] > 0.99, self.f * (0.99 / tot.clamp_min(1e-30))[None], self.f)
+
+    def _contamination_newton(self, A, gc, Fx, c0):
+        """The minimizer over c >= 0 of the contamination loss's quadratic model at c0 plus the L1 thresholds, by FISTA:
+        gradient gc (J, n_atoms), bin-wise Fisher information Fx (K, J, J)."""
+        J, na = gc.shape
+        H = torch.zeros(J * na, J * na, device=A.device, dtype=torch.float64)
+        for a in range(J):
+            for b in range(J):
+                H[a * na:(a + 1) * na, b * na:(b + 1) * na] = A.T @ (Fx[:, a, b, None] * A)
+        g, lam, c0 = gc.reshape(-1), self.lam_c.double().reshape(-1), c0.reshape(-1)
+        v = torch.ones_like(c0)
+        for _ in range(CONTAM_POWER_ITERS):
+            v = H @ v; v = v / v.norm().clamp_min(1e-300)
+        L = CONTAM_STEP_MARGIN * float(v @ (H @ v)) + 1e-300
+        x = c0.clone(); y = x.clone(); t = 1.0
+        for _ in range(CONTAM_INNER_ITERS):
+            x_new = (y - (g + H @ (y - c0) + lam) / L).clamp_min(0)
+            t_new = 0.5 * (1 + math.sqrt(1 + 4 * t * t))
+            y = x_new + ((t - 1) / t_new) * (x_new - x); x, t = x_new, t_new
+        return x.reshape(J, na)
 
     def loss_c(self, c):
         f = c @ self.A.T
@@ -892,7 +932,9 @@ class FitB:
         idx = [i for i in idx if float(M.ub[i]) > float(M.lb[i])]                     # fixed parameters stay out
         if not idx:
             return self.loss(), damping
-        grad, F = self.global_system(idx) if system is None else system
+        if system is None:
+            system = self._lagged_system(idx)
+        grad, F = system
         g0 = self.g.clone()
         l0 = self.loss()
         lam_ = damping
@@ -912,6 +954,40 @@ class FitB:
                 return l1, max(lam_ / 3, 1e-9)
             lam_ *= 10
         return l0, lam_
+
+    def _lagged_system(self, idx):
+        """The global step's gradient and Fisher information: both recomputed every fisher_every calls (and whenever the
+        free parameters change), the gradient alone in between with the last Fisher information."""
+        M = self.M
+        res_free = any(M.res_sl[0] <= i < M.res_sl[1] for i in idx)
+        lag = self._fisher
+        if self.fisher_every <= 1 or res_free or lag is None or lag[0] != idx or lag[2] % self.fisher_every == 0:
+            grad, F = self.global_system(idx)
+            self._fisher = (list(idx), F, 1)
+            return grad, F
+        self._fisher = (lag[0], lag[1], lag[2] + 1)
+        return self.global_grad(idx), lag[1]
+
+    def global_grad(self, idx):
+        """The gradient of the loss (with the spline penalty) for the global parameters idx, by automatic
+        differentiation: about two loss evaluations, against one Jacobian per parameter for global_system. The
+        resolution kernel must be held fixed (its band enters without derivatives)."""
+        M = self.M
+        assert not any(M.res_sl[0] <= i < M.res_sl[1] for i in idx), 'global_grad holds the resolution kernel fixed'
+        gp = self.g.clone().requires_grad_(True)
+        with torch.no_grad():
+            band = M.band_matrix(M.band(self.g))
+        grad = torch.zeros_like(self.g)
+        for sl in self.chunks():
+            cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
+            m = self.mean(sl, g=gp, cache=cache)[0]
+            dv = deviance_terms(m, self.T[sl], self.dose(sl)).sum(dtype=torch.float64)
+            grad += torch.autograd.grad(dv, gp)[0]
+        all_sum(grad)
+        pen = self.spline_penalty(gp)
+        if torch.is_tensor(pen):
+            grad += torch.autograd.grad(pen, gp)[0]
+        return grad[idx].detach()
 
     def global_system(self, idx):
         """Gradient and Fisher information (with the spline penalty's exact Hessian) of the loss for the global

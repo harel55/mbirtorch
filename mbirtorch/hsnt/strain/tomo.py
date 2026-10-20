@@ -297,9 +297,11 @@ class TomoFit:
         self.fit = fit
         assert density_prior in ('quadratic', 'qggmrf'), density_prior
         self.density_prior, self.voxel_scale = density_prior, float(voxel_scale)
-        # the volume solves' preconditioner: 'jacobi' (each unknown's diagonal) or 'block' (per voxel and material, the
-        # inverse of the (1 + C) x (1 + C) block coupling its density and strain components)
-        assert precond in ('jacobi', 'block'), precond
+        # the volume solves' preconditioner: 'jacobi' (each unknown's diagonal), 'block' (per voxel and material, the
+        # inverse of the (1 + C) x (1 + C) block coupling its density and strain components), or 'fft' (Jacobi on the
+        # densities; for the strain, the exact inverse of a translation-invariant stand-in for its Hessian block, applied
+        # by FFT: use it with the equilibrium prior, whose stiff coupling of neighbouring voxels slows the others)
+        assert precond in ('jacobi', 'block', 'fft'), precond
         self.precond = precond
         # support=True: MONSTR's support prior in place of the weak strain ridge (strain held at 0 outside the sample)
         self.support = support
@@ -534,8 +536,12 @@ class TomoFit:
         for _ in range(6):
             lam_ = self.damp
             pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
-            prec = self._block_preconditioner(F, lam_, dV_, dE_, free, fE, mask) if self.precond == 'block' \
-                else (lambda rV, rE: (rV / pV, rE / pE))
+            if self.precond == 'block':
+                prec = self._block_preconditioner(F, lam_, dV_, dE_, free, fE, mask)
+            elif self.precond == 'fft':
+                prec = self._fft_preconditioner(F, lam_, pV, dE_, free, fE)
+            else:
+                prec = lambda rV, rE: (rV / pV, rE / pE)
             bV, bE = -gV * free, -gE * fE
             xV, xE = torch.zeros_like(V), torch.zeros_like(E)
             rV, rE = bV.clone(), bE.clone()
@@ -561,6 +567,51 @@ class TomoFit:
                     return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l1
             self.damp *= 10
         return float('nan'), 0.0
+
+    def _prior_symbol(self):
+        """(n, n, n, R, C, C) complex: the Fourier symbol of the strain priors' Hessian (the weak ridge, the smoothness
+        prior, and the equilibrium prior with its mask taken as everywhere, where its operator is periodic), from its
+        responses to unit impulses at the volume's centre. The traction-free faces are left out (faces only)."""
+        R, C, V = self.R, self.C, self.V
+        n = V.shape[0]; c = (n // 2,) * 3
+        full = torch.ones(n, n, n, R, dtype=torch.bool, device=V.device)
+        div = lambda Y: self._divergence(Y, full).reshape(*Y.shape[:3], -1)
+        out = torch.zeros(n, n, n, R, C, C, dtype=torch.complex128, device=V.device)
+        for r in range(R):
+            for k in range(C):
+                X = torch.zeros(n, n, n, R, C, device=V.device, dtype=V.dtype); X[c + (r, k)] = 1.0
+                resp = 2 * self.lam_E * X + self.smooth_E * self.laplacian(X)
+                if self.elastic is not None:
+                    resp = resp + self.eq_w * torch.func.vjp(div, X)[1](div(X))[0]
+                resp = torch.roll(resp[..., r, :], shifts=tuple(-v for v in c), dims=(0, 1, 2)).double()
+                out[..., r, :, k] = torch.fft.fftn(resp, dim=(0, 1, 2))
+        return out
+
+    def _fft_preconditioner(self, F, lam_, pV, dE_, fV, fE):
+        """The 'fft' preconditioner: Jacobi (pV) on the densities; on the strain, per spatial frequency, the inverse of
+        the priors' exact Fourier symbol plus the data's strain block (the ray Fisher information through each view's
+        weights) averaged over the material's voxels, plus the damping. The equilibrium prior is stiff and couples the
+        components of neighbouring voxels, so a diagonal preconditioner leaves its smooth modes to converge slowly.
+        Returns z = P(rV, rE)."""
+        R, C, V = self.R, self.C, self.V
+        n = V.shape[0]; P_ = F.shape[0]; w = self.w_ray
+        dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
+        bUU = torch.stack([self.proj.back(torch.cat([torch.zeros(P_, R, device=V.device), (dUU[:, :, None] * (w[:, k:k + 1] * w)[:, None, :]).reshape(P_, R * C)], 1))
+                           [..., R:].reshape(n, n, n, R, C) for k in range(C)], -2)              # (n, n, n, R, C, C)
+        sym = self._prior_symbol()
+        for r in range(R):
+            ins = V[..., r] > 0.5 * V[..., r].max()
+            if not bool(ins.any()):
+                continue
+            B = (V[..., r, None, None] ** 2 * bUU[..., r, :, :])[ins].double().mean(0)
+            dmp = lam_ * dE_[..., r, :][ins].double().mean(0)
+            sym[..., r, :, :] += (B + torch.diag(dmp)).to(sym.dtype)
+        inv = torch.linalg.inv(sym)
+
+        def apply(rV, rE):
+            z = torch.fft.ifftn(torch.einsum('xyzrab,xyzrb->xyzra', inv, torch.fft.fftn(rE.double(), dim=(0, 1, 2))), dim=(0, 1, 2))
+            return rV / pV * fV, z.real.to(rE.dtype) * fE
+        return apply
 
     def _block_preconditioner(self, F, lam_, dV_, dE_, fV, fE, mask):
         """The 'block' preconditioner: per voxel and material, the zero-lag block of the volume Hessian over (V, E_1..C)
@@ -797,8 +848,9 @@ class TomoFit:
             Ag = Fg + lam_ * torch.diag(torch.diagonal(Fg))
             Ag_inv = torch.linalg.inv(Ag)
             pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
-            if self.precond == 'block':
-                pvol = self._block_preconditioner(Fw, lam_, dV_, dE_, fV, fE, mask)
+            if self.precond in ('block', 'fft'):
+                pvol = self._block_preconditioner(Fw, lam_, dV_, dE_, fV, fE, mask) if self.precond == 'block' \
+                    else self._fft_preconditioner(Fw, lam_, pV, dE_, fV, fE)
                 prec = lambda rV, rE, rg: (*pvol(rV, rE), Ag_inv @ rg)
             else:
                 prec = lambda rV, rE, rg: (rV / pV, rE / pE, Ag_inv @ rg)

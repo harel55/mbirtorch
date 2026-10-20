@@ -116,3 +116,76 @@ def test_recenter_full_zero_mean():
     tf.sync = lambda: None
     tf.recenter_strain(full=True)
     assert float(tf.E.mean((0, 1, 2)).abs().max()) < 1e-12
+
+
+def test_fft_preconditioner_symbol():
+    """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    n = 12
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C = 1, 6
+    tf.V = torch.ones(n, n, n, 1, dtype=torch.float64)
+    tf.elastic = [(211e9, 0.29)]
+    tf.lam_E, tf.smooth_E, tf.eq_w = 0.3, 2.0, 5.0
+    g = torch.Generator().manual_seed(0)
+    X = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
+    X[4:8, 4:8, 4:8] = torch.randn(4, 4, 4, 1, 6, generator=g, dtype=torch.float64)
+    full = torch.ones(n, n, n, 1, dtype=torch.bool)
+    div = lambda Y: tf._divergence(Y, full).reshape(*Y.shape[:3], -1)
+    direct = 2 * tf.lam_E * X + tf.smooth_E * tf.laplacian(X) + tf.eq_w * torch.func.vjp(div, X)[1](div(X))[0]
+    sym = tf._prior_symbol()
+    via = torch.fft.ifftn(torch.einsum('xyzrab,xyzrb->xyzra', sym, torch.fft.fftn(X, dim=(0, 1, 2))), dim=(0, 1, 2)).real
+    assert torch.allclose(via, direct, atol=1e-10 * float(direct.abs().max()))
+
+
+def _small_fit(seed=0):
+    """A small FitB on the CPU: one bcc material, per-ray dilations, one contamination component, counts from the model."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    lam = np.linspace(2.0, 4.4, 300)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    gen = torch.Generator().manual_seed(seed)
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
+    f = torch.zeros(1, M.K, dtype=torch.float64); f[0, 100:140] = 0.05
+    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, f, eps=eps, chunk=16)
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
+    return fit
+
+
+def test_global_grad_matches_global_system():
+    """FitB.global_grad (automatic differentiation) equals global_system's gradient for the parameters other than the
+    resolution kernel."""
+    fit = _small_fit()
+    M = fit.M
+    idx = [i for i in range(M.n_global) if not (M.res_sl[0] <= i < M.res_sl[1]) and float(M.ub[i]) > float(M.lb[i])]
+    g1, _ = fit.global_system(idx)
+    g2 = fit.global_grad(idx)
+    assert torch.allclose(g1, g2, rtol=1e-6, atol=1e-8 * float(g1.abs().max()))
+
+
+def test_contamination_newton_kkt():
+    """The contamination Newton step's inner solution meets the optimality conditions of its model: zero gradient where
+    a coefficient is positive, gradient >= 0 where it is held at 0."""
+    fit = _small_fit()
+    fit.build_atoms()
+    M = fit.M; na = fit.A.shape[1]
+    gen = torch.Generator().manual_seed(1)
+    A = fit.A.double()
+    Fx = (1.0 + torch.rand(M.K, 1, 1, generator=gen, dtype=torch.float64)) * 50.0
+    gc = torch.randn(1, na, generator=gen, dtype=torch.float64) * 5.0
+    fit.lam_c = torch.full((1, na), 1.0, dtype=torch.float64)
+    c0 = torch.zeros(1, na, dtype=torch.float64)
+    c = fit._contamination_newton(A, gc, Fx, c0)
+    H = A.T @ (Fx[:, 0, 0, None] * A)
+    grad = gc[0] + H @ (c[0] - c0[0]) + fit.lam_c[0]
+    pos = c[0] > 1e-9
+    scale = float(gc.abs().max())
+    assert float(grad[pos].abs().max()) < 1e-2 * scale and float(grad[~pos].min()) > -1e-2 * scale
