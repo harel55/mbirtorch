@@ -1036,11 +1036,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
         fit.kappa_prior = kappa_prior * float(np.abs(targets).mean())
     if anchor_scale:
         # pin each spectrum at the fine grid's middle to its warm-up value: the stiffness is ANCHOR_STIFFNESS times
-        # the largest diagonal entry of the global Fisher information, so the pin dominates the data along the scale
+        # the largest diagonal entry of the spectrum parameters' Fisher information, so the pin dominates the data
+        # along the scale (the resolution kernel is left out: its derivatives are costly and it does not set the scale)
         with torch.no_grad():
             k = M.Kf // 2; targets = M.spectra(g)[:, k].clone()
         fit.scale_anchor = (k, targets, 0.0)
-        idx = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]
+        idx = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i]) and not (M.res_sl[0] <= i < M.res_sl[1])]
         _, F0 = fit.global_system(idx)
         fit.scale_anchor = (k, targets, ANCHOR_STIFFNESS * float(torch.diagonal(F0).max()))
     C = 1 if weights is None else np.asarray(weights).shape[1]
