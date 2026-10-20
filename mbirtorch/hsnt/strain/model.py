@@ -961,8 +961,14 @@ class FitB:
             if l1 < l0:
                 # the move's root mean square in standard errors, from its length in the Fisher metric (with all
                 # correlations; a parameter held at a bound has not moved), for a stopping rule
+                # measured with the data's Fisher information only: the penalties (the stiff scale anchor above all)
+                # would count a move along a gauge the data cannot see as many standard errors
                 moved = (g_new - g0)[idx_t[live]]
-                self.last_step_se = math.sqrt(max(float(moved @ (F[live][:, live] @ moved)), 0.0) / len(moved)) if len(moved) else 0.0
+                Fd = F
+                lf = getattr(self, 'last_fisher_data', None)
+                if lf is not None and lf[0] == list(idx):
+                    Fd = lf[1]
+                self.last_step_se = math.sqrt(max(float(moved @ (Fd[live][:, live] @ moved)), 0.0) / len(moved)) if len(moved) else 0.0
                 self.g = g_new
                 return l1, max(lam_ / 3, 1e-9)
             lam_ *= 10
@@ -1041,6 +1047,7 @@ class FitB:
         if torch.is_tensor(pen):
             gpen, = torch.autograd.grad(pen, gp, create_graph=True)
             Hpen = torch.stack([torch.autograd.grad(gpen[i], gp, retain_graph=True)[0] for i in idx])[:, idx]
+            self.last_fisher_data = (list(idx), F.clone())          # without the penalties, for the step measure
             grad += gpen.detach()[idx]; F += Hpen.detach()
         return grad, F
 
