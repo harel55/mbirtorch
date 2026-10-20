@@ -944,6 +944,14 @@ class FitB:
         d = torch.diagonal(F)
         live = d > INFO_FLOOR * d.max()
         idx_t = torch.as_tensor(idx, device=self.g.device)
+        # a parameter at a bound whose gradient points outward is held (projected Newton): solving for it and then
+        # clipping it distorts the other parameters' steps through their coupling, so the step raises the loss and is
+        # accepted only under heavy damping
+        gi = g0[idx_t]
+        live = live & ~(((gi <= M.lb[idx_t]) & (grad > 0)) | ((gi >= M.ub[idx_t]) & (grad < 0)))
+        if not bool(live.any()):
+            self.last_step_se = 0.0
+            return l0, damping
         for _ in range(max_tries):
             A = F[live][:, live] + lam_ * torch.diag(d[live])
             step = torch.linalg.solve(A, grad[live])
