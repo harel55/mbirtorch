@@ -234,14 +234,16 @@ def test_traction_faces_bonded_interface():
 
 def test_spike_phantom_equilibrium():
     """The spike phantom's press-fit strain gives a stress with zero divergence inside each part (finite differences,
-    away from the interfaces), the same three materials as voxels, and a largest strain component of SPIKE_PEAK."""
+    away from the interfaces); the parts' volume fractions add to at most 1; the parts' largest strain is SPIKE_PEAK."""
     from scipy import ndimage as nd
-    from mbirtorch.hsnt.strain.phantom import spike_tensor, SPIKE_ELASTIC, SPIKE_MATERIALS, SPIKE_PEAK
+    from mbirtorch.hsnt.strain.phantom import spike_tensor, spike_fields, SPIKE_ELASTIC, SPIKE_MATERIALS, SPIKE_PEAK
     N = 96                                       # fine enough that finite differences of the 1/r^2 field near the hole
     #                                              stay well under the tolerance (1.25% of a voxel's jump at 64)
     mat, eps = spike_tensor(N)
     assert all(int((mat == r).sum()) > 0 for r in range(3))
-    assert abs(float(np.abs(eps).max()) - SPIKE_PEAK) < 1e-12
+    frac, eps_parts = spike_fields(32)
+    assert abs(float(np.abs(eps_parts).max()) - SPIKE_PEAK) < 1e-12                # the peak, on the parts' own fields
+    assert float(frac.sum(-1).max()) <= 1 + 1e-12 and 0 < float(frac[..., 1].sum()) < float(frac[..., 2].sum())
     sig = np.zeros_like(eps)
     for r, m in enumerate(SPIKE_MATERIALS):
         E, nu = SPIKE_ELASTIC[m['name']]; lam_, mu_ = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))

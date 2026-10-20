@@ -241,16 +241,8 @@ if __name__ == '__main__':
     print('written')
 
 
-def blk_mat(mat, n, fine):
-    """The coarse material map (n, n, n): each coarse voxel's majority material on the fine grid (-1 empty)."""
-    counts = np.stack([(mat == r).reshape(n, fine, n, fine, n, fine).sum((1, 3, 5)) for r in range(int(mat.max()) + 1)], -1)
-    out = counts.argmax(-1).astype(np.int8)
-    out[counts.max(-1) * 2 <= fine ** 3] = -1
-    return out
-
-
 def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", contamination=True, voxel=None, fine=2,
-              tensor=False, series=('z',), axis=None, scene='ni_cu_al'):
+              tensor=False, series=('z',), axis=None):
     """Tomographic version of `make`: `views` parallel-beam views over [0, pi) through the package projector. The
     volume is built and projected on a grid `fine` times finer than the n^3 reconstruction grid, and the detector is
     binned back to n x n, so the data are not generated on the reconstruction grid. `voxel` is the attenuation scale
@@ -262,11 +254,9 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
     view sees n . eps . n with n its beam direction (beam_geometry), projected exactly over strain levels view by view.
     series: the rotation axes measured, each with the same angles (beam_geometry.PERMS); rays are series-major.
     A series about x or y sees the sample's other strain components, so three series see all six.
-    scene: 'ni_cu_al' (MATERIALS, strain_tensor) or 'spike' (SPIKE_MATERIALS, spike_tensor; tensor strain only)."""
+    The spike phantom has its own generator, make_spike."""
     import mbirtorch
-    assert scene in ('ni_cu_al', 'spike'), scene
-    assert scene == 'ni_cu_al' or tensor, 'the spike phantom has a tensor strain only'
-    mats = MATERIALS if scene == 'ni_cu_al' else SPIKE_MATERIALS
+    mats = MATERIALS
     voxel = 2.56 / n if voxel is None else voxel
     lam, flux = default_axis() if axis is None else axis
     lam = np.asarray(lam); flux = np.asarray(flux) / np.mean(flux)
@@ -282,10 +272,6 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
         mat, eps = volume(N)                                                   # (z, y, x)
         mat = mat.transpose(1, 2, 0); eps = eps.transpose(1, 2, 0)            # projector layout (y, x, z)
         seen = [eps] * (S * views)                                             # every view sees the same scalar
-    elif scene == 'spike':
-        mat, et = spike_tensor(N)                                              # already (y, x, z, 6)
-        wts = series_weights([(ax, angles) for ax in series])
-        seen = [(et * w).sum(-1) for w in wts]
     else:
         mat, et = strain_tensor(N)
         mat = mat.transpose(1, 2, 0); et = et.transpose(1, 2, 0, 3)          # (y, x, z, 6)
@@ -355,7 +341,7 @@ def make_tomo(n=16, views=25, dose=50.0, levels=31, seed=1, device="cuda", conta
         mu0 = M.spectra(g).cpu().numpy()
     return dict(T=T, lam=lam, dose_per_bin=d, n=n, views=views, angles=angles, W_true=W_true, eps_bar=eps_bar,
                 V_true=V_true, E_true=E_true, voxel=voxel, mu_true=mu0, lamf=M.lamf.cpu().numpy(), g_true=g.cpu().numpy(),
-                f_true=f.cpu().numpy(), materials=mats, mat_true=blk_mat(mat, n, fine))
+                f_true=f.cpu().numpy(), materials=mats)
 
 
 # The spike phantom (user, 2026-10-20): a steel spike pressed through a copper washer into a nickel plate. Three
@@ -372,50 +358,151 @@ SPIKE = dict(radius=0.08, top=0.34, tip_start=-0.18, tip=-0.30,           # spik
 SPIKE_PEAK = 1.5e-3                         # the largest strain component (sets the interference)
 
 
-def spike_tensor(N):
-    """Material index (N, N, N) (-1 empty; 0 Fe spike, 1 Cu washer, 2 Ni plate) and strain tensor (N, N, N, 6),
-    COMPONENTS order, in the projector layout (rows y, cols x, slices z). Press fit: the spike, radius a, sits in holes
-    of radius a with the same radial interference; in each contact zone (the washer's and the plate's thickness) the
-    contact pressure is p = delta / (a / E_h ((b^2 + a^2) / (b^2 - a^2) + nu_h) + a / E_s (1 - nu_s)), b the hub's outer
-    radius (Lame, plane stress through the thickness). The spike carries sigma_rr = sigma_tt = -p there and no stress
-    elsewhere; a hub carries sigma_rr = -p a^2 / (b^2 - a^2) (b^2 / r^2 - 1), sigma_tt = p a^2 / (b^2 - a^2)
-    (b^2 / r^2 + 1). This stress satisfies equilibrium, carries the contact pressure across each interface, and is
-    traction-free on every outer surface; delta is scaled so the largest strain component is SPIKE_PEAK."""
+SPIKE_SUPERSAMPLE = 4                       # points per axis inside each fine voxel for the parts' volume fractions
+
+
+def _spike_geometry(yy, xx, zz):
+    """Boolean membership of the spike, washer and plate at points (units of n about the centre)."""
     G = SPIKE
-    c = (N - 1) / 2.0
-    yy, xx, zz = np.meshgrid((np.arange(N) - c) / N, (np.arange(N) - c) / N, (np.arange(N) - c) / N, indexing='ij')
     r = np.sqrt(xx ** 2 + yy ** 2); a = G['radius']
     in_z = lambda zr: (zz >= zr[0]) & (zz < zr[1])
     cone = np.where(zz < G['tip_start'], a * (zz - G['tip']) / (G['tip_start'] - G['tip']), a)
     spike = (r < cone) & (zz >= G['tip']) & (zz < G['top'])
     washer = (r >= a) & (r < G['washer_outer']) & in_z(G['washer_z'])
     plate = (r >= a) & (r < G['plate_outer']) & in_z(G['plate_z'])
-    mat = -np.ones((N, N, N), np.int8); mat[spike] = 0; mat[washer] = 1; mat[plate] = 2
-    Es, nus = SPIKE_ELASTIC['Fe']
+    return spike, washer, plate
 
-    def pressure(hub, b, delta):
-        Eh, nuh = SPIKE_ELASTIC[hub]
-        return delta / (a / Eh * ((b * b + a * a) / (b * b - a * a) + nuh) + a / Es * (1 - nus))
+
+def spike_fields(N, supersample=SPIKE_SUPERSAMPLE):
+    """The spike phantom on an N^3 grid, projector layout (rows y, cols x, slices z): each part's volume fraction per
+    voxel (N, N, N, 3), from supersample^3 points per voxel, so faces and interfaces are not staircased; and each
+    part's strain tensor at the voxel centre (N, N, N, 3, 6), COMPONENTS order, wherever the part occupies the voxel.
+    Press fit: the spike, radius a, sits in holes of radius a with the same radial interference; in each contact zone
+    (the washer's and the plate's thickness) the contact pressure is p = delta / (a / E_h ((b^2 + a^2) / (b^2 - a^2) +
+    nu_h) + a / E_s (1 - nu_s)), b the hub's outer radius (Lame, plane stress through the thickness). The spike carries
+    sigma_rr = sigma_tt = -p there and no stress elsewhere; a hub carries sigma_rr = -p a^2 / (b^2 - a^2) (b^2 / r^2 - 1),
+    sigma_tt = p a^2 / (b^2 - a^2) (b^2 / r^2 + 1). This stress satisfies equilibrium, carries the contact pressure
+    across each interface, and is traction-free on every outer surface; delta is scaled so the largest strain
+    component is SPIKE_PEAK."""
+    G = SPIKE; a = G['radius']
+    c = (N - 1) / 2.0
+    ax = (np.arange(N) - c) / N
+    frac = np.zeros((N, N, N, 3))
+    sub = (np.arange(supersample) + 0.5) / supersample - 0.5                   # offsets inside a voxel, in voxels
+    for oy in sub:
+        for ox in sub:
+            for oz in sub:
+                yy, xx, zz = np.meshgrid(ax + oy / N, ax + ox / N, ax + oz / N, indexing='ij')
+                for k, part in enumerate(_spike_geometry(yy, xx, zz)):
+                    frac[..., k] += part
+    frac /= supersample ** 3
+    yy, xx, zz = np.meshgrid(ax, ax, ax, indexing='ij')
+    r = np.maximum(np.sqrt(xx ** 2 + yy ** 2), 1e-9); th = np.arctan2(yy, xx); cs, sn = np.cos(th), np.sin(th)
+    in_z = lambda zr: (zz >= zr[0]) & (zz < zr[1])
+    Es, nus = SPIKE_ELASTIC['Fe']
 
     def strains(srr, stt, E, nu):
         err = (srr - nu * stt) / E; ett = (stt - nu * srr) / E; ezz = -nu * (srr + stt) / E
-        th = np.arctan2(yy, xx); cs, sn = np.cos(th), np.sin(th)
-        return np.stack([err * cs ** 2 + ett * sn ** 2, err * sn ** 2 + ett * cs ** 2, ezz, (err - ett) * sn * cs,
-                         np.zeros_like(err), np.zeros_like(err)], -1)
+        z0 = np.zeros_like(err)
+        return np.stack([err * cs ** 2 + ett * sn ** 2, err * sn ** 2 + ett * cs ** 2, ezz, (err - ett) * sn * cs, z0, z0], -1)
 
-    def field(delta):
-        eps = np.zeros((N, N, N, 6))
-        rr = np.maximum(r, 1e-9)
-        for hub, b, zr, sel in (('Cu', G['washer_outer'], G['washer_z'], washer), ('Ni', G['plate_outer'], G['plate_z'], plate)):
-            p = pressure(hub, b, delta); k = p * a * a / (b * b - a * a)
-            Eh, nuh = SPIKE_ELASTIC[hub]
-            e = strains(-k * (b * b / rr ** 2 - 1), k * (b * b / rr ** 2 + 1), Eh, nuh); eps[sel] = e[sel]
-            zone = spike & in_z(zr)
-            e = strains(-p * np.ones_like(r), -p * np.ones_like(r), Es, nus); eps[zone] = e[zone]
-        return eps
+    eps = np.zeros((N, N, N, 3, 6))
+    for k, (hub, b, zr) in enumerate((('Cu', G['washer_outer'], G['washer_z']), ('Ni', G['plate_outer'], G['plate_z']))):
+        Eh, nuh = SPIKE_ELASTIC[hub]
+        p = 1.0 / (a / Eh * ((b * b + a * a) / (b * b - a * a) + nuh) + a / Es * (1 - nus))
+        kk = p * a * a / (b * b - a * a); rh = np.maximum(r, a)               # a hub's field, at r >= a
+        eps[..., k + 1, :] = strains(-kk * (b * b / rh ** 2 - 1), kk * (b * b / rh ** 2 + 1), Eh, nuh)
+        zone = in_z(zr)
+        eps[zone, 0, :] = strains(-p * np.ones_like(r), -p * np.ones_like(r), Es, nus)[zone]
+    eps *= (frac > 0)[..., None]
+    eps *= SPIKE_PEAK / np.abs(eps).max()
+    return frac, eps
 
-    eps1 = field(1.0)
-    return mat, eps1 * (SPIKE_PEAK / np.abs(eps1).max())
+
+def spike_tensor(N):
+    """The spike phantom as one material per voxel: the material index (N, N, N) of each voxel's largest part (-1
+    where no part fills half the voxel) and that part's strain (N, N, N, 6). See spike_fields."""
+    frac, eps = spike_fields(N)
+    mat = frac.argmax(-1).astype(np.int8); mat[frac.max(-1) < 0.5] = -1
+    sel = np.clip(mat, 0, 2)
+    e = np.take_along_axis(eps, sel[..., None, None].repeat(6, -1), 3)[..., 0, :]
+    return mat, e * (mat >= 0)[..., None]
+
+
+def make_spike(n=32, views=51, dose=320.0, levels=31, seed=1, device="cuda", contamination=True, voxel=None, fine=2,
+               series=('z', 'x', 'y'), axis=None, supersample=SPIKE_SUPERSAMPLE):
+    """Data for the spike phantom (spike_fields), as make_tomo's tensor version: built on a grid `fine` times finer
+    than the n^3 reconstruction grid with each part's volume fraction per fine voxel (so faces and interfaces are not
+    staircased), projected view by view through the package projector over each part's strain levels n . eps . n,
+    the detector binned back to n x n. Rays are series-major, then (view, row, channel). Returns make_tomo's dict:
+    V_true (n, n, n, 3) densities, E_true (n, n, n, 3, 6) each part's mean strain in a voxel, mat_true (n, n, n) each
+    voxel's largest part (-1 where no part fills half of it), and the materials."""
+    import mbirtorch
+    from .geometry import PERMS, series_weights
+    voxel = 2.56 / n if voxel is None else voxel
+    lam, flux = default_axis() if axis is None else axis
+    lam = np.asarray(lam); flux = np.asarray(flux) / np.mean(flux)
+    d = dose * flux
+    mats = SPIKE_MATERIALS; R = len(mats)
+    M, g = spectra_model(lam, d, device, materials=mats)
+    N = fine * n
+    angles = np.linspace(0, np.pi, views, endpoint=False)
+    blk = lambda x: x.reshape(n, fine, n, fine, n, fine).mean((1, 3, 5))
+    frac, eps = spike_fields(N, supersample)                                     # (N, N, N, R), (N, N, N, R, 6)
+    S = len(series)
+    wts = series_weights([(ax, angles) for ax in series])                        # (S views, 6)
+    # each part's strain levels: the range of n . eps . n over its voxels and all views
+    levels_r = []
+    for r in range(R):
+        e = eps[..., r, :][frac[..., r] > 0]
+        seen = e @ wts.T                                                         # (voxels, S views)
+        levels_r.append(np.linspace(seen.min(), seen.max(), levels))
+    L = R * levels
+    proj = np.zeros((R, levels, S * views, n, n))
+    for k, ax in enumerate(series):
+        perm = PERMS[ax]
+        frac_s = frac.transpose(perm + (3,)); eps_s = eps.transpose(perm + (3, 4))
+        for v in range(views):
+            w = wts[k * views + v]
+            inds = []
+            for r in range(R):
+                seen = eps_s[..., r, :] @ w
+                idx = np.abs(seen[..., None] - levels_r[r]).argmin(-1)
+                inds += [(frac_s[..., r] * (idx == l)).astype(np.float32) for l in range(levels)]
+            model = mbirtorch.ParallelBeamModel((1, N * L, N), angles[v:v + 1])
+            model.set_params(use_ror_mask=False)
+            sino = model.forward_project(np.concatenate(inds, 2), output_sharded=True)
+            proj[:, :, k * views + v] = (sino.reshape(L, n, fine, n, fine).mean((2, 4)) / fine).reshape(R, levels, n, n).cpu().numpy()
+    proj = proj.reshape(R, levels, S * views * n * n)
+    P = S * views * n * n
+    V_true = np.stack([blk(frac[..., r]) for r in range(R)], -1) * voxel
+    E_true = np.stack([np.stack([blk(frac[..., r] * eps[..., r, c]) / np.maximum(blk(frac[..., r]), 1e-12) for c in range(6)], -1)
+                       for r in range(R)], -2)
+    occ = np.stack([blk(frac[..., r]) for r in range(R)], -1)
+    mat_true = occ.argmax(-1).astype(np.int8); mat_true[occ.max(-1) < 0.5] = -1
+    with torch.no_grad():
+        X = torch.zeros(P, M.Kf, dtype=torch.float32, device=device)
+        for r in range(R):
+            for l, e_l in enumerate(levels_r[r]):
+                wl = torch.as_tensor(proj[r, l] * voxel, dtype=torch.float32, device=device)
+                if float(wl.max()) <= 0:
+                    continue
+                eps_t = torch.zeros((1, R), dtype=torch.float64, device=device); eps_t[0, r] = e_l
+                X += wl[:, None] * M.spectra(g, eps_t)[0, r].float()[None, :]
+        n_t = M.apply_band(torch.exp(-X), M.band_matrix(M.band(g)))
+        f = torch.zeros(2, M.K, device=device)
+        if contamination:
+            k_spike = int(np.abs(lam - 2.638).argmin()); f[0, k_spike] = 0.04
+            bump = (lam > 2.655) & (lam < 2.77); f[1, torch.as_tensor(bump, device=device)] = torch.as_tensor(
+                0.16 * np.exp(-0.5 * ((lam[bump] - 2.70) / 0.03) ** 2), dtype=torch.float32, device=device)
+        m = (1 - f.sum(0)) * n_t + torch.ones(P, 2, device=device) @ f
+        gen = torch.Generator(device=device).manual_seed(seed)
+        dd = torch.as_tensor(d, dtype=torch.float32, device=device)
+        T = torch.poisson(dd * m, generator=gen) / dd
+        mu0 = M.spectra(g).cpu().numpy()
+    return dict(T=T, lam=lam, dose_per_bin=d, n=n, views=views, angles=angles, V_true=V_true, E_true=E_true,
+                mat_true=mat_true, voxel=voxel, mu_true=mu0, lamf=M.lamf.cpu().numpy(), g_true=g.cpu().numpy(),
+                f_true=f.cpu().numpy(), materials=mats)
 
 
 # The Fe cube phantom: one bcc Fe cube seen by three rotation series, each with its own mount and a holder rod.
