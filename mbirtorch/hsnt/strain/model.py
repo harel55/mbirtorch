@@ -561,7 +561,7 @@ class FitB:
         # contamination_newton: the contamination step takes a full Newton step on the atom coefficients
         # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
         self.contamination_newton = False
-        self.last_step_se = float('inf')      # the last global step's largest step in standard errors (global_step)
+        self.last_step_se = float('inf')      # the last global step's RMS in standard errors (global_step)
 
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask."""
@@ -951,10 +951,10 @@ class FitB:
             g_new = torch.maximum(torch.minimum(g_new, M.ub), M.lb)
             l1 = self.loss(g=g_new)
             if l1 < l0:
-                # the largest move in standard errors (each parameter's from its own Fisher information; a parameter held
-                # at a bound has not moved), for a stopping rule
+                # the move's root mean square in standard errors, from its length in the Fisher metric (with all
+                # correlations; a parameter held at a bound has not moved), for a stopping rule
                 moved = (g_new - g0)[idx_t[live]]
-                self.last_step_se = float((moved.abs() * torch.sqrt(d[live].clamp_min(0))).max()) if len(moved) else 0.0
+                self.last_step_se = math.sqrt(max(float(moved @ (F[live][:, live] @ moved)), 0.0) / len(moved)) if len(moved) else 0.0
                 self.g = g_new
                 return l1, max(lam_ / 3, 1e-9)
             lam_ *= 10

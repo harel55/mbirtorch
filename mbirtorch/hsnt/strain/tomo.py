@@ -335,7 +335,7 @@ class TomoFit:
         self.hold_strain = False
         self.cg_iters = cg_iters
         self.damp = 1e-3
-        self.last_step_se = float('inf')     # the last volume step in standard errors (_step_se), for a stopping rule
+        self.last_step_se = float('inf')     # the last volume step's RMS in standard errors (_step_se), for a stopping rule
         self.sync()
 
     # ---- projections
@@ -563,7 +563,7 @@ class TomoFit:
                 Vn = (V + alpha * xV).clamp_min(0); En = E + alpha * xE
                 l1 = self.loss(Vn, En, mask=mask)
                 if l1 < l0:
-                    self.last_step_se = self._step_se(alpha * xV, alpha * xE, dV_, dE_)
+                    self.last_step_se = self._step_se(alpha * alpha * dec)
                     self.V, self.E = Vn, En; self.sync()
                     self.damp = max(self.damp / 3, 1e-6)
                     return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l1
@@ -571,15 +571,12 @@ class TomoFit:
         self.last_step_se = 0.0
         return float('nan'), 0.0
 
-    def _step_se(self, xV, xE, dV_, dE_):
-        """The root mean square of a volume step in standard errors over each material's own voxels (density above half
-        its maximum), for a stopping rule. Each parameter's standard error is taken from its own curvature (the Hessian's
-        diagonal), which is smaller than its marginal standard error, so the measure errs on the strict side."""
-        ins = (self.V > 0.5 * self.V.amax((0, 1, 2), keepdim=True))
-        if not bool(ins.any()):
-            return 0.0
-        se2 = torch.cat([(xV * xV * dV_)[ins][:, None], (xE * xE * dE_)[ins]], 1)
-        return math.sqrt(float(se2.double().mean()))
+    def _step_se(self, quad):
+        """The root mean square of a volume step in standard errors, from its length in the Hessian's metric (quad =
+        x^T H x, with all correlations): sqrt(quad / n), n the parameters of the voxels holding material (density above
+        half its maximum), for a stopping rule. The empty voxels barely move and would dilute the mean."""
+        n_in = int((self.V > 0.5 * self.V.amax((0, 1, 2), keepdim=True)).sum()) * (1 + self.C)
+        return math.sqrt(max(quad, 0.0) / max(n_in, 1))
 
     def _prior_symbol(self):
         """(n, n, n, R, C, C) complex: the Fourier symbol of the strain priors' Hessian (the weak ridge, the smoothness
