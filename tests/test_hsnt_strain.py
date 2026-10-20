@@ -189,3 +189,24 @@ def test_contamination_newton_kkt():
     pos = c[0] > 1e-9
     scale = float(gc.abs().max())
     assert float(grad[pos].abs().max()) < 1e-2 * scale and float(grad[~pos].min()) > -1e-2 * scale
+
+
+@pytest.mark.parametrize("method", ["median", "otsu"])
+def test_material_mask_face_overshoot(method):
+    """With density overshoot on a cube's faces, the 'median' and 'otsu' material masks hold the whole cube and give
+    the equilibrium prior an interior, while the 'max' mask holds only the overshooting faces."""
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    n = 16
+    V = torch.zeros(n, n, n, 1)
+    V[3:13, 3:13, 3:13] = 1.0
+    V[3, 3:13, 3:13] = V[12, 3:13, 3:13] = 2.5                                   # overshoot on two faces
+    V += 0.02 * torch.rand(n, n, n, 1, generator=torch.Generator().manual_seed(0))
+    cube = torch.zeros(n, n, n, 1, dtype=torch.bool); cube[3:13, 3:13, 3:13] = True
+    tf = object.__new__(TomoFit)
+    tf.V = V; tf.mask_freeze = False; tf._mask = None
+    tf.mask_method = 'max'
+    assert int(tf._eq_mask().sum()) == 0
+    tf.mask_method = method
+    m = tf.material_voxels()
+    assert int((m & cube).sum()) >= 0.9 * int(cube.sum()) and int((m & ~cube).sum()) <= 0.1 * int(cube.sum())
+    assert int(tf._eq_mask().sum()) >= 0.5 * 8 ** 3

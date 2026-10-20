@@ -32,6 +32,10 @@ from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 STRAIN_PRIOR_SD = 1e-2          # standard deviation of the weak strain prior
 STRAIN_SMOOTH_SD = 3e-4         # standard deviation of the strain difference between neighbouring voxels
 JOINT_CG_ITERS = 60             # conjugate-gradient iterations of the joint (volumes + global) step
+MASK_FLOOR_REL = 0.1            # the material mask ('median'): the typical density is the median over the voxels whose
+                                # density exceeds this fraction of the maximum
+MASK_MEDIAN_REL = 0.5           # ... and the mask is the voxels whose density exceeds this fraction of it
+OTSU_BINS = 256                 # histogram bins of the 'otsu' material mask
 SUPPORT_REL = 0.1               # the support: voxels whose 3 x 3 x 3 mean density exceeds this fraction of the maximum
 EQUILIBRIUM_SD = 1e-5           # the equilibrium prior's standard deviation of div(stress) / Young's modulus per voxel
 QGGMRF_P, QGGMRF_Q, QGGMRF_T = 2.0, 1.2, 1.0   # the edge-preserving density prior's exponents and threshold (the
@@ -274,6 +278,20 @@ class MultiProjector:
         return out.contiguous()
 
 
+def _otsu_threshold(x):
+    """Otsu's threshold of the values x: the cut of their histogram (OTSU_BINS bins) that maximizes the variance
+    between the two classes."""
+    lo, hi = float(x.min()), float(x.max())
+    if hi <= lo:
+        return lo
+    h = torch.histc(x.double(), bins=OTSU_BINS, min=lo, max=hi)
+    c = lo + (torch.arange(OTSU_BINS, dtype=torch.float64, device=x.device) + 0.5) * (hi - lo) / OTSU_BINS
+    w0 = torch.cumsum(h, 0); w1 = w0[-1] - w0
+    m0 = torch.cumsum(h * c, 0) / w0.clamp_min(1e-30); m1 = ((h * c).sum() - torch.cumsum(h * c, 0)) / w1.clamp_min(1e-30)
+    k = int(torch.argmax(w0 * w1 * (m0 - m1) ** 2))
+    return lo + (k + 1) * (hi - lo) / OTSU_BINS
+
+
 class TomoFit:
     """The volume part of the tomographic fit. Per material r: a density volume V (n, n, n, R) and strain volumes E
     (n, n, n, R, C), C = 1 (a scalar dilation, the same in every view) or 6 (the strain tensor, COMPONENTS order xx,
@@ -286,15 +304,22 @@ class TomoFit:
 
     def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
                  eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi', density_prior='quadratic',
-                 voxel_scale=1.0, traction=False):
+                 voxel_scale=1.0, traction=False, mask_method='max', mask_freeze=False):
         """traction=True adds traction-free faces to the equilibrium prior: on the voxels at the sample's faces, the
         traction sigma . n / Young's modulus (n the outward normal) has the equilibrium prior's standard deviation.
         density_prior: 'quadratic' (a Gaussian prior on neighbour differences) or 'qggmrf' (edge-preserving: the
         same for small differences, much weaker for large jumps, so sharp interfaces are kept). voxel_scale: the voxel
         size relative to the grid the prior strengths are set for; the smoothness and equilibrium weights scale with it
         and the weak strain ridge with its cube, as discretized integrals over the volume, so the priors mean the same
-        at any binning."""
+        at any binning.
+        mask_method: how the material's own voxels are found (for the equilibrium prior's interior and faces, the strain
+        recentring and the density prior's scale): 'max' (density above half the maximum; a few overshooting voxels at
+        the faces can leave it nearly empty), 'median' (density above MASK_MEDIAN_REL of the typical density), or 'otsu'
+        (density above Otsu's threshold of its histogram). mask_freeze=True computes the mask once,
+        from the starting volume, so the objective stays the same from one iteration to the next."""
         self.fit = fit
+        assert mask_method in ('max', 'median', 'otsu'), mask_method
+        self.mask_method, self.mask_freeze, self._mask = mask_method, bool(mask_freeze), None
         assert density_prior in ('quadratic', 'qggmrf'), density_prior
         self.density_prior, self.voxel_scale = density_prior, float(voxel_scale)
         # the volume solves' preconditioner: 'jacobi' (each unknown's diagonal), 'block' (per voxel and material, the
@@ -322,8 +347,9 @@ class TomoFit:
         self.smooth_V = torch.zeros(self.R, device=V.device, dtype=V.dtype)
         self.sigma_V = torch.full((self.R,), float('inf'), device=V.device, dtype=V.dtype)
         if density_smooth:
+            own = self.material_voxels(V)
             for r in range(self.R):
-                v = V[..., r]; typ = v[v > 0.5 * v.max()].median() if float(v.max()) > 0 else torch.ones(())
+                v = V[..., r]; typ = v[own[..., r]].median() if bool(own[..., r].any()) else torch.ones(())
                 self.sigma_V[r] = float(DENSITY_SMOOTH_REL * typ)
                 self.smooth_V[r] = vs / float(DENSITY_SMOOTH_REL * typ) ** 2
         self.elastic = elastic if (elastic is not None and self.C == 6) else None
@@ -419,10 +445,32 @@ class TomoFit:
                 tot += float((a ** QGGMRF_P / (QGGMRF_P * sx ** QGGMRF_P) * ds / (1 + ds)).sum())
         return self.voxel_scale * tot
 
+    def material_voxels(self, V=None):
+        """(n, n, n, R) bool: each material's own voxels, by mask_method (see __init__); with mask_freeze, the mask of
+        the first call is kept."""
+        method, freeze = getattr(self, 'mask_method', 'max'), getattr(self, 'mask_freeze', False)
+        if freeze and getattr(self, '_mask', None) is not None:
+            return self._mask
+        V = self.V if V is None else V
+        if method == 'max':
+            m = V > 0.5 * V.amax((0, 1, 2), keepdim=True)
+        else:
+            m = torch.zeros_like(V, dtype=torch.bool)
+            for r in range(V.shape[-1]):
+                v = V[..., r]
+                if float(v.max()) <= 0:
+                    continue
+                if method == 'median':
+                    m[..., r] = v > MASK_MEDIAN_REL * v[v > MASK_FLOOR_REL * v.max()].median()
+                else:
+                    m[..., r] = v > _otsu_threshold(v[v > 0])
+        if freeze:
+            self._mask = m
+        return m
+
     def _eq_mask(self):
-        """Per material, the voxels whose six neighbours all hold the material (density above half its maximum)."""
-        Vd = self.V
-        inside = Vd > 0.5 * Vd.amax((0, 1, 2), keepdim=True)
+        """Per material, the voxels whose six neighbours all hold the material (material_voxels)."""
+        inside = self.material_voxels()
         self._eq_inside = inside                                                    # for the traction-free faces
         m = inside.clone()
         for d in range(3):
@@ -575,7 +623,7 @@ class TomoFit:
         """The root mean square of a volume step in standard errors, from its length in the Hessian's metric (quad =
         x^T H x, with all correlations): sqrt(quad / n), n the parameters of the voxels holding material (density above
         half its maximum), for a stopping rule. The empty voxels barely move and would dilute the mean."""
-        n_in = int((self.V > 0.5 * self.V.amax((0, 1, 2), keepdim=True)).sum()) * (1 + self.C)
+        n_in = int(self.material_voxels().sum()) * (1 + self.C)
         return math.sqrt(max(quad, 0.0) / max(n_in, 1))
 
     def _prior_symbol(self):
@@ -609,8 +657,9 @@ class TomoFit:
         bUU = torch.stack([self.proj.back(torch.cat([torch.zeros(P_, R, device=V.device), (dUU[:, :, None] * (w[:, k:k + 1] * w)[:, None, :]).reshape(P_, R * C)], 1))
                            [..., R:].reshape(n, n, n, R, C) for k in range(C)], -2)              # (n, n, n, R, C, C)
         sym = self._prior_symbol()
+        own = self.material_voxels()
         for r in range(R):
-            ins = V[..., r] > 0.5 * V[..., r].max()
+            ins = own[..., r]
             if not bool(ins.any()):
                 continue
             B = (V[..., r, None, None] ** 2 * bUU[..., r, :, :])[ins].double().mean(0)
@@ -747,9 +796,10 @@ class TomoFit:
         M, R, C = self.fit.M, self.R, self.C
         moved = []
         with torch.no_grad():
+            own = self.material_voxels()
             for r in range(R):
                 V = self.V[..., r]
-                w = (V > 0.5 * V.max()).to(V.dtype) * V                         # the material's own voxels, density weighted
+                w = own[..., r].to(V.dtype) * V                                 # the material's own voxels, density weighted
                 if float(w.sum()) <= 0:
                     moved.append(0.0); continue
                 iso = self.E[..., r, :3].mean(-1) if C == 6 else self.E[..., r, 0]
@@ -901,7 +951,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
-           smooth_sd=STRAIN_SMOOTH_SD):
+           smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -912,7 +962,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     ray_mask (rays,) bool leaves the rays where it is False out of the reconstruction and the likelihood (FitB).
     kernel: the resolution kernel's form (model.Hybrid2); kernel_values: its 8 parameters from a calibration (for
     example on a Ni cylinder), held fixed; None fits the kernel from the warm start's estimate. traction: traction-free faces in the
-    equilibrium prior (TomoFit); smooth_sd: the strain smoothness prior's standard deviation (None: no smoothness prior)."""
+    equilibrium prior (TomoFit); smooth_sd: the strain smoothness prior's standard deviation (None: no smoothness prior);
+    mask_method, mask_freeze: how the material's own voxels are found (TomoFit)."""
     from mbirtorch import hsnt
     R = len(lattices)
     if ray_mask is None:
@@ -996,7 +1047,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     E0 = torch.zeros(*V.shape, C, device=device, dtype=V.dtype)
     return TomoFit(fit, proj, V, E0, weights=weights, density_smooth=density_smooth, elastic=elastic, eq_sd=eq_sd,
                    cg_iters=cg_iters, support=support, precond=precond, density_prior=density_prior,
-                   voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
+                   voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd, mask_method=mask_method,
+                   mask_freeze=mask_freeze), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
                                                            resolution=[float(v) for v in resolution], traction=traction, smooth_sd=smooth_sd)
 
 
