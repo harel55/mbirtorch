@@ -675,11 +675,14 @@ class TomoFit:
         apply(0.0); self.sync()
         return dict(alpha=0.0, loss_decrease=0.0, mounts=mounts())
 
-    def recenter_strain(self):
+    def recenter_strain(self, full=False):
         """Move each material's mean isotropic strain into its lattice parameter, so the strain is measured from the
         sample's mean lattice and carries no uniform offset. Use it after a volume step. The predicted data are unchanged
         to second order in the strain. A pinned lattice parameter (equal bounds) moves with its bounds; a free one, fitted
-        by the global steps, moves within its bounds. Returns the offsets moved, one per material."""
+        by the global steps, moves within its bounds. Returns the offsets moved, one per material.
+        full=True (strain tensor only) also removes the mean deviatoric strain, so every component averages to zero over
+        the material: a body with no external load has zero mean stress, hence zero mean elastic strain. Unlike the
+        isotropic part, the deviatoric mean changes the predicted data, so this is a constraint, not a choice of gauge."""
         M, R, C = self.fit.M, self.R, self.C
         moved = []
         with torch.no_grad():
@@ -692,6 +695,9 @@ class TomoFit:
                 d = float((w * iso).sum() / w.sum())
                 if C == 6:
                     self.E[..., r, :3] -= d
+                    if full:                                                   # the deviatoric mean, per component
+                        m = (w[..., None] * self.E[..., r, :]).sum((0, 1, 2)) / w.sum()
+                        self.E[..., r, :] -= m
                 else:
                     self.E[..., r, 0] -= d
                 ia = M.slices[r]['a']

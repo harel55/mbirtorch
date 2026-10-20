@@ -93,3 +93,26 @@ def test_traction_free_faces():
     y_face = t[1, 2, 2, 1]                                                          # y face: normal (0, 1, 0)
     assert abs(float(y_face[1]) - lam_ * 1e-3) < 1e-12                               # sigma_yy from the Poisson term
     assert float(t[2, 2, 2].abs().max()) == 0.0                                     # an interior voxel
+
+
+def test_recenter_full_zero_mean():
+    """recenter_strain(full=True) leaves every strain component with zero density-weighted mean over the material."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    class _M:                                                                  # the lattice slot recenter_strain moves
+        slices = [{'a': 0}]
+        lb = torch.tensor([2.8]); ub = torch.tensor([2.9])
+
+    class _Fit:
+        M = _M(); g = torch.tensor([2.8665], dtype=torch.float64)
+
+    n = 5
+    tf = object.__new__(TomoFit)
+    tf.fit, tf.R, tf.C = _Fit(), 1, 6
+    tf.V = torch.ones(n, n, n, 1, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    tf.E = 1e-3 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64) + torch.tensor([3e-4, 0, 0, 2e-4, -1e-4, 5e-4], dtype=torch.float64)
+    tf.sync = lambda: None
+    tf.recenter_strain(full=True)
+    assert float(tf.E.mean((0, 1, 2)).abs().max()) < 1e-12
