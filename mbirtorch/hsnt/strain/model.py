@@ -61,7 +61,7 @@ TEXTURE_ANGLE_BOUND = 2 * math.pi  # texture3d: the axis angles' bounds (the fac
 TEXTURE_TABLE = (65, 257)        # texture3d: the factor's table over |cos psi| and sin(theta)
 TEXTURE_CONE_POINTS = 48         # texture3d: points on each diffraction cone
 TEXTURE_SEARCH_DIRS = 24         # texture3d: axis directions tried by texture_search (over a hemisphere)
-TEXTURE_SEARCH_STRENGTH = 0.8    # texture3d: the strength tried by texture_search (and its inverse)
+TEXTURE_SEARCH_STRENGTH = 0.9    # texture3d: the probe strength of texture_search (and its inverse)
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
 CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
 CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvature)
@@ -1242,21 +1242,43 @@ class FitB:
         return grad, F
 
     def texture_search(self, r, strength=TEXTURE_SEARCH_STRENGTH, n_dirs=TEXTURE_SEARCH_DIRS):
-        """Material r's texture axis (texture3d) by a search: the loss with the axis at each of n_dirs directions spread
-        over a hemisphere (a Fibonacci lattice; the factor does not depend on the axis's sign), at the strength
-        `strength` and at its inverse (plate-like and needle-like textures), against the current parameters; keeps the
-        best. From a random powder the axis has no gradient, and the loss is not convex in it, so the global steps alone
-        may not find it. Returns (loss, (strength, polar, azimuth))."""
+        """Material r's texture (texture3d) by a search over axis directions. For each of n_dirs directions spread over a
+        hemisphere (a Fibonacci lattice; the factor does not depend on the axis's sign), the loss at the strengths
+        `strength` and 1 / strength, with the random powder's loss, gives a parabola in the strength's logarithm. The
+        direction whose parabola reaches the lowest loss is then evaluated at that parabola's minimum, so weak and
+        strong textures are both found. Keeps the best loss evaluated, the current parameters included. Use it before
+        the global steps: from a random powder the axis has no gradient, and the loss is not convex in it. Returns
+        (loss, (strength, polar, azimuth))."""
         M = self.M; x0 = M.slices[r]["x"][0]
+        u_lo, u_hi = math.log(float(M.lb[x0])), math.log(float(M.ub[x0]))
+
+        def L(s_, th, ph):
+            gg = self.g.clone(); gg[x0] = s_; gg[x0 + 1] = th; gg[x0 + 2] = ph
+            return self.loss(g=gg)
         best = (self.loss(), tuple(float(v) for v in self.g[x0:x0 + 3]))
+        th0, ph0 = best[1][1], best[1][2]
+        l0 = L(1.0, th0, ph0)                                              # a random powder: the axis does not matter
+        if l0 < best[0]:
+            best = (l0, (1.0, th0, ph0))
+        h = abs(math.log(strength))
         k = np.arange(n_dirs) + 0.5
-        polar = np.arccos(1 - k / n_dirs); azim = math.pi * (1 + math.sqrt(5)) * k
-        for s_ in (strength, 1.0 / strength):
-            for th, ph in zip(polar, azim):
-                gg = self.g.clone(); gg[x0] = s_; gg[x0 + 1] = float(th); gg[x0 + 2] = float(ph % (2 * math.pi))
-                l_ = self.loss(g=gg)
+        polar = np.arccos(1 - k / n_dirs); azim = (math.pi * (1 + math.sqrt(5)) * k) % (2 * math.pi)
+        pred = None
+        for th, ph in zip(polar.tolist(), azim.tolist()):
+            lm, lp = L(math.exp(-h), th, ph), L(math.exp(h), th, ph)
+            for s_, l_ in ((math.exp(-h), lm), (math.exp(h), lp)):
                 if l_ < best[0]:
-                    best = (l_, (s_, float(th), float(ph % (2 * math.pi))))
+                    best = (l_, (s_, th, ph))
+            a = (lp + lm - 2.0 * l0) / (2.0 * h * h); b = (lp - lm) / (2.0 * h)   # loss = l0 + b u + a u^2, u = log strength
+            if a > 0:
+                u = min(max(-b / (2.0 * a), u_lo), u_hi)
+                lu = l0 + b * u + a * u * u
+                if pred is None or lu < pred[0]:
+                    pred = (lu, (math.exp(u), th, ph))
+        if pred is not None:
+            l_ = L(*pred[1])
+            if l_ < best[0]:
+                best = (l_, pred[1])
         with torch.no_grad():
             self.g[x0:x0 + 3] = torch.tensor(best[1], dtype=self.g.dtype, device=self.g.device)
         return best

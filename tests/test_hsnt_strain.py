@@ -436,9 +436,9 @@ def test_normalize_views():
     assert np.abs(lv2 - 1).max() < 3e-4                                         # every view and tile at the median level
 
 
-def _small_fit_texture(seed=0):
-    """A small FitB on the CPU with a March-Dollase texture (texture3d): one bcc material, eight views with their own beam
-    directions, per-ray dilations, counts from the model."""
+def _small_fit_texture(seed=0, strength=0.7, noise=True):
+    """A small FitB on the CPU with a March-Dollase texture (texture3d) of the given strength: one bcc material, eight
+    views with their own beam directions, per-ray dilations, counts from the model (their means when noise is False)."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
@@ -446,7 +446,7 @@ def _small_fit_texture(seed=0):
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
-    g[sl['x'][0]] = 0.7; g[sl['x'][0] + 1] = 0.9; g[sl['x'][0] + 2] = 0.4
+    g[sl['x'][0]] = strength; g[sl['x'][0] + 1] = 0.9; g[sl['x'][0] + 2] = 0.4
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     gen = torch.Generator().manual_seed(seed)
     d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
@@ -457,7 +457,7 @@ def _small_fit_texture(seed=0):
     fit.ray_view = torch.arange(P) % 8
     with torch.no_grad():
         m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
-    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0 if noise else m.clone()
     return fit
 
 
@@ -505,3 +505,17 @@ def test_texture_search():
     l_powder = fit.loss()
     l_best, (st, th, ph) = fit.texture_search(0, strength=0.7, n_dirs=48)
     assert l_best < l_powder and (l_best - l_true) < 0.5 * (l_powder - l_true)
+
+
+def test_texture_search_weak():
+    """texture_search finds a weak texture (strength 0.92, noiseless data): from a random powder, the axis it keeps is
+    within 30 degrees of the truth, its strength is plate-like (below 1), and its loss is below the powder's."""
+    fit = _small_fit_texture(strength=0.92, noise=False)
+    M = fit.M; x0 = M.slices[0]['x'][0]
+    with torch.no_grad():
+        fit.g[x0] = 1.0; fit.g[x0 + 1] = 0.3; fit.g[x0 + 2] = 2.0
+    l_powder = fit.loss()
+    l_best, (st, th, ph) = fit.texture_search(0)
+    n = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
+    n_true = np.array([np.sin(0.9) * np.cos(0.4), np.sin(0.9) * np.sin(0.4), np.cos(0.9)])
+    assert l_best < l_powder and st < 1.0 and abs(float(n @ n_true)) > np.cos(np.radians(30))
