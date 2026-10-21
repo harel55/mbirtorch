@@ -434,94 +434,23 @@ def test_normalize_views():
     assert np.abs(lv2 - 1).max() < 3e-4                                         # every view and tile at the median level
 
 
-def _small_fit_texture(seed=0, strength=0.7, noise=True):
-    """A small FitB on the CPU with a March-Dollase texture (texture3d) of the given strength: one bcc material, eight
-    views with their own beam directions, per-ray dilations, counts from the model (their means when noise is False)."""
-    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
-    lam = np.linspace(2.0, 4.4, 300)
-    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
-                device='cpu', two_scale=True, dtype=torch.float64, shape_model='texture3d')
-    g = torch.zeros(M.n_global, dtype=torch.float64)
-    sl = M.slices[0]
-    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
-    g[sl['x'][0]] = strength; g[sl['x'][0] + 1] = 0.9; g[sl['x'][0] + 2] = 0.4
-    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
-    gen = torch.Generator().manual_seed(seed)
-    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
-    P = 40
-    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
-    eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
-    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64), eps=eps, chunk=16)
-    fit.ray_view = torch.arange(P) % 8
-    with torch.no_grad():
-        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
-    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0 if noise else m.clone()
-    return fit
-
-
-def test_texture_factor():
-    """The texture factor is 1 for a random powder, averages to about 1 over beam directions, does not depend on the
-    axis's sign, and differs between views for a textured sample."""
-    fit = _small_fit_texture()
-    M = fit.M; x0 = M.slices[0]['x'][0]; g = fit.g.clone()
-    g[x0] = 1.0
-    assert torch.allclose(M.texture_factor(g, 0), torch.ones(()).double(), atol=1e-9)
-    g[x0] = 0.7
-    d = torch.randn(4000, 3, generator=torch.Generator().manual_seed(5), dtype=torch.float64)
-    keep = M.view_dirs; M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
-    avg = M.texture_factor(g, 0).mean(0)                                     # over beam directions
-    e = 2.0 * float(g[M.slices[0]['a']]) / np.sqrt(M.mats[0]['ns'].numpy())
-    below = (M.lamf.numpy()[None, :] < 0.95 * e[:, None])                     # bins below each edge
-    assert abs(float(avg.numpy()[below].mean()) - 1.0) < 0.03
-    M.view_dirs = keep
-    f1 = M.texture_factor(g, 0)
-    g2 = g.clone(); g2[x0 + 1] = math.pi - g[x0 + 1]; g2[x0 + 2] = g[x0 + 2] + math.pi    # the opposite axis
-    assert torch.allclose(f1, M.texture_factor(g2, 0), atol=1e-9)
-    assert float((f1.max(0).values - f1.min(0).values).max()) > 0.1
-
-
-def test_texture_global_grad():
-    """With texture3d the gradient by automatic differentiation (global_grad) equals global_system's for the texture,
-    height and lattice parameters (the per-view factor enters both)."""
-    fit = _small_fit_texture()
-    M = fit.M; sl = M.slices[0]
-    idx = list(range(sl['h'][0], sl['h'][1])) + list(range(sl['x'][0], sl['x'][1]))
-    g1, F = fit.global_system(idx)
-    g2 = fit.global_grad(idx)
-    assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
-    assert bool((torch.diagonal(F) > 0).all())
-
-
-def test_texture_search():
-    """texture_search, started from a random powder, finds an axis whose loss is below the powder's and close to the
-    truth's (the small fit's data come from a texture of strength 0.7)."""
-    fit = _small_fit_texture()
-    M = fit.M; x0 = M.slices[0]['x'][0]
-    l_true = fit.loss()
-    with torch.no_grad():
-        fit.g[x0] = 1.0; fit.g[x0 + 1] = 0.3; fit.g[x0 + 2] = 2.0
-    l_powder = fit.loss()
-    l_best, (st, th, ph) = fit.texture_search(0, strength=0.7, n_dirs=48)
-    assert l_best < l_powder and (l_best - l_true) < 0.5 * (l_powder - l_true)
-
-
-def test_texture_search_weak():
-    """texture_search finds a weak texture (strength 0.92, noiseless data): from a random powder, the axis it keeps is
-    within 30 degrees of the truth, its strength is plate-like (below 1), and its loss is below the powder's."""
-    fit = _small_fit_texture(strength=0.92, noise=False)
-    M = fit.M; x0 = M.slices[0]['x'][0]
-    with torch.no_grad():
-        fit.g[x0] = 1.0; fit.g[x0 + 1] = 0.3; fit.g[x0 + 2] = 2.0
-    l_powder = fit.loss()
-    l_best, (st, th, ph) = fit.texture_search(0)
-    n = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
-    n_true = np.array([np.sin(0.9) * np.cos(0.4), np.sin(0.9) * np.sin(0.4), np.cos(0.9)])
-    assert l_best < l_powder and st < 1.0 and abs(float(n @ n_true)) > np.cos(np.radians(30))
+def test_shape_model_checks():
+    """Hybrid2 rejects a shape model it does not know, and fe_spectrum_model rejects a texture that is neither 9
+    coefficients nor a dict."""
+    from mbirtorch.hsnt.strain.model import Hybrid2
+    from mbirtorch.hsnt.strain.phantom import fe_spectrum_model
+    lam = np.linspace(2.0, 4.4, 50)
+    with pytest.raises(ValueError):
+        Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.85, 2.88))], n_spline=4, n_contam=1, device='cpu',
+                shape_model='texture3d')
+    with pytest.raises(ValueError):
+        fe_spectrum_model(lam, np.full_like(lam, 50.0), 16, 'cpu', texture=(0.7, 0.9, 0.4))
 
 
 def _small_fit_cubic4(seed=0, coeffs=None):
-    """Builds the small fit of _small_fit_texture with the cubic4 model. The data come from a degree-4 cubic texture
-    with coefficients coeffs (default: a fiber about a tilted axis) on eight views."""
+    """Builds a small FitB on the CPU with the cubic4 model: one bcc material, eight views with their own beam
+    directions, and per-ray dilations. The data come from a degree-4 cubic texture with coefficients coeffs (default: a
+    fiber about a tilted axis)."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,

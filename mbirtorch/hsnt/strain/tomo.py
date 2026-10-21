@@ -25,7 +25,7 @@ import time
 import numpy as np
 import torch
 
-from .model import Hybrid2, FitB, ls_init_material
+from .model import Hybrid2, FitB, ls_init_material, SHAPE_MODELS
 from .bragg import warm_start, BraggSpectrum
 from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
@@ -50,7 +50,6 @@ INIT_PIXEL_STEPS = 3            # per-ray map fits in the warm-up
 MOUNT_FD = (0.05, 0.05, 0.1)    # finite-difference steps for the mount derivatives: degrees, voxels, detector channels
 MOUNT_MAX_STEP = (0.5, 0.5, 0.5) # largest change per mount step: degrees, voxels, detector channels
 ANCHOR_STIFFNESS = 1e3          # the spectrum scale pin's weight, relative to the largest global Fisher diagonal entry
-TEXTURE_AXIS_START = (0.6, 0.4)  # texture3d: the axis's starting polar and azimuthal angles (generic, off the axes)
 
 
 STACK_GAP = 2                    # empty slices between stacked volumes, so a fractional row offset cannot mix them
@@ -903,6 +902,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     (9 coefficients, linear; model.harmonics4), starting as a random powder; it needs the strain-tensor weights, which
     hold the views' beam directions."""
     from mbirtorch import hsnt
+    if shape_model not in SHAPE_MODELS:
+        raise ValueError(f"shape_model must be one of {SHAPE_MODELS}, not {shape_model!r}")
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
@@ -967,10 +968,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     for r in range(R):
         ls_init_material(M, g, r, targets[r], a0[r])
         M.lb[M.slices[r]['a']] = M.ub[M.slices[r]['a']] = a0[r]                    # d0 reference
-        if shape_model == 'texture3d':                                             # a random powder to start
-            x0 = M.slices[r]['x'][0]
-            g[x0] = 1.0; g[x0 + 1] = TEXTURE_AXIS_START[0]; g[x0 + 2] = TEXTURE_AXIS_START[1]
-        elif shape_model == 'cubic4':                                              # a random powder: no degree-4 term
+        if shape_model == 'cubic4':                                              # a random powder: no degree-4 term
             g[M.slices[r]['x'][0]:M.slices[r]['x'][1]] = 0.0
     Mx = np.linalg.lstsq(targets.T, H0_local.T.astype(np.float64), rcond=None)[0].T
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)

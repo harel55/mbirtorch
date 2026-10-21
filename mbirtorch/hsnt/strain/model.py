@@ -103,16 +103,11 @@ LATTICE_HALF_WIDTH = 0.008   # relative half width of the lattice parameter sear
 LATTICE_COARSE_STEP = 5e-4   # relative spacing of its coarse grid: about a Bragg edge's width
 LATTICE_TOL = 1e-6           # relative tolerance of its golden-section refinement
 GOLDEN = (math.sqrt(5) - 1) / 2   # the golden section's ratio
-TEXTURE_R_RANGE = (0.3, 3.0)     # texture3d: the March-Dollase strength's bounds (1 is a random powder)
-TEXTURE_ANGLE_BOUND = math.inf   # texture3d: the axis angles' bounds: none (the factor is periodic in both, and a bound stops the axis)
-TEXTURE_TABLE = (65, 257)        # texture3d: the factor's table over |cos psi| and sin(theta)
-TEXTURE_CONE_POINTS = 48         # texture3d: points on each diffraction cone
-TEXTURE_SEARCH_DIRS = 24         # texture3d: axis directions tried by texture_search (over a hemisphere)
-TEXTURE_SEARCH_STRENGTH = 0.9    # texture3d: the probe strength of texture_search (and its inverse)
 CUBIC4_BOUND = 1.0               # cubic4: the bound on each degree-4 texture coefficient
 CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a truncated expansion can go negative)
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
-VIEW_TEXTURES = ("texture3d", "cubic4")   # shape models whose spectra depend on the view
+VIEW_TEXTURES = ("cubic4",)      # shape models whose spectra depend on the view
+SHAPE_MODELS = (None, "extinction", "texture", "cubic4")   # the shape models Hybrid2 accepts
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
 CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
 CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvature)
@@ -332,16 +327,18 @@ class Hybrid2:
             self.mats.append(dict(lattice=lt, ns=torch.as_tensor(ns, device=device, dtype=torch.float64), a_range=(a_lo, a_hi),
                                   mult=torch.as_tensor(multiplicities(lt, ns), device=device, dtype=torch.float64),
                                   k4=torch.as_tensor(cubic_k4(lt, ns), device=device, dtype=torch.float64)))
+        if shape_model not in SHAPE_MODELS:
+            raise ValueError(f"shape_model must be one of {SHAPE_MODELS}, not {shape_model!r}")
         self.shape_model = shape_model
         self.kernel = kernel
         self.slices, off = [], 0
-        nx = {"texture3d": 3, "cubic4": 9}.get(shape_model, 2)              # the linked shape block's width
+        nx = {"cubic4": 9}.get(shape_model, 2)              # the linked shape block's width
         for m in self.mats:
             ne = len(m["ns"]); o = off + 1 + 2 * ne
             sl = dict(a=off, h=(off + 1, off + 1 + ne), t=(off + 1 + ne, o), x=(o, o + nx), c=(o + nx, o + nx + 2),
                       s=(o + nx + 2, o + nx + 2 + self.n_spline))
             self.slices.append(sl); off = sl["s"][1]
-        self.view_dirs = None            # texture3d, cubic4: each view's beam direction in the sample frame (views, 3)
+        self.view_dirs = None            # cubic4: each view's beam direction in the sample frame (views, 3)
         self.res_sl = (off, off + 8); off += 8
         self.kap_sl = (off, off + self.J * self.R); off += self.J * self.R
         self.n_global = off
@@ -359,11 +356,6 @@ class Hybrid2:
             elif shape_model == "texture":
                 lb[sl["x"][0]], ub[sl["x"][0]] = 0.3, 3.0
                 lb[sl["x"][0] + 1], ub[sl["x"][0] + 1] = 0.0, math.pi / 2
-            elif shape_model == "texture3d":
-                # March-Dollase strength, then the axis's polar and azimuthal angles in the sample frame (left free:
-                # the factor is periodic in both)
-                lb[sl["x"][0]], ub[sl["x"][0]] = TEXTURE_R_RANGE
-                lb[sl["x"][0] + 1:sl["x"][1]] = -TEXTURE_ANGLE_BOUND; ub[sl["x"][0] + 1:sl["x"][1]] = TEXTURE_ANGLE_BOUND
             elif shape_model == "cubic4":
                 # the texture's 9 degree-4 coefficients in the sample frame (0: a random powder)
                 lb[sl["x"][0]:sl["x"][1]] = -CUBIC4_BOUND; ub[sl["x"][0]:sl["x"][1]] = CUBIC4_BOUND
@@ -401,7 +393,7 @@ class Hybrid2:
     def spectra(self, g, eps=None, views=None, tex=None):
         """mu (R, Kf), float64; or (Pc, R, Kf) in the model's dtype with per-pixel dilations eps (Pc, R): the edge
         positions are computed in float64, the per-pixel arrays (pixels x edges x bins) in the model's dtype. With
-        shape_model 'texture3d' and views (Pc,) (each pixel's view), each pixel's edges carry its view's texture factor
+        shape_model 'cubic4' and views (Pc,) (each pixel's view), each pixel's edges carry its view's texture factor
         (texture_factor; tex: the factors per material, already computed at g); without views the spectra are a random
         powder's."""
         x = self.lamf / self.lam_ref
@@ -483,42 +475,16 @@ class Hybrid2:
         return P.mean(-1)
 
     def texture_factor(self, g, r):
-        """Material r's texture factor (views, edges, fine bins) in the model's dtype, for shape_model 'texture3d': the
-        March-Dollase pole density with strength x0 about an axis at polar and azimuthal angles (x1, x2) in the sample
-        frame, averaged over each reflection's diffraction cone (the plane normals at 90 deg - theta from each view's beam,
-        view_dirs). It is tabulated over |cos psi| (psi the angle between the axis and the beam) and sin(theta) and
-        interpolated, so its cost does not grow with the views; it is 1 for a random powder and averages to 1 over the
-        beam directions.
-        With shape_model 'cubic4', the factor is 1 + k4(hkl) P4(sin theta) sum_j c_j Y4_j(beam) for each view and
-        reflection. This is the lowest-order texture of a cubic crystal (harmonics4, cubic_k4). P4(sin theta) is the
+        """Material r's texture factor (views, edges, fine bins) in the model's dtype, for shape_model 'cubic4'. The
+        factor is 1 + k4(hkl) P4(sin theta) sum_j c_j Y4_j(beam) for each view and reflection. This is the lowest-order
+        texture of a cubic crystal (harmonics4, cubic_k4). P4(sin theta) is the
         average of a degree-4 harmonic over the diffraction cone (Funk-Hecke). The cone closes on the beam at the edge."""
         m, sl = self.mats[r], self.slices[r]; x0 = sl["x"][0]
-        if self.shape_model == "cubic4":
-            e = 2.0 * g[sl["a"]] / torch.sqrt(m["ns"])                                          # unstrained edges
-            st = (self.lamf[None, :] / e[:, None]).clamp(0.0, 1.0)                              # sin(theta), (edges, Kf)
-            p4 = (35 * st ** 4 - 30 * st ** 2 + 3) / 8
-            A = harmonics4(torch.as_tensor(self.view_dirs, dtype=torch.float64, device=self.dev)) @ g[x0:x0 + 9]
-            return (1 + m["k4"][None, :, None] * p4[None] * A[:, None, None]).clamp_min(CUBIC4_FLOOR).to(self.dt)
-        r_md, th, ph = g[x0], g[x0 + 1], g[x0 + 2]
-        nc, ns_ = TEXTURE_TABLE
-        cp = torch.linspace(0, 1, nc, dtype=torch.float64, device=self.dev)[:, None, None]      # |cos psi|
-        st = torch.linspace(0, 1, ns_, dtype=torch.float64, device=self.dev)[None, :, None]     # sin(theta)
-        phi = torch.linspace(0, 2 * math.pi, TEXTURE_CONE_POINTS + 1, dtype=torch.float64, device=self.dev)[:-1]
-        ca = torch.sqrt(1 - st * st) * torch.cos(phi) * torch.sqrt(1 - cp * cp) + st * cp      # normal . axis
-        table = ((r_md ** 2 * ca * ca + (1 - ca * ca) / r_md) ** -1.5).mean(-1)                  # (nc, ns_)
-        axis = torch.stack([torch.sin(th) * torch.cos(ph), torch.sin(th) * torch.sin(ph), torch.cos(th)])
-        b = torch.as_tensor(self.view_dirs, dtype=torch.float64, device=self.dev)
-        cpv = (b @ axis).abs().clamp(max=1.0)                                                   # (views,)
         e = 2.0 * g[sl["a"]] / torch.sqrt(m["ns"])                                              # unstrained edges
-        stk = (self.lamf[None, :] / e[:, None]).clamp(0.0, 1.0)                                 # (edges, Kf)
-        # bilinear interpolation by indexing (differentiable in both directions, unlike grid_sample)
-        u = stk * (ns_ - 1); vv = cpv * (nc - 1)
-        j0 = u.detach().floor().clamp(0, ns_ - 2).long(); fu = u - j0
-        i0 = vv.detach().floor().clamp(0, nc - 2).long(); fv = (vv - i0)[:, None, None]
-        a_ = i0[:, None, None]; b_ = j0[None]
-        lo = (1 - fu) * table[a_, b_] + fu * table[a_, b_ + 1]
-        hi = (1 - fu) * table[a_ + 1, b_] + fu * table[a_ + 1, b_ + 1]
-        return ((1 - fv) * lo + fv * hi).to(self.dt)
+        st = (self.lamf[None, :] / e[:, None]).clamp(0.0, 1.0)                                  # sin(theta), (edges, Kf)
+        p4 = (35 * st ** 4 - 30 * st ** 2 + 3) / 8
+        A = harmonics4(torch.as_tensor(self.view_dirs, dtype=torch.float64, device=self.dev)) @ g[x0:x0 + 9]
+        return (1 + m["k4"][None, :, None] * p4[None] * A[:, None, None]).clamp_min(CUBIC4_FLOOR).to(self.dt)
 
     def band(self, g):
         """Banded operator values (K, bw), float64, rows normalized."""
@@ -677,7 +643,7 @@ class FitB:
         # variance inflation of pixel sums from spatially correlated counts (noise.py); scales score variances
         self.inflation = float(inflation)
         self.eps = None if eps is None else eps.clone()
-        self.ray_view = None             # (rays,) each ray's view, for a view-dependent spectrum (texture3d, cubic4)
+        self.ray_view = None             # (rays,) each ray's view, for a view-dependent spectrum (cubic4)
         self.chunk = chunk
         self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
         self.z = norm.isf(alpha / (2 * model.K)) if z is None else z
@@ -701,7 +667,7 @@ class FitB:
         return [slice(i, min(i + self.chunk, P)) for i in range(0, P, self.chunk)]
 
     def _texture(self, g):
-        """The texture factors per material at g (texture3d), computed once per state of g and kept; None when g carries
+        """The texture factors per material at g (cubic4), computed once per state of g and kept; None when g carries
         derivatives (automatic differentiation then goes through the factor) or there is no view-dependent texture."""
         if self.M.shape_model not in VIEW_TEXTURES or self.ray_view is None or g.requires_grad:
             return None
@@ -1076,7 +1042,7 @@ class FitB:
                 slr = M.slices[r]
                 if tex is not None and dtex is not None and eps is not None and (
                         slr["h"][0] <= i < slr["h"][1] or slr["x"][0] <= i < slr["x"][1]):
-                    # texture3d, cubic4: a height's derivative is its edge term times the view's factor; a texture parameter's
+                    # cubic4: a height's derivative is its edge term times the view's factor; a texture parameter's
                     # is the sum over edges of height x edge term x the factor's derivative (dtex, computed once)
                     if r not in terms:
                         terms[r] = M.edge_terms(self.g, eps, r)
@@ -1248,48 +1214,6 @@ class FitB:
             self.last_fisher_data = (list(idx), F.clone())          # without the penalties, for the step measure
             grad += gpen.detach()[idx]; F += Hpen.detach()
         return grad, F
-
-    def texture_search(self, r, strength=TEXTURE_SEARCH_STRENGTH, n_dirs=TEXTURE_SEARCH_DIRS):
-        """Finds material r's texture (texture3d) by a search over axis directions. For each of n_dirs directions spread over a
-        hemisphere (a Fibonacci lattice; the factor does not depend on the axis's sign), the loss at the strengths
-        `strength` and 1 / strength, with the random powder's loss, gives a parabola in the strength's logarithm. The
-        direction whose parabola reaches the lowest loss is then evaluated at that parabola's minimum, so weak and
-        strong textures are both found. Keeps the best loss evaluated, the current parameters included. Use it before
-        the global steps: from a random powder the axis has no gradient, and the loss is not convex in it. Returns
-        (loss, (strength, polar, azimuth))."""
-        M = self.M; x0 = M.slices[r]["x"][0]
-        u_lo, u_hi = math.log(float(M.lb[x0])), math.log(float(M.ub[x0]))
-
-        def L(s_, th, ph):
-            gg = self.g.clone(); gg[x0] = s_; gg[x0 + 1] = th; gg[x0 + 2] = ph
-            return self.loss(g=gg)
-        best = (self.loss(), tuple(float(v) for v in self.g[x0:x0 + 3]))
-        th0, ph0 = best[1][1], best[1][2]
-        l0 = L(1.0, th0, ph0)                                              # a random powder: the axis does not matter
-        if l0 < best[0]:
-            best = (l0, (1.0, th0, ph0))
-        h = abs(math.log(strength))
-        k = np.arange(n_dirs) + 0.5
-        polar = np.arccos(1 - k / n_dirs); azim = (math.pi * (1 + math.sqrt(5)) * k) % (2 * math.pi)
-        pred = None
-        for th, ph in zip(polar.tolist(), azim.tolist()):
-            lm, lp = L(math.exp(-h), th, ph), L(math.exp(h), th, ph)
-            for s_, l_ in ((math.exp(-h), lm), (math.exp(h), lp)):
-                if l_ < best[0]:
-                    best = (l_, (s_, th, ph))
-            a = (lp + lm - 2.0 * l0) / (2.0 * h * h); b = (lp - lm) / (2.0 * h)   # loss = l0 + b u + a u^2, u = log strength
-            if a > 0:
-                u = min(max(-b / (2.0 * a), u_lo), u_hi)
-                lu = l0 + b * u + a * u * u
-                if pred is None or lu < pred[0]:
-                    pred = (lu, (math.exp(u), th, ph))
-        if pred is not None:
-            l_ = L(*pred[1])
-            if l_ < best[0]:
-                best = (l_, pred[1])
-        with torch.no_grad():
-            self.g[x0:x0 + 3] = torch.tensor(best[1], dtype=self.g.dtype, device=self.g.device)
-        return best
 
     def lattice_search(self, r, half_width=LATTICE_HALF_WIDTH, step=LATTICE_COARSE_STEP, rel_tol=LATTICE_TOL):
         """Material r's lattice parameter: the loss on a grid of relative spacing `step` over a0 * (1 +- half_width),
