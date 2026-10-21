@@ -50,9 +50,10 @@ def multiplicities(lattice, ns):
 
 
 def cubic_k4(lattice, ns):
-    """For each h^2 + k^2 + l^2 in ns, the cubic harmonic of degree 4, (h^4 + k^4 + l^4) / (h^2 + k^2 + l^2)^2 - 3/5, averaged
-    over the (h, k, l) the lattice type allows (several families can share h^2 + k^2 + l^2). In a cubic crystal a
-    texture's lowest-order effect on reflection hkl is proportional to it: 0.4 for 200, -0.1 for 110, 211 and 220."""
+    """Returns, for each h^2 + k^2 + l^2 in ns, the cubic harmonic of degree 4, (h^4 + k^4 + l^4) / (h^2 + k^2 + l^2)^2 - 3/5,
+    averaged over the (h, k, l) that the lattice type allows. Several families can share h^2 + k^2 + l^2. In a cubic
+    crystal, a texture's lowest-order effect on reflection hkl is proportional to this value. It is 0.4 for 200 and
+    -0.1 for 110, 211 and 220."""
     from .bragg import LATTICES
     allowed = LATTICES[lattice]
     out = []
@@ -65,7 +66,7 @@ def cubic_k4(lattice, ns):
 
 
 def _harmonics4_raw(u):
-    """The 9 real spherical harmonics of degree 4 at unit vectors u (..., 3), unnormalized (polynomial forms)."""
+    """Returns the 9 real spherical harmonics of degree 4 at unit vectors u (..., 3) as unnormalized polynomials."""
     x, y, z = u[..., 0], u[..., 1], u[..., 2]
     return torch.stack([35 * z ** 4 - 30 * z ** 2 + 3, x * z * (7 * z ** 2 - 3), y * z * (7 * z ** 2 - 3),
                         (x * x - y * y) * (7 * z ** 2 - 1), x * y * (7 * z ** 2 - 1), x * z * (x * x - 3 * y * y),
@@ -73,7 +74,8 @@ def _harmonics4_raw(u):
 
 
 def _sphere_quadrature(dtype=torch.float64, device="cpu"):
-    """Points and weights (summing to 1) of a product quadrature on the sphere, exact for polynomials of degree 8."""
+    """Returns the points and the weights (summing to 1) of a product quadrature on the sphere. It is exact for
+    polynomials up to degree 8."""
     nz, nphi = CUBIC4_QUADRATURE
     zq, wq = np.polynomial.legendre.leggauss(nz)
     phi = 2 * math.pi * np.arange(nphi) / nphi
@@ -84,9 +86,10 @@ def _sphere_quadrature(dtype=torch.float64, device="cpu"):
 
 
 def harmonics4(u):
-    """The 9 real spherical harmonics of degree 4 at unit vectors u (..., 3), each scaled to a root mean square of 1 over
-    the sphere (they are orthogonal), in float64. A cubic material's texture to lowest order changes the pole density
-    of reflection hkl along direction y by k4(hkl) * sum_j c_j harmonics4(y)_j (cubic_k4; there is no degree-2 term)."""
+    """Returns the 9 real spherical harmonics of degree 4 at unit vectors u (..., 3) in float64. Each is scaled to a root
+    mean square of 1 over the sphere, and they are orthogonal. To lowest order, a texture changes the pole density of a
+    cubic material's reflection hkl along direction y by k4(hkl) * sum_j c_j harmonics4(y)_j (cubic_k4). There is no
+    degree-2 term."""
     u = torch.as_tensor(u, dtype=torch.float64)
     pts, w = _sphere_quadrature(device=u.device)
     norm = torch.sqrt((w[:, None] * _harmonics4_raw(pts) ** 2).sum(0))
@@ -486,9 +489,9 @@ class Hybrid2:
         view_dirs). It is tabulated over |cos psi| (psi the angle between the axis and the beam) and sin(theta) and
         interpolated, so its cost does not grow with the views; it is 1 for a random powder and averages to 1 over the
         beam directions.
-        With shape_model 'cubic4': 1 + k4(hkl) P4(sin theta) sum_j c_j Y4_j(beam) for each view and reflection, the
-        lowest-order texture of a cubic crystal (harmonics4, cubic_k4); P4(sin theta) is the average of a degree-4
-        harmonic over the diffraction cone (Funk-Hecke), which closes on the beam at the edge."""
+        With shape_model 'cubic4', the factor is 1 + k4(hkl) P4(sin theta) sum_j c_j Y4_j(beam) for each view and
+        reflection. This is the lowest-order texture of a cubic crystal (harmonics4, cubic_k4). P4(sin theta) is the
+        average of a degree-4 harmonic over the diffraction cone (Funk-Hecke). The cone closes on the beam at the edge."""
         m, sl = self.mats[r], self.slices[r]; x0 = sl["x"][0]
         if self.shape_model == "cubic4":
             e = 2.0 * g[sl["a"]] / torch.sqrt(m["ns"])                                          # unstrained edges
@@ -1303,7 +1306,7 @@ class FitB:
         return grad, F
 
     def texture_search(self, r, strength=TEXTURE_SEARCH_STRENGTH, n_dirs=TEXTURE_SEARCH_DIRS):
-        """Material r's texture (texture3d) by a search over axis directions. For each of n_dirs directions spread over a
+        """Finds material r's texture (texture3d) by a search over axis directions. For each of n_dirs directions spread over a
         hemisphere (a Fibonacci lattice; the factor does not depend on the axis's sign), the loss at the strengths
         `strength` and 1 / strength, with the random powder's loss, gives a parabola in the strength's logarithm. The
         direction whose parabola reaches the lowest loss is then evaluated at that parabola's minimum, so weak and

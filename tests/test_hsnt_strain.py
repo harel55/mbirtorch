@@ -522,8 +522,8 @@ def test_texture_search_weak():
 
 
 def _small_fit_cubic4(seed=0, coeffs=None):
-    """The small textured fit of _small_fit_texture with the cubic4 model: a degree-4 cubic texture (coefficients
-    coeffs, default a fiber about a tilted axis) on eight views."""
+    """Builds the small fit of _small_fit_texture with the cubic4 model. The data come from a degree-4 cubic texture
+    with coefficients coeffs (default: a fiber about a tilted axis) on eight views."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
@@ -550,8 +550,9 @@ def _small_fit_cubic4(seed=0, coeffs=None):
 
 
 def test_cubic4_harmonics():
-    """harmonics4 gives 9 orthogonal functions of root mean square 1 over the sphere, with no degree-2 part: each is
-    orthogonal to the degree-2 monomials. cubic_k4 is 0.4 for bcc 200, -0.1 for 110, 211 and 220, -4/15 for 222."""
+    """harmonics4 gives 9 orthogonal functions with a root mean square of 1 over the sphere. Each is orthogonal to the
+    degree-2 monomials, so none has a degree-2 part. cubic_k4 is 0.4 for bcc 200, -0.1 for 110, 211 and 220, and -4/15
+    for 222."""
     from mbirtorch.hsnt.strain.model import harmonics4, cubic_k4, _sphere_quadrature
     pts, w = _sphere_quadrature()
     Y = harmonics4(pts)
@@ -563,8 +564,8 @@ def test_cubic4_harmonics():
 
 
 def test_cubic4_factor():
-    """The cubic4 factor is 1 for a random powder; at an edge it equals the pole density along the beam; below the edge
-    it equals the pole density averaged over the diffraction cone (checked against a direct average on the cone)."""
+    """The cubic4 factor is 1 for a random powder. Below each edge it equals the pole density averaged over the
+    diffraction cone, checked against a direct average on the cone."""
     from mbirtorch.hsnt.strain.model import harmonics4
     fit = _small_fit_cubic4()
     M = fit.M; sl = M.slices[0]; x0 = sl['x'][0]; g = fit.g.clone()
