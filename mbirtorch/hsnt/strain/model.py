@@ -596,10 +596,12 @@ class FitB:
         each material's spectrum at one fine-grid index: (index, targets (R,), weight). The pin removes the scale that
         maps and spectra otherwise trade freely (X = W mu is unchanged by mu -> s mu, W -> W / s)."""
         tot = 0.0
-        for sl in self.M.slices:
+        scale = getattr(self, "spline_scale", None)
+        for r, sl in enumerate(self.M.slices):
             sp = g[sl["s"][0]:sl["s"][1]]
             d2 = sp[2:] - 2 * sp[1:-1] + sp[:-2]
-            tot = tot + self.ridge * ((d2 * d2).sum() + 1e-2 * (sp * sp).sum())
+            w = self.ridge * (1.0 if scale is None else float(scale[r]))
+            tot = tot + w * ((d2 * d2).sum() + 1e-2 * (sp * sp).sum())
         kp = getattr(self, "kappa_prior", None)
         if kp is not None:
             # a weak Gaussian prior on the contamination's attenuation by the sample, centred on 0 (contamination
@@ -609,9 +611,28 @@ class FitB:
             tot = tot + 0.5 * (kap * kap).sum() / kp ** 2
         anchor = getattr(self, "scale_anchor", None)
         if anchor is not None:
-            k, targets, weight = anchor
-            tot = tot + weight * ((self.M.spectra(g)[:, k] - targets) ** 2).sum()
+            k, targets, weight = anchor                  # weight: one number, or one per material
+            tot = tot + (weight * (self.M.spectra(g)[:, k] - targets) ** 2).sum()
         return tot
+
+    def rescale_material(self, r, factor):
+        """Multiply material r's spectrum by factor (its edge heights, smooth part and spline) and its contamination
+        attenuations, for a density divided by factor: the predicted data are unchanged, and so are the penalties (the
+        spline penalty's weight and the scale anchor's are divided by factor squared, its target multiplied)."""
+        M = self.M; sl = M.slices[r]
+        with torch.no_grad():
+            for key in ("h", "c", "s"):
+                self.g[sl[key][0]:sl[key][1]] *= factor
+            for j in range(M.J):
+                self.g[M.kap_sl[0] + j * M.R + r] *= factor
+            if getattr(self, "spline_scale", None) is None:
+                self.spline_scale = torch.ones(M.R, dtype=torch.float64)
+            self.spline_scale[r] /= factor ** 2
+            if getattr(self, "scale_anchor", None) is not None:
+                k, targets, weight = self.scale_anchor
+                w = (weight if torch.is_tensor(weight) else torch.full((M.R,), float(weight), dtype=torch.float64, device=targets.device)).clone()
+                targets = targets.clone(); targets[r] *= factor; w[r] /= factor ** 2
+                self.scale_anchor = (k, targets, w)
 
     def loss(self, g=None, W=None, f=None, eps=None):
         g = self.g if g is None else g; f = self.f if f is None else f

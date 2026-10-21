@@ -259,3 +259,26 @@ def test_spike_phantom_equilibrium():
     for r in range(3):
         interior = nd.binary_erosion(mat == r, iterations=2)
         assert float(np.percentile(f[interior], 99)) < 1e-2 * jump
+
+
+def test_equilibrium_corner_stencil():
+    """The corner stencil sees a stress alternating along one axis (invisible to central differences), gives the exact
+    derivative of a linear stress, and still misses a pattern alternating along two axes (an hourglass mode)."""
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    n = 8
+    idx = torch.arange(n, dtype=torch.float64)
+    full = torch.ones(n, n, n, 1, dtype=torch.bool)
+    res = {}
+    for stencil in ('central', 'corner'):
+        tf = object.__new__(TomoFit); tf.elastic = [(1.0, 0.0)]; tf.eq_stencil = stencil   # nu = 0: sigma_xx = e_xx
+        E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
+        E[..., 0, 0] = ((-1.0) ** idx)[None, :, None].expand(n, n, n)                      # e_xx alternating along x
+        alt = tf._divergence(E, full)[1:-1, 1:-2, 1:-1, 0, 0].abs().max()
+        E[..., 0, 0] = 0.01 * idx[None, :, None].expand(n, n, n)                            # linear along x
+        lin = tf._divergence(E, full)[1:-1, 1:-2, 1:-1, 0, 0]
+        E[..., 0, 0] = ((-1.0) ** (idx[:, None] + idx[None, :]))[..., None].expand(n, n, n)  # alternating along x and y
+        hg = tf._divergence(E, full)[1:-1, 1:-2, 1:-1, 0, 0].abs().max()
+        res[stencil] = (float(alt), lin, float(hg))
+    assert res['central'][0] < 1e-12 and res['corner'][0] > 0.5                 # only the corner stencil sees it
+    assert torch.allclose(res['corner'][1], torch.full_like(res['corner'][1], 0.01))
+    assert res['corner'][2] < 1e-12                                              # the hourglass mode remains
