@@ -50,6 +50,7 @@ INIT_PIXEL_STEPS = 3            # per-ray map fits in the warm-up
 MOUNT_FD = (0.05, 0.05, 0.1)    # finite-difference steps for the mount derivatives: degrees, voxels, detector channels
 MOUNT_MAX_STEP = (0.5, 0.5, 0.5) # largest change per mount step: degrees, voxels, detector channels
 ANCHOR_STIFFNESS = 1e3          # the spectrum scale pin's weight, relative to the largest global Fisher diagonal entry
+TEXTURE_AXIS_START = (0.6, 0.4)  # texture3d: the axis's starting polar and azimuthal angles (generic, off the axes)
 
 
 STACK_GAP = 2                    # empty slices between stacked volumes, so a fractional row offset cannot mix them
@@ -1066,7 +1067,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='corner',
-           noise=None, detector_tiles=(1, 1)):
+           noise=None, detector_tiles=(1, 1), shape_model=None):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1085,7 +1086,10 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     attenuations are multiplied by it, so the predicted data are unchanged. noise='measure' measures the counts' noise on
     the rays that miss the sample (noise.measure_noise) and fits with the dose divided by the measured dispersion and
     the measured inflation in place of d and inflation; None uses d and inflation as given. detector_tiles: the
-    detector's sensors as (rows, channels) tiles, each with its own open-beam level when air rays are found."""
+    detector's sensors as (rows, channels) tiles, each with its own open-beam level when air rays are found.
+    shape_model='texture3d' gives each material a March-Dollase texture (strength and axis, model.Hybrid2.texture_factor):
+    each view's edges carry its own factor (needs the strain-tensor weights, which hold the views' beam directions); it
+    starts as a random powder."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -1130,7 +1134,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     targets = np.stack(targets)
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
-    M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True, kernel=kernel)
+    M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True, kernel=kernel,
+                shape_model=shape_model)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     if kernel_values is not None:                       # a calibrated kernel, held fixed
@@ -1143,6 +1148,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     for r in range(R):
         ls_init_material(M, g, r, targets[r], a0[r])
         M.lb[M.slices[r]['a']] = M.ub[M.slices[r]['a']] = a0[r]                    # d0 reference
+        if shape_model == 'texture3d':                                             # a random powder to start
+            x0 = M.slices[r]['x'][0]
+            g[x0] = 1.0; g[x0 + 1] = TEXTURE_AXIS_START[0]; g[x0 + 2] = TEXTURE_AXIS_START[1]
     Mx = np.linalg.lstsq(targets.T, H0_local.T.astype(np.float64), rcond=None)[0].T
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
     # the pipeline's per-ray fits of the maps to the initial spectra (no strain yet)
@@ -1162,6 +1170,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     V = x.clamp_min(0)
     fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask)
+    if shape_model == 'texture3d':                                                 # each view's beam, each ray's view
+        from .geometry import directions_from_weights
+        assert weights is not None, 'texture3d needs the strain-tensor weights (they hold the beam directions)'
+        rpv = getattr(proj, 'rays_per_view', proj.n * proj.n)
+        M.view_dirs = directions_from_weights(weights)
+        fit.ray_view = torch.arange(T.shape[0] // rpv, device=T.device).repeat_interleave(rpv)
     if kappa_prior is not None:
         # the standard deviation as a multiple of the warm-up spectra's mean attenuation (kappa's own units)
         fit.kappa_prior = kappa_prior * float(np.abs(targets).mean())

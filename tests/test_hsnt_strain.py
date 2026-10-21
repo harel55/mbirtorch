@@ -1,4 +1,5 @@
 """Tests of the experimental strain-tomography projectors in ``mbirtorch.hsnt.strain``."""
+import math
 import numpy as np
 import pytest
 import torch
@@ -433,3 +434,61 @@ def test_normalize_views():
     assert np.abs(lv - rel).max() < 3e-4 and flagged == [(7, 2)]
     lv2, _ = normalize_views(T, (images, side, side), tiles=(2, 2))
     assert np.abs(lv2 - 1).max() < 3e-4                                         # every view and tile at the median level
+
+
+def _small_fit_texture(seed=0):
+    """A small FitB on the CPU with a March-Dollase texture (texture3d): one bcc material, eight views with their own beam
+    directions, per-ray dilations, counts from the model."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    lam = np.linspace(2.0, 4.4, 300)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64, shape_model='texture3d')
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    g[sl['x'][0]] = 0.7; g[sl['x'][0] + 1] = 0.9; g[sl['x'][0] + 2] = 0.4
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    gen = torch.Generator().manual_seed(seed)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
+    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64), eps=eps, chunk=16)
+    fit.ray_view = torch.arange(P) % 8
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
+    return fit
+
+
+def test_texture_factor():
+    """The texture factor is 1 for a random powder, averages to about 1 over beam directions, does not depend on the
+    axis's sign, and differs between views for a textured sample."""
+    fit = _small_fit_texture()
+    M = fit.M; x0 = M.slices[0]['x'][0]; g = fit.g.clone()
+    g[x0] = 1.0
+    assert torch.allclose(M.texture_factor(g, 0), torch.ones(()).double(), atol=1e-9)
+    g[x0] = 0.7
+    d = torch.randn(4000, 3, generator=torch.Generator().manual_seed(5), dtype=torch.float64)
+    keep = M.view_dirs; M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    avg = M.texture_factor(g, 0).mean(0)                                     # over beam directions
+    e = 2.0 * float(g[M.slices[0]['a']]) / np.sqrt(M.mats[0]['ns'].numpy())
+    below = (M.lamf.numpy()[None, :] < 0.95 * e[:, None])                     # bins below each edge
+    assert abs(float(avg.numpy()[below].mean()) - 1.0) < 0.03
+    M.view_dirs = keep
+    f1 = M.texture_factor(g, 0)
+    g2 = g.clone(); g2[x0 + 1] = math.pi - g[x0 + 1]; g2[x0 + 2] = g[x0 + 2] + math.pi    # the opposite axis
+    assert torch.allclose(f1, M.texture_factor(g2, 0), atol=1e-9)
+    assert float((f1.max(0).values - f1.min(0).values).max()) > 0.1
+
+
+def test_texture_global_grad():
+    """With texture3d the gradient by automatic differentiation (global_grad) equals global_system's for the texture,
+    height and lattice parameters (the per-view factor enters both)."""
+    fit = _small_fit_texture()
+    M = fit.M; sl = M.slices[0]
+    idx = list(range(sl['h'][0], sl['h'][1])) + list(range(sl['x'][0], sl['x'][1]))
+    g1, F = fit.global_system(idx)
+    g2 = fit.global_grad(idx)
+    assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
+    assert bool((torch.diagonal(F) > 0).all())

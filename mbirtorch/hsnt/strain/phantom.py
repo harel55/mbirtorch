@@ -542,12 +542,13 @@ def fe_cube_tensor(N, offset=0.0):
     return cube, eps
 
 
-def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', kernel_values=None):
+def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', kernel_values=None, texture=None):
     """A Hybrid2 model for bcc Fe on the axis lam and its parameter vector: Bragg heights j d, a smooth part, the
     resolution kernel, scaled so the attenuation per voxel at 3 Angstrom is FE_ATTEN_3A / n. kernel: the kernel's form
-    (model.Hybrid2); kernel_values: its 8 parameters (default: JOINT_KERNEL, a two-scale kernel)."""
+    (model.Hybrid2); kernel_values: its 8 parameters (default: JOINT_KERNEL, a two-scale kernel). texture: (March-Dollase
+    strength, axis polar angle, axis azimuth) for a textured cube (shape model texture3d; the caller sets view_dirs)."""
     M = Hybrid2(lam, dose_per_bin, [(FE['lattice'], (FE['a'] * (1 - FE_A_RANGE), FE['a'] * (1 + FE_A_RANGE)))], n_spline=8, n_contam=2,
-                device=device, two_scale=True, kernel=kernel)
+                device=device, two_scale=True, kernel=kernel, shape_model=None if texture is None else 'texture3d')
     g = torch.zeros(M.n_global, dtype=torch.float64, device=device)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL if kernel_values is None else kernel_values, dtype=torch.float64)
     sl = M.slices[0]
@@ -555,6 +556,8 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', ke
     ns = M.mats[0]['ns'].cpu().numpy(); d = FE['a'] / np.sqrt(ns)
     g[sl['h'][0]:sl['h'][1]] = torch.as_tensor(np.array(multiplicities(FE['lattice'], ns), float) * d)
     g[sl['c'][0]] = 0.3; g[sl['c'][0] + 1] = 0.2
+    if texture is not None:
+        g[sl['x'][0]:sl['x'][1]] = torch.as_tensor(np.asarray(texture, float))
     with torch.no_grad():
         mu = M.spectra(g)[0].cpu().numpy()
     k3 = np.abs(M.lamf.cpu().numpy() - 3.0).argmin()
@@ -565,7 +568,7 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', ke
 
 def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, offsets=None, levels=31, fine=2, seed=1,
                  device='cuda', axis=None, holder=True, contamination=True, kernel='two_scale', kernel_values=None,
-                 cube_shift=0.0):
+                 cube_shift=0.0, texture=None):
     """Synthetic data shaped like the Fe cube measurement: a bcc Fe cube with a residual-stress strain tensor
     (fe_cube_tensor), seen by rotation series with their own mounts and a holder rod each.
 
@@ -580,7 +583,8 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     the true spectrum, and holder_rows (the first detector row of the holder in each series). kernel, kernel_values:
     the resolution kernel the data are generated with (see fe_spectrum_model). cube_shift moves the cube along all three
     axes by this many detector pixels (a multiple of 1 / fine), so that its faces can fall between the planes of a
-    finer reconstruction grid."""
+    finer reconstruction grid. texture: (March-Dollase strength, axis polar angle, axis azimuth in the sample frame) for
+    a textured cube: each view's Bragg edges carry that view's texture factor (model.Hybrid2.texture_factor)."""
     import mbirtorch
     from .geometry import series_weights
     from .tomo import MultiProjector, Projector, detector_directions
@@ -594,10 +598,13 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     else:
         lam, flux = np.asarray(axis[0]), np.asarray(axis[1])
     d = dose * flux / np.mean(flux)
-    M, g = fe_spectrum_model(lam, d, n, device, kernel=kernel, kernel_values=kernel_values)
+    M, g = fe_spectrum_model(lam, d, n, device, kernel=kernel, kernel_values=kernel_values, texture=texture)
     N = fine * n; V_ = len(angles); S = len(mounts)
     cube, et = fe_cube_tensor(N, cube_shift / n)
     wts = series_weights([((m[0], m[1], m[2]), angles) for m in mounts])         # (S views, 6)
+    if texture is not None:
+        from .geometry import directions_from_weights
+        M.view_dirs = directions_from_weights(wts)
     seen_all = [(et * w).sum(-1) for w in wts]
     lv = np.linspace(min(s[cube].min() for s in seen_all), max(s[cube].max() for s in seen_all), levels)
     proj = np.zeros((levels, S * V_, n, n))                                      # path length per strain level
@@ -643,7 +650,13 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
             if float(w.max()) <= 0:
                 continue
             eps_t = torch.full((1, 1), float(e_l), dtype=torch.float64, device=device)
-            X += w[:, None] * M.spectra(g, eps_t)[0, 0].float()[None, :]
+            if texture is None:
+                X += w[:, None] * M.spectra(g, eps_t)[0, 0].float()[None, :]
+            else:                                   # each view's spectrum, with its own texture factor
+                nv = S * V_; per = n * n
+                spec = M.spectra(g, eps_t.expand(nv, 1), torch.arange(nv, device=device))[:, 0].float()   # (views, Kf)
+                for v in range(nv):
+                    X[v * per:(v + 1) * per] += w[v * per:(v + 1) * per, None] * spec[v][None, :]
         mu0 = M.spectra(g)[0]
         X += torch.as_tensor(hold, dtype=torch.float32, device=device)[:, None] * float(HOLDER['atten'] * mu0.mean())
         n_t = M.apply_band(torch.exp(-X), M.band_matrix(M.band(g)))
