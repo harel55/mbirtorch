@@ -576,9 +576,6 @@ class FitB:
         # Not with a free resolution kernel, whose band enters the gradient without derivatives.
         self.fisher_every = 1
         self._fisher = None
-        # contamination_newton: the contamination step takes a full Newton step on the atom coefficients
-        # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
-        self.contamination_newton = False
         self.last_step_se = float('inf')      # the last global step's RMS in standard errors (global_step)
 
     def dose(self, sl):
@@ -614,12 +611,10 @@ class FitB:
         each material's spectrum at one fine-grid index: (index, targets (R,), weight). The pin removes the scale that
         maps and spectra otherwise trade freely (X = W mu is unchanged by mu -> s mu, W -> W / s)."""
         tot = 0.0
-        scale = getattr(self, "spline_scale", None)
         for r, sl in enumerate(self.M.slices):
             sp = g[sl["s"][0]:sl["s"][1]]
             d2 = sp[2:] - 2 * sp[1:-1] + sp[:-2]
-            w = self.ridge * (1.0 if scale is None else float(scale[r]))
-            tot = tot + w * ((d2 * d2).sum() + 1e-2 * (sp * sp).sum())
+            tot = tot + self.ridge * ((d2 * d2).sum() + 1e-2 * (sp * sp).sum())
         kp = getattr(self, "kappa_prior", None)
         if kp is not None:
             # a weak Gaussian prior on the contamination's attenuation by the sample, centred on 0 (contamination
@@ -632,25 +627,6 @@ class FitB:
             k, targets, weight = anchor                  # weight: one number, or one per material
             tot = tot + (weight * (self.M.spectra(g)[:, k] - targets) ** 2).sum()
         return tot
-
-    def rescale_material(self, r, factor):
-        """Multiply material r's spectrum by factor (its edge heights, smooth part and spline) and its contamination
-        attenuations, for a density divided by factor: the predicted data are unchanged, and so are the penalties (the
-        spline penalty's weight and the scale anchor's are divided by factor squared, its target multiplied)."""
-        M = self.M; sl = M.slices[r]
-        with torch.no_grad():
-            for key in ("h", "c", "s"):
-                self.g[sl[key][0]:sl[key][1]] *= factor
-            for j in range(M.J):
-                self.g[M.kap_sl[0] + j * M.R + r] *= factor
-            if getattr(self, "spline_scale", None) is None:
-                self.spline_scale = torch.ones(M.R, dtype=torch.float64)
-            self.spline_scale[r] /= factor ** 2
-            if getattr(self, "scale_anchor", None) is not None:
-                k, targets, weight = self.scale_anchor
-                w = (weight if torch.is_tensor(weight) else torch.full((M.R,), float(weight), dtype=torch.float64, device=targets.device)).clone()
-                targets = targets.clone(); targets[r] *= factor; w[r] /= factor ** 2
-                self.scale_anchor = (k, targets, w)
 
     # -- the data loss at the current state, remembered from the passes that compute it anyway (the derivative passes
     # and the accepted trials of the line searches), so a step's starting loss and a driver's log cost no pass. It is
@@ -782,32 +758,6 @@ class FitB:
         Hpen = torch.stack([torch.autograd.grad(gpen[i], gp, retain_graph=True)[0] for i in idx])[:, idx]
         return gpen.detach()[idx], Hpen.detach()
 
-    def joint_system(self, idx, chunk=None):
-        """For a joint step over the rays' (W, U) and the global parameters idx: per ray the gradient (P, 2R) and Fisher
-        information (P, 2R, 2R) for (W, U) and their cross information with the global parameters (P, 2R, n); and the
-        global gradient (n) and Fisher information (n, n), penalties included. Needs per-ray strain."""
-        M = self.M; R = M.R
-        cache, dmu, dRb = self.global_derivatives(idx)
-        P = self.T.shape[0]; n = len(idx); dev = self.T.device
-        gch = chunk or max(64, self.chunk // 4)
-        G = torch.zeros(P, 2 * R, device=dev, dtype=torch.float64); Fw = torch.zeros(P, 2 * R, 2 * R, device=dev, dtype=torch.float64)
-        C = torch.zeros(P, 2 * R, n, device=dev, dtype=torch.float32)
-        gg = torch.zeros(n, device=dev, dtype=torch.float64); Fg = torch.zeros(n, n, device=dev, dtype=torch.float64)
-        for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
-            Jw, m = self.ray_jacobian(sl, cache)                                      # (Pc, K, 2R)
-            Jg, _ = self.global_jacobian(sl, cache, idx, dmu, dRb)                     # (n, Pc, K)
-            mm = m.clamp_min(1e-12); T = self.T[sl]
-            r_ = self.dose(sl) * (1 - T / mm); w_ = self.dose(sl) / mm
-            G[sl] = torch.einsum('pk,pkn->pn', r_, Jw).double()
-            Fw[sl] = torch.einsum('pk,pka,pkb->pab', w_, Jw, Jw).double()
-            C[sl] = torch.einsum('pk,pka,npk->pan', w_, Jw, Jg)
-            gg += torch.einsum('pk,npk->n', r_, Jg).double()
-            Fg += torch.einsum('pk,apk,bpk->ab', w_, Jg, Jg).double()
-            del Jw, Jg
-        all_sum(gg); all_sum(Fg)
-        gp, Hp = self.penalty_system(idx)
-        return G, Fw, C, gg + gp, Fg + Hp
-
     def ray_jacobian(self, sl, cache):
         """d m / d (W, U) of the rays sl, (Pc, K, 2R), and the mean m (Pc, K)."""
         M = self.M; R = M.R
@@ -854,11 +804,10 @@ class FitB:
         self.freeze_threshold = False
 
     def contamination_atoms_step(self, iters=4):
-        """One step on the contamination atoms' coefficients c (f = c A^T), with the L1 thresholds lam_c and c >= 0.
-        The default step uses each atom's own curvature only. The atoms overlap (single bins and bumps of several
-        widths), so that step overshoots and is halved repeatedly, and the contamination converges slowly. With
-        contamination_newton, the step minimizes the full quadratic model in all atoms of all components (the bin-wise
-        Fisher information, including the coupling between the components) by FISTA, then takes the same line search."""
+        """One step on the contamination atoms' coefficients c (f = c A^T), with the L1 thresholds lam_c and c >= 0: the
+        minimizer of the full quadratic model in all atoms of all components (the bin-wise Fisher information, including
+        the coupling between the components) by FISTA, then a line search. The atoms overlap (single bins and bumps of
+        several widths), so a step with each atom's own curvature would overshoot and converge slowly."""
         M = self.M; J = M.J
         if not J:
             return
@@ -885,18 +834,13 @@ class FitB:
                 pear += float((self.dose(sl) * (T - m) ** 2 / mm).sum(dtype=torch.float64))
         all_sum(grad); all_sum(Fx); all_sum(Fi0); pear = all_sum_float(pear, M.dev); dev = all_sum_float(dev, M.dev)
         self.remember_data_loss(dev)
-        Fd = torch.diagonal(Fx, dim1=1, dim2=2)
         self.dispersion = pear / self.n_points
         A = self.A.double()
         if not (self.freeze_threshold and hasattr(self, "lam_c")):
             self.lam_c = (self.z_atoms * torch.sqrt(self.dispersion * self.inflation * ((A * A).T @ Fi0))).T.to(M.dt)   # (J, n_atoms)
         gc = (A.T @ grad).T                                                           # (J, n_atoms)
         c_old = self.c.double()
-        if self.contamination_newton:
-            c_new = self._contamination_newton(A, gc, Fx, c_old)
-        else:
-            Hc = ((A * A).T @ Fd).T.clamp_min(1e-30)
-            c_new = (c_old - (gc + self.lam_c.double()) / Hc).clamp_min(0)
+        c_new = self._contamination_newton(A, gc, Fx, c_old)
         # the starting loss from this step's own pass when the current f is the current c's (as every step leaves it)
         l0 = (dev + float((self.lam_c * self.c).sum())) if torch.equal(self._contamination_f(self.c), self.f) else self.loss_c(self.c)
         dev_new = None
@@ -1181,20 +1125,6 @@ class FitB:
                 best = (f_, x_)
         self.g[ia] = best[1]
         return best
-
-    def lattice_scan(self, r, half_width=0.004, n=21):
-        """Line search on material r's lattice parameter (non-convex: an edge sees no gradient far from its place):
-        evaluate the loss on a grid of a about the current value and keep the best."""
-        M = self.M; sl = M.slices[r]
-        a0 = float(self.g[sl["a"]]); best = (self.loss(), a0)
-        for a in np.linspace(a0 * (1 - half_width), a0 * (1 + half_width), n):
-            gg = self.g.clone(); gg[sl["a"]] = a
-            l = self.loss(g=gg)
-            if l < best[0]:
-                best = (l, a)
-        self.g[sl["a"]] = best[1]
-        return best
-
 
 def _projected_newton_mixed(V, grad, F, row_loss, nonneg):
     """_projected_newton_rows with only the columns flagged in `nonneg` bounded at zero."""

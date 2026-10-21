@@ -54,7 +54,6 @@ def steps(tf, state):
     tf.fit.contamination_atoms_step(); out.append(tf.loss())
     tf.mount_step(); out.append(tf.loss())
     M = tf.fit.M
-    tf.joint_step([i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]); out.append(tf.loss())
     return out, tf.V.clone(), tf.fit.g.clone()
 
 

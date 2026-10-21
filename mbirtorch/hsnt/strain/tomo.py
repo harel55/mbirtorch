@@ -30,14 +30,14 @@ from .bragg import warm_start, BraggSpectrum
 from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
 STRAIN_PRIOR_SD = 1e-2          # standard deviation of the weak strain prior
-STRAIN_SMOOTH_SD = 3e-4         # standard deviation of the strain difference between neighbouring voxels
-JOINT_CG_ITERS = 60             # conjugate-gradient iterations of the joint (volumes + global) step
+STRAIN_SMOOTH_SD = 8e-4         # standard deviation of the strain difference between neighbouring voxels (with the measured
+                                # noise, the held-out prediction's choice on the 16^3 Fe phantom, also its smallest strain error)
+FISHER_EVERY = 5                # the global step recomputes its Fisher information every this many iterations (FitB)
+MIN_AIR_RAYS = 100              # noise='measure' falls back to the given dose and inflation with fewer air rays than this
 MASK_FLOOR_REL = 0.1            # the material mask ('median'): the typical density is the median over the voxels whose
                                 # density exceeds this fraction of the maximum
 MASK_MEDIAN_REL = 0.5           # ... and the mask is the voxels whose density exceeds this fraction of it
 OTSU_BINS = 256                 # histogram bins of the 'otsu' material mask
-VOLUME_FRACTION_MAX = 1.0       # with fraction=True, a voxel holds at most all of a material (a physical bound)
-SUPPORT_REL = 0.1               # the support: voxels whose 3 x 3 x 3 mean density exceeds this fraction of the maximum
 EQUILIBRIUM_SD = 1e-5           # the equilibrium prior's standard deviation of div(stress) / Young's modulus per voxel
 QGGMRF_P, QGGMRF_Q, QGGMRF_T = 2.0, 1.2, 1.0   # the edge-preserving density prior's exponents and threshold (the
 #                                              package's q-GGMRF defaults)
@@ -345,9 +345,8 @@ class TomoFit:
     material, with standard deviation EQUILIBRIUM_SD of the divergence of stress / Young's modulus per voxel."""
 
     def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
-                 eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi', density_prior='quadratic',
-                 voxel_scale=1.0, traction=False, mask_method='max', mask_freeze=False, fraction=False,
-                 eq_stencil='corner'):
+                 eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, precond='fft', density_prior='quadratic',
+                 voxel_scale=1.0, traction=False, mask_method='median', mask_freeze=True, eq_stencil='corner'):
         """traction=True adds traction-free faces to the equilibrium prior: on the voxels at the sample's faces, the
         traction sigma . n / Young's modulus (n the outward normal) has the equilibrium prior's standard deviation.
         density_prior: 'quadratic' (a Gaussian prior on neighbour differences) or 'qggmrf' (edge-preserving: the
@@ -356,14 +355,9 @@ class TomoFit:
         and the weak strain ridge with its cube, as discretized integrals over the volume, so the priors mean the same
         at any binning.
         mask_method: how the material's own voxels are found (for the equilibrium prior's interior and faces, the strain
-        recentring and the density prior's scale): 'max' (density above half the maximum; a few overshooting voxels at
-        the faces can leave it nearly empty), 'median' (density above MASK_MEDIAN_REL of the typical density), or 'otsu'
-        (density above Otsu's threshold of its histogram). mask_freeze=True computes the mask once,
-        from the starting volume, so the objective stays the same from one iteration to the next.
-        fraction=True: V is each material's volume fraction, bounded by 0 and VOLUME_FRACTION_MAX (the material's full
-        attenuation is carried by its spectrum; see warmup), so a voxel cannot hold more than all of a material; call
-        normalize_fractions after each volume step. It removes the density's ringing at faces off the voxel grid, but
-        the model error behind the ringing then goes into the strain at the faces, so it is off by default.
+        recentring and the density prior's scale): 'median' (density above MASK_MEDIAN_REL of the typical density) or
+        'otsu' (density above Otsu's threshold of its histogram). mask_freeze=True computes the mask once, from the
+        starting volume, so the objective stays the same from one iteration to the next.
         eq_stencil: where the equilibrium prior evaluates div(stress): 'central' (at the voxels, central differences,
         which cannot see a strain that alternates from voxel to voxel) or 'corner' (the default; at the voxel corners, from the
         differences between the voxels on either side, averaged over the four pairs around the corner: it sees
@@ -372,19 +366,15 @@ class TomoFit:
         self.fit = fit
         assert eq_stencil in ('central', 'corner'), eq_stencil
         self.eq_stencil = eq_stencil
-        self.v_max = VOLUME_FRACTION_MAX if fraction else float('inf')
-        assert mask_method in ('max', 'median', 'otsu'), mask_method
+        assert mask_method in ('median', 'otsu'), mask_method
         self.mask_method, self.mask_freeze, self._mask = mask_method, bool(mask_freeze), None
         assert density_prior in ('quadratic', 'qggmrf'), density_prior
         self.density_prior, self.voxel_scale = density_prior, float(voxel_scale)
-        # the volume solves' preconditioner: 'jacobi' (each unknown's diagonal), 'block' (per voxel and material, the
-        # inverse of the (1 + C) x (1 + C) block coupling its density and strain components), or 'fft' (Jacobi on the
-        # densities; for the strain, the exact inverse of a translation-invariant stand-in for its Hessian block, applied
-        # by FFT: use it with the equilibrium prior, whose stiff coupling of neighbouring voxels slows the others)
-        assert precond in ('jacobi', 'block', 'fft'), precond
+        # the volume solves' preconditioner: 'fft' (Jacobi on the densities; for the strain, the exact inverse of a
+        # translation-invariant stand-in for its Hessian block, applied by FFT, which handles the equilibrium prior's
+        # stiff coupling of neighbouring voxels) or 'jacobi' (each unknown's diagonal)
+        assert precond in ('jacobi', 'fft'), precond
         self.precond = precond
-        # support=True: MONSTR's support prior in place of the weak strain ridge (strain held at 0 outside the sample)
-        self.support = support
         self.R = fit.M.R
         self.V = V.clone()
         self.E = (E[..., None] if E.dim() == 4 else E).clone()
@@ -395,7 +385,7 @@ class TomoFit:
         self.w_ray = w.repeat_interleave(getattr(proj, 'rays_per_view', n * n), 0)  # (P, C): rays are view-major
         self.proj = proj.with_q(self.R * (1 + self.C))
         vs = self.voxel_scale
-        self.lam_E = 0.0 if support else vs ** 3 * 0.5 / STRAIN_PRIOR_SD ** 2    # negative log-likelihood scale
+        self.lam_E = vs ** 3 * 0.5 / STRAIN_PRIOR_SD ** 2                       # negative log-likelihood scale
         self.smooth_E = 0.0 if smooth_sd is None else vs / smooth_sd ** 2
         # density smoothness, per material: 1 / sd^2 with sd = DENSITY_SMOOTH_REL x the median density over the
         # voxels above half the material's maximum
@@ -411,9 +401,6 @@ class TomoFit:
         self.traction = bool(traction) and self.elastic is not None
         self.eq_w = vs / eq_sd ** 2
         self._wts = None
-        # hold_strain=True keeps the strain where it is (the volume steps move the density only), e.g. for the first
-        # iterations, so the spectrum and the density settle before the strain is fitted
-        self.hold_strain = False
         self.cg_iters = cg_iters
         self.damp = 1e-3
         self.last_step_se = float('inf')     # the last volume step's RMS in standard errors (_step_se), for a stopping rule
@@ -511,22 +498,19 @@ class TomoFit:
     def material_voxels(self, V=None):
         """(n, n, n, R) bool: each material's own voxels, by mask_method (see __init__); with mask_freeze, the mask of
         the first call is kept."""
-        method, freeze = getattr(self, 'mask_method', 'max'), getattr(self, 'mask_freeze', False)
+        method, freeze = getattr(self, 'mask_method', 'median'), getattr(self, 'mask_freeze', False)
         if freeze and getattr(self, '_mask', None) is not None:
             return self._mask
         V = self.V if V is None else V
-        if method == 'max':
-            m = V > 0.5 * V.amax((0, 1, 2), keepdim=True)
-        else:
-            m = torch.zeros_like(V, dtype=torch.bool)
-            for r in range(V.shape[-1]):
-                v = V[..., r]
-                if float(v.max()) <= 0:
-                    continue
-                if method == 'median':
-                    m[..., r] = v > MASK_MEDIAN_REL * v[v > MASK_FLOOR_REL * v.max()].median()
-                else:
-                    m[..., r] = v > _otsu_threshold(v[v > 0])
+        m = torch.zeros_like(V, dtype=torch.bool)
+        for r in range(V.shape[-1]):
+            v = V[..., r]
+            if float(v.max()) <= 0:
+                continue
+            if method == 'median':
+                m[..., r] = v > MASK_MEDIAN_REL * v[v > MASK_FLOOR_REL * v.max()].median()
+            else:
+                m[..., r] = v > _otsu_threshold(v[v > 0])
         if freeze:
             self._mask = m
         return m
@@ -651,7 +635,7 @@ class TomoFit:
         gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
         free = self._free_density(V, gV)                                            # V's active bounds held
-        fE = self.support_mask().expand_as(E) & (not self.hold_strain)              # strain free inside the support
+        fE = torch.ones_like(E, dtype=torch.bool)                                   # every strain is free
         # Jacobi preconditioner from the ray Fisher diagonals (for the strain parts, each view's weight squared)
         dWW = torch.diagonal(F[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
         dWU = torch.diagonal(F[:, :R, R:], dim1=1, dim2=2)
@@ -673,9 +657,7 @@ class TomoFit:
         for _ in range(6):
             lam_ = self.damp
             pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
-            if self.precond == 'block':
-                prec = self._block_preconditioner(F, lam_, dV_, dE_, free, fE, mask)
-            elif self.precond == 'fft':
+            if self.precond == 'fft':
                 prec = self._fft_preconditioner(F, lam_, pV, dE_, free, fE)
             else:
                 prec = lambda rV, rE: (rV / pV, rE / pE)
@@ -696,7 +678,7 @@ class TomoFit:
             dec = float(-(gV * free * xV).sum() - (gE * fE * xE).sum())            # Newton decrement^2 (deviance)
             l0 = self.loss(mask=mask)
             for alpha in (1.0, 0.5, 0.25):
-                Vn = (V + alpha * xV).clamp(0, self.v_max); En = E + alpha * xE
+                Vn = (V + alpha * xV).clamp_min(0); En = E + alpha * xE
                 d1 = self.data_loss(Vn, En)
                 l1 = d1 + self.prior(Vn, En, mask)
                 if l1 < l0:
@@ -708,30 +690,9 @@ class TomoFit:
         self.last_step_se = 0.0
         return float('nan'), 0.0
 
-    def normalize_fractions(self):
-        """With fraction=True: rescale each material so its median volume fraction over its own voxels is 1 (a typical
-        interior voxel holds all of the material), the inverse factor on its spectrum (FitB.rescale_material). Lowering
-        every fraction while raising the spectrum leaves the data unchanged and the bound at 1 cannot stop it; this
-        fixes that scale, as recentring fixes the strain's. Use it after a volume step. Returns the factors."""
-        if not np.isfinite(self.v_max):
-            return []
-        own = self.material_voxels(); out = []
-        with torch.no_grad():
-            for r in range(self.R):
-                if not bool(own[..., r].any()):
-                    out.append(1.0); continue
-                m = float(self.V[..., r][own[..., r]].median())
-                if m > 0:
-                    self.V[..., r] = (self.V[..., r] / m).clamp(0, self.v_max)
-                    self.fit.rescale_material(r, m)
-                out.append(m)
-        self.sync()
-        return out
-
     def _free_density(self, V, gV):
-        """The densities a step may move: not those at a bound (0, or v_max with fraction=True) whose gradient points
-        outward."""
-        return ~(((V <= 0) & (gV > 0)) | ((V >= self.v_max) & (gV < 0)))
+        """The densities a step may move: not those at the bound 0 whose gradient points outward."""
+        return ~((V <= 0) & (gV > 0))
 
     def _step_se(self, quad):
         """The root mean square of a volume step in standard errors, from its length in the Hessian's metric (quad =
@@ -784,51 +745,6 @@ class TomoFit:
         def apply(rV, rE):
             z = torch.fft.ifftn(torch.einsum('xyzrab,xyzrb->xyzra', inv, torch.fft.fftn(rE.double(), dim=(0, 1, 2))), dim=(0, 1, 2))
             return rV / pV * fV, z.real.to(rE.dtype) * fE
-        return apply
-
-    def _block_preconditioner(self, F, lam_, dV_, dE_, fV, fE, mask):
-        """The 'block' preconditioner: per voxel and material, the zero-lag block of the volume Hessian over (V, E_1..C)
-        (the data term through the ray Fisher blocks of that material, the priors' zero-lag terms, the equilibrium
-        prior's zero-lag block from an impulse response) plus the damping, inverted. Returns z = P(rV, rE)."""
-        R, C, V, E = self.R, self.C, self.V, self.E
-        n = V.shape[0]; P_ = F.shape[0]; w = self.w_ray
-        dWW = torch.diagonal(F[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
-        dWU = torch.diagonal(F[:, :R, R:], dim1=1, dim2=2)
-        b = self.proj.back(torch.cat([dWW, (dWU[:, :, None] * w[:, None, :]).reshape(P_, R * C)], 1))
-        bWW, bWU = b[..., :R], b[..., R:].reshape(n, n, n, R, C)
-        bUU = torch.stack([self.proj.back(torch.cat([torch.zeros_like(dWW), (dUU[:, :, None] * (w[:, k:k + 1] * w)[:, None, :]).reshape(P_, R * C)], 1))
-                           [..., R:].reshape(n, n, n, R, C) for k in range(C)], -2)              # (n, n, n, R, C, C)
-        B = torch.zeros(n, n, n, R, 1 + C, 1 + C, device=V.device, dtype=V.dtype)
-        EbUU = torch.einsum('xyzrk,xyzrkl->xyzrl', E, bUU)
-        B[..., 0, 0] = bWW + 2 * (E * bWU).sum(-1) + (EbUU * E).sum(-1) + self.dens_diag(self._wts)
-        B[..., 0, 1:] = V[..., None] * (bWU + EbUU); B[..., 1:, 0] = B[..., 0, 1:]
-        B[..., 1:, 1:] = V[..., None, None] ** 2 * bUU + (2 * self.lam_E + 6 * self.smooth_E) * torch.eye(C, device=V.device)
-        if self.elastic is not None:
-            # the equilibrium prior's zero-lag block, from its response to unit impulses at an interior voxel
-            for r in range(R):
-                deep = mask[..., r].clone()
-                for d in range(3):
-                    deep &= torch.roll(mask[..., r], 1, d) & torch.roll(mask[..., r], -1, d)
-                idx = deep.nonzero()
-                if len(idx) == 0:
-                    continue
-                j = tuple(int(v) for v in idx[len(idx) // 2])
-                blk = torch.zeros(C, C, device=V.device, dtype=V.dtype)
-                for k in range(C):
-                    X = torch.zeros_like(E); X[j + (r, k)] = 1.0
-                    resp = self.eq_w * torch.func.vjp(lambda Y: self._eq_residual(Y, mask), X)[1](self._eq_residual(X, mask))[0]
-                    blk[:, k] = resp[j + (r,)]
-                B[..., r, 1:, 1:] += mask[..., r, None, None].to(V.dtype) * blk
-        # damping as in the Jacobi version, then the held unknowns' rows and columns replaced by the identity
-        B = B + lam_ * torch.diag_embed(torch.cat([dV_[..., None], dE_], -1))
-        free = torch.cat([fV[..., None], fE], -1).to(V.dtype)                              # (n, n, n, R, 1 + C)
-        B = B * free[..., :, None] * free[..., None, :] + torch.diag_embed(1 - free)
-        B = B + 1e-12 * torch.eye(1 + C, device=V.device)
-        Binv = torch.linalg.inv(B.double()).to(V.dtype)
-
-        def apply(rV, rE):
-            z = torch.einsum('xyzrab,xyzrb->xyzra', Binv, torch.cat([rV[..., None], rE], -1)) * free
-            return z[..., 0], z[..., 1:]
         return apply
 
     def mount_step(self, refine_rigid=None, damp=1e-2):
@@ -936,137 +852,11 @@ class TomoFit:
         self.sync()
         return moved
 
-    def support_mask(self):
-        """(n, n, n, R, 1): where each material's strain is free (its 3 x 3 x 3 mean density above SUPPORT_REL of the
-        maximum), or everywhere without the support prior."""
-        if not self.support:
-            return torch.ones_like(self.V)[..., None].bool()
-        Vs = torch.nn.functional.avg_pool3d(self.V.permute(3, 0, 1, 2)[None], 3, stride=1, padding=1,
-                                            count_include_pad=False)[0].permute(1, 2, 3, 0)
-        return (Vs > SUPPORT_REL * Vs.amax((0, 1, 2), keepdim=True))[..., None]
-
-    def joint_step(self, idx, cross='ray'):
-        """One Gauss-Newton step on the volumes (V, E) and the global parameters idx together: the cross information
-        between them comes from the rays (FitB.joint_system), back-projected into one volume pair per global parameter;
-        the joint system is solved by preconditioned CG (Jacobi on the volumes, the exact inverse of the free global
-        block), then a projected backtracking line search on the full loss. Returns (decrement per parameter, loss
-        decrease). cross='ray' keeps the cross information per ray (memory ~ rays x 2R x n_global) and applies it on
-        the projections the volume block already makes; cross='volume' back-projects it into one volume pair per global
-        parameter (memory ~ n_global x voxels x R (1 + C)), the first implementation, kept for comparison."""
-        fit, R, C = self.fit, self.R, self.C
-        M = fit.M
-        self.sync()
-        G, Fw, Cx, gg, Fg = fit.joint_system(idx)
-        G, Fw = G.float(), Fw.float()
-        V, E = self.V, self.E
-        mask = self._eq_mask() if self.elastic is not None else None
-        eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._eq_residual(Y, mask), X)[1](self._eq_residual(X, mask))[0]) \
-            if self.elastic is not None else (lambda X: torch.zeros_like(X))
-        bGW, bGU = self._back(G[:, :R], G[:, R:])
-        self._wts = wts = self._dens_wts(V)
-        gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
-        gE = V[..., None] * bGU + 2 * self.lam_E * E + self.smooth_E * self.laplacian(E) + eq(E)
-        fV = self._free_density(V, gV); fE = self.support_mask().expand_as(E) & (not self.hold_strain)
-        # the global parameters that move: informative and not held at a bound
-        gi = fit.g[idx]; lb, ub = M.lb[idx], M.ub[idx]
-        d = torch.diagonal(Fg)
-        fg = (d > 1e-12 * d.max()) & ~((gi <= lb) & (gg > 0)) & ~((gi >= ub) & (gg < 0))
-        gg = gg * fg
-        fgf = fg.float()
-        if cross == 'volume':                       # the cross columns, one volume pair per global parameter
-            cV, cE = [], []
-            for j in range(len(idx)):
-                bW, bU = self._back(Cx[:, :R, j].contiguous(), Cx[:, R:, j].contiguous())
-                cV.append((bW + (E * bU).sum(-1)) * fV); cE.append(V[..., None] * bU * fE)
-            cV, cE = torch.stack(cV), torch.stack(cE)
-            cV, cE = cV * fgf[:, None, None, None, None], cE * fgf[:, None, None, None, None, None]
-        Fg = Fg * (fg[:, None] & fg[None, :]) + torch.diag((~fg).double())
-        # Jacobi preconditioner for the volumes (as volume_step)
-        dWW = torch.diagonal(Fw[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(Fw[:, R:, R:], dim1=1, dim2=2)
-        dWU = torch.diagonal(Fw[:, :R, R:], dim1=1, dim2=2); P_ = dWW.shape[0]
-        bWW = self.proj.back(torch.cat([dWW, torch.zeros(P_, R * C, device=dWW.device)], 1))[..., :R]
-        bUU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dUU[:, :, None] * self.w_ray[:, None, :] ** 2).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
-        bWU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dWU[:, :, None] * self.w_ray[:, None, :]).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
-        eq_diag = 12.0 * self.eq_w if self.elastic is not None else 0.0
-        dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + self.dens_diag(wts)
-        dE_ = V[..., None] ** 2 * bUU + 2 * self.lam_E + 6 * self.smooth_E + eq_diag
-
-        def H(xV, xE, xg):
-            xgf = xg.float() * fgf
-            zW, zU = self._fwd(xV * fV, E * (xV * fV)[..., None] + V[..., None] * (xE * fE))
-            z = torch.cat([zW, zU], 1)
-            y = torch.einsum('pab,pb->pa', Fw, z)
-            if cross == 'ray':                      # the cross block applied on the same rays: no extra projections
-                y = y + torch.einsum('pan,n->pa', Cx, xgf)
-            bW, bU = self._back(y[:, :R], y[:, R:])
-            hV = (bW + (E * bU).sum(-1) + self.dens_lap(xV, wts)) * fV
-            hE = (V[..., None] * bU + 2 * self.lam_E * xE + self.smooth_E * self.laplacian(xE) + eq(xE)) * fE
-            if cross == 'ray':
-                hg = (Fg @ xg) + (all_sum(torch.einsum('pan,pa->n', Cx, z)) * fgf).double()
-            else:
-                hV = hV + torch.einsum('j,j...->...', xgf, cV)
-                hE = hE + torch.einsum('j,j...->...', xgf, cE)
-                hg = (Fg @ xg) + (torch.einsum('j...,...->j', cV, xV) + torch.einsum('j...,...->j', cE, xE)).double()
-            return hV, hE, hg
-
-        def total(Vn, En, gn):
-            g_keep = fit.g; fit.g = gn
-            try:
-                return self.loss(Vn, En, mask=mask) + float(fit.spline_penalty(gn))
-            finally:
-                fit.g = g_keep
-
-        l0 = total(V, E, fit.g)
-        for _ in range(6):
-            lam_ = self.damp
-            Ag = Fg + lam_ * torch.diag(torch.diagonal(Fg))
-            Ag_inv = torch.linalg.inv(Ag)
-            pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
-            if self.precond in ('block', 'fft'):
-                pvol = self._block_preconditioner(Fw, lam_, dV_, dE_, fV, fE, mask) if self.precond == 'block' \
-                    else self._fft_preconditioner(Fw, lam_, pV, dE_, fV, fE)
-                prec = lambda rV, rE, rg: (*pvol(rV, rE), Ag_inv @ rg)
-            else:
-                prec = lambda rV, rE, rg: (rV / pV, rE / pE, Ag_inv @ rg)
-            bV, bE, bg = -gV * fV, -gE * fE, -gg
-            xV, xE, xg = torch.zeros_like(V), torch.zeros_like(E), torch.zeros_like(gg)
-            rV, rE, rg = bV.clone(), bE.clone(), bg.clone()
-            zV, zE, zg = prec(rV, rE, rg)
-            dV, dE, dg = zV.clone(), zE.clone(), zg.clone()
-            rz = float((rV * zV).sum() + (rE * zE).sum() + (rg * zg).sum()); rz0 = rz
-            for _ in range(JOINT_CG_ITERS):
-                hV, hE, hg = H(dV, dE, dg)
-                hV = hV + lam_ * dV_ * dV; hE = hE + lam_ * dE_ * dE; hg = hg + lam_ * torch.diagonal(Fg) * dg
-                den = float((dV * hV).sum() + (dE * hE).sum() + (dg * hg).sum())
-                if den <= 0:
-                    break
-                a = rz / den
-                xV += a * dV; xE += a * dE; xg += a * dg; rV -= a * hV; rE -= a * hE; rg -= a * hg
-                zV, zE, zg = prec(rV, rE, rg)
-                rz_new = float((rV * zV).sum() + (rE * zE).sum() + (rg * zg).sum())
-                b = rz_new / max(rz, 1e-30)
-                dV, dE, dg = zV + b * dV, zE + b * dE, zg + b * dg; rz = rz_new
-            self.last_cg = math.sqrt(max(rz, 0.0) / max(rz0, 1e-300))                 # the CG's final relative residual
-            dec = float(-(gV * fV * xV).sum() - (gE * fE * xE).sum() - (gg * xg).sum())
-            for alpha in (1.0, 0.5, 0.25):
-                Vn = (V + alpha * xV).clamp(0, self.v_max); En = E + alpha * xE
-                gn = fit.g.clone(); gn[idx] = gn[idx] + alpha * xg
-                gn = torch.maximum(torch.minimum(gn, M.ub), M.lb)
-                l1 = total(Vn, En, gn)
-                if l1 < l0:
-                    self.V, self.E, fit.g = Vn, En, gn; self.sync()
-                    self.damp = max(self.damp / 3, 1e-6)
-                    return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel() + len(idx))), l0 - l1
-            self.damp *= 10
-        return float('nan'), 0.0
-
-
 def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2, chunk=1024, a_range=0.01,
-           d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
-           eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
+           d0_from_data=False, anchor_scale=True, inflation=1.0, density_smooth=False, weights=None, elastic=None,
+           eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, ray_mask=None, precond='fft',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
-           smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='corner',
-           noise=None):
+           smooth_sd=STRAIN_SMOOTH_SD, mask_method='median', mask_freeze=True, eq_stencil='corner', noise='measure'):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1079,19 +869,24 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     example on a Ni cylinder), held fixed; None fits the kernel from the warm start's estimate. traction: traction-free faces in the
     equilibrium prior (TomoFit); smooth_sd: the strain smoothness prior's standard deviation (None: no smoothness prior);
     mask_method, mask_freeze: how the material's own voxels are found (TomoFit). eq_stencil: the equilibrium prior's
-    stencil (TomoFit). fraction: densities as volume
-    fractions (TomoFit): each material's warm-start density is divided by its full density (the median over its own
-    voxels, by mask_method), and its spectrum's linear parameters (edge heights, smooth part, spline) and contamination
-    attenuations are multiplied by it, so the predicted data are unchanged. noise='measure' measures the counts' noise on
-    the rays that miss the sample (noise.measure_noise) and fits with the dose divided by the measured dispersion and
-    the measured inflation in place of d and inflation; None uses d and inflation as given."""
+    stencil (TomoFit). noise='measure' (the default) measures the counts' noise on the rays that miss the sample
+    (noise.measure_noise) and fits with the dose divided by the measured dispersion and the measured inflation in place
+    of d and inflation, unless fewer than MIN_AIR_RAYS rays miss the sample (then d and inflation are used as given,
+    with a warning); None uses d and inflation as given. The returned fit recomputes the global Fisher information every
+    FISHER_EVERY iterations."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n); side = int(round(math.sqrt(rpv)))
         noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool())
-        d = np.asarray(d, dtype=np.float64) / noise_info['dispersion']; inflation = noise_info['inflation']
+        noise_info['used'] = noise_info['air_rays'] >= MIN_AIR_RAYS
+        if noise_info['used']:
+            d = np.asarray(d, dtype=np.float64) / noise_info['dispersion']; inflation = noise_info['inflation']
+        else:
+            import warnings
+            warnings.warn(f"only {noise_info['air_rays']} rays miss the sample: the noise is not measured, the given dose "
+                          f"and inflation are used")
     elif noise is not None:
         raise ValueError(f"noise must be None or 'measure', not {noise!r}")
     R = len(lattices)
@@ -1160,6 +955,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     V = x.clamp_min(0)
     fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask)
+    fit.fisher_every = FISHER_EVERY
     if kappa_prior is not None:
         # the standard deviation as a multiple of the warm-up spectra's mean attenuation (kappa's own units)
         fit.kappa_prior = kappa_prior * float(np.abs(targets).mean())
@@ -1173,22 +969,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
         idx = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i]) and not (M.res_sl[0] <= i < M.res_sl[1])]
         _, F0 = fit.global_system(idx)
         fit.scale_anchor = (k, targets, ANCHOR_STIFFNESS * float(torch.diagonal(F0).max()))
-    if fraction:
-        probe = object.__new__(TomoFit); probe.V = V; probe.mask_method = 'median' if mask_method == 'max' else mask_method
-        probe.mask_freeze = False; probe._mask = None
-        own = probe.material_voxels()
-        with torch.no_grad():
-            for r in range(R):
-                full = float(V[..., r][own[..., r]].median()) if bool(own[..., r].any()) else 1.0
-                V[..., r] = V[..., r] / full
-                fit.rescale_material(r, full)
-            V = V.clamp(0, VOLUME_FRACTION_MAX)
     C = 1 if weights is None else np.asarray(weights).shape[1]
     E0 = torch.zeros(*V.shape, C, device=device, dtype=V.dtype)
     return TomoFit(fit, proj, V, E0, weights=weights, density_smooth=density_smooth, elastic=elastic, eq_sd=eq_sd,
-                   cg_iters=cg_iters, support=support, precond=precond, density_prior=density_prior,
+                   cg_iters=cg_iters, precond=precond, density_prior=density_prior,
                    voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd, mask_method=mask_method,
-                   mask_freeze=mask_freeze, fraction=fraction, eq_stencil=eq_stencil), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
+                   mask_freeze=mask_freeze, eq_stencil=eq_stencil), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
                                                            resolution=[float(v) for v in resolution], traction=traction, smooth_sd=smooth_sd,
                                                            noise=noise_info)
 

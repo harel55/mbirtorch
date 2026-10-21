@@ -194,7 +194,7 @@ def test_contamination_newton_kkt():
 @pytest.mark.parametrize("method", ["median", "otsu"])
 def test_material_mask_face_overshoot(method):
     """With density overshoot on a cube's faces, the 'median' and 'otsu' material masks hold the whole cube and give
-    the equilibrium prior an interior, while the 'max' mask holds only the overshooting faces."""
+    the equilibrium prior an interior."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
     n = 16
     V = torch.zeros(n, n, n, 1)
@@ -204,8 +204,6 @@ def test_material_mask_face_overshoot(method):
     cube = torch.zeros(n, n, n, 1, dtype=torch.bool); cube[3:13, 3:13, 3:13] = True
     tf = object.__new__(TomoFit)
     tf.V = V; tf.mask_freeze = False; tf._mask = None
-    tf.mask_method = 'max'
-    assert int(tf._eq_mask().sum()) == 0
     tf.mask_method = method
     m = tf.material_voxels()
     assert int((m & cube).sum()) >= 0.9 * int(cube.sum()) and int((m & ~cube).sum()) <= 0.1 * int(cube.sum())
@@ -361,7 +359,7 @@ def test_data_loss_memo():
     l3 = fit.loss()
     assert len(calls) > n1 and l3 != l1
     del fit.mean
-    fit.build_atoms(); fit.contamination_newton = True
+    fit.build_atoms()
     a, b = copy.deepcopy(fit), copy.deepcopy(fit)
     b.use_memo = False
     for x in (a, b):
