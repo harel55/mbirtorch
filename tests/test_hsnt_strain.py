@@ -300,3 +300,23 @@ def test_fine_projector():
     xf = xc.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
     pf, pc = fp.fwd(xf), cp.fwd(xc)
     assert float((pf - pc).abs().max()) < 0.05 * float(pc.abs().max())
+
+
+def test_measure_noise():
+    """measure_noise finds the rays that miss an attenuating disk and recovers the dispersion and the inflation of
+    noise with a known variance (4 x Poisson) and correlation (0.5 between neighbouring channels)."""
+    from mbirtorch.hsnt.strain.noise import measure_noise, AIR_MARGIN
+    images, side, K, phi, rho = 20, 24, 400, 4.0, 0.5
+    g = torch.Generator().manual_seed(0)
+    d = torch.full((K,), 1000.0, dtype=torch.float64)
+    yy, xx = np.meshgrid(np.arange(side) - side / 2, np.arange(side) - side / 2, indexing='ij')
+    disk = np.broadcast_to(yy ** 2 + xx ** 2 < 36, (images, side, side))
+    m = torch.where(torch.as_tensor(disk.reshape(-1)), 0.7, 1.0).double()[:, None].expand(-1, K)
+    w = torch.randn(images, side, side + 1, K, generator=g, dtype=torch.float64)
+    x = (w[:, :, :-1] + w[:, :, 1:]) / np.sqrt(2.0)                              # correlation 0.5 along channels
+    T = m + torch.sqrt(phi * m / d) * x.reshape(-1, K)
+    out = measure_noise(T, d.numpy(), (images, side, side))
+    near = np.broadcast_to(yy ** 2 + xx ** 2 < (6 + AIR_MARGIN) ** 2, (images, side, side))
+    assert out['air_rays'] <= int((~near).sum())                                 # no ray near the disk counts as air
+    assert abs(out['dispersion'] / phi - 1) < 0.02
+    assert abs(out['inflation'] - (1 + 2 * rho)) < 0.05
