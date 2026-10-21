@@ -279,6 +279,47 @@ class MultiProjector:
         return out.contiguous()
 
 
+class FineProjector:
+    """A MultiProjector on a volume grid `factor` times finer than the detector: the volume has side factor * n, it is
+    projected onto a detector factor times finer, and each detector pixel averages its factor^2 fine pixels, as a
+    detector integrates over its pixel area (the phantom generator makes its data the same way). Use it so faces and
+    interfaces can sit between the detector's pixel positions without forcing ringing into the densities; it costs
+    factor^3 the voxels. Lengths are in units of the detector pixel, as for a MultiProjector of side n. Mount shifts
+    (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n. No mount
+    refinement (mount_step) on this projector."""
+
+    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2):
+        self.n_det, self.factor, self.Q = n, int(factor), Q
+        self.series, self.ror_mask = list(series), ror_mask
+        self.offsets = [float(o) for o in (channel_offsets or [0.0] * len(self.series))]
+        f = self.factor
+        fine_series = []
+        for ax, ang in self.series:
+            if isinstance(ax, str):
+                fine_series.append((ax, ang))
+            else:
+                tr = (ax[0], ax[1], tuple(float(v) * f for v in ax[2])) + ((tuple(ax[3]),) if len(ax) > 3 else ())
+                fine_series.append((tr, ang))
+        self.inner = MultiProjector(f * n, fine_series, Q, [o * f for o in self.offsets], ror_mask)
+        self.n = f * n                                       # the volume's side
+        self.V = self.inner.V
+        self.rays_per_view = n * n
+        self.counts = [c // f ** 2 for c in self.inner.counts]
+
+    def with_q(self, Q):
+        return self if Q == self.Q else FineProjector(self.n_det, self.series, Q, self.offsets, self.ror_mask, self.factor)
+
+    def fwd(self, vols):
+        n, f = self.n_det, self.factor
+        rays = self.inner.fwd(vols)                                                   # (views N N, Q)
+        return rays.reshape(self.V, n, f, n, f, -1).mean((2, 4)).reshape(self.V * n * n, -1) / f
+
+    def back(self, rays):
+        n, f = self.n_det, self.factor
+        r = rays.reshape(self.V, n, 1, n, 1, -1).expand(self.V, n, f, n, f, rays.shape[-1]) / f ** 3
+        return self.inner.back(r.reshape(self.V * f * n * f * n, -1).contiguous())
+
+
 def _otsu_threshold(x):
     """Otsu's threshold of the values x: the cut of their histogram (OTSU_BINS bins) that maximizes the variance
     between the two classes."""
@@ -306,7 +347,7 @@ class TomoFit:
     def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
                  eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi', density_prior='quadratic',
                  voxel_scale=1.0, traction=False, mask_method='max', mask_freeze=False, fraction=False,
-                 eq_stencil='central'):
+                 eq_stencil='corner'):
         """traction=True adds traction-free faces to the equilibrium prior: on the voxels at the sample's faces, the
         traction sigma . n / Young's modulus (n the outward normal) has the equilibrium prior's standard deviation.
         density_prior: 'quadratic' (a Gaussian prior on neighbour differences) or 'qggmrf' (edge-preserving: the
@@ -324,7 +365,7 @@ class TomoFit:
         normalize_fractions after each volume step. It removes the density's ringing at faces off the voxel grid, but
         the model error behind the ringing then goes into the strain at the faces, so it is off by default.
         eq_stencil: where the equilibrium prior evaluates div(stress): 'central' (at the voxels, central differences,
-        which cannot see a strain that alternates from voxel to voxel) or 'corner' (at the voxel corners, from the
+        which cannot see a strain that alternates from voxel to voxel) or 'corner' (the default; at the voxel corners, from the
         differences between the voxels on either side, averaged over the four pairs around the corner: it sees
         patterns that alternate along one axis; patterns alternating along two or three axes stay invisible, as the
         hourglass modes of one-point finite elements)."""
@@ -351,7 +392,7 @@ class TomoFit:
         n = V.shape[0]
         w = torch.ones(proj.V, 1, device=V.device) if weights is None else torch.as_tensor(weights, device=V.device, dtype=V.dtype)
         assert w.shape == (proj.V, self.C), (w.shape, proj.V, self.C)
-        self.w_ray = w.repeat_interleave(n * n, 0)                                   # (P, C): rays are view-major
+        self.w_ray = w.repeat_interleave(getattr(proj, 'rays_per_view', n * n), 0)  # (P, C): rays are view-major
         self.proj = proj.with_q(self.R * (1 + self.C))
         vs = self.voxel_scale
         self.lam_E = 0.0 if support else vs ** 3 * 0.5 / STRAIN_PRIOR_SD ** 2    # negative log-likelihood scale
@@ -1007,7 +1048,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
-           smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='central'):
+           smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='corner'):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each

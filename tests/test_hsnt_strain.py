@@ -282,3 +282,21 @@ def test_equilibrium_corner_stencil():
     assert res['central'][0] < 1e-12 and res['corner'][0] > 0.5                 # only the corner stencil sees it
     assert torch.allclose(res['corner'][1], torch.full_like(res['corner'][1], 0.01))
     assert res['corner'][2] < 1e-12                                              # the hourglass mode remains
+
+
+def test_fine_projector():
+    """FineProjector: back is the adjoint of fwd, and a volume constant over each factor^3 block projects as the
+    detector-resolution projector projects its block values (lengths in detector pixels)."""
+    from mbirtorch.hsnt.strain.tomo import FineProjector
+    n, f = 8, 2
+    series = [(((0, 1, 2), (1, 1, 1), (0.0, 0.0, 0.0)), ANGLES), (((1, 2, 0), (1, 1, 1), (1.0, -2.0, 0.0)), ANGLES)]
+    fp = FineProjector(n, series, 2, channel_offsets=[0.0, 0.0], ror_mask=False, factor=f)
+    cp = MultiProjector(n, series, 2, channel_offsets=[0.0, 0.0], ror_mask=False)
+    g = torch.Generator().manual_seed(0)
+    x = torch.rand(f * n, f * n, f * n, 2, generator=g); y = torch.rand(fp.V * n * n, 2, generator=g)
+    a = float((fp.fwd(x) * y).sum()); b = float((x * fp.back(y)).sum())
+    assert abs(a - b) <= 1e-4 * abs(a)
+    xc = torch.rand(n, n, n, 2, generator=g)
+    xf = xc.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
+    pf, pc = fp.fwd(xf), cp.fwd(xc)
+    assert float((pf - pc).abs().max()) < 0.05 * float(pc.abs().max())
