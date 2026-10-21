@@ -1125,12 +1125,13 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     elif noise is not None:
         raise ValueError(f"noise must be None or 'measure', not {noise!r}")
     R = len(lattices)
+    dev = str(T.device) if T.is_cuda else None   # a GPU tensor is factored on its own GPU, without a host copy
     if ray_mask is None:
-        W0, H0, _ = hsnt.dehydrate(T.cpu().numpy(), 'transmission', num_materials=R, verbose=0)
+        W0, H0, _ = hsnt.dehydrate(T, 'transmission', num_materials=R, device=dev, verbose=0)
         W0 = W0.reshape(-1, R)
     else:                                       # the spectra from the kept rays only; left-out rays start at zero
         keep = ray_mask.cpu().numpy().astype(bool)
-        Wk, H0, _ = hsnt.dehydrate(T[ray_mask.to(T.device)].cpu().numpy(), 'transmission', num_materials=R, verbose=0)
+        Wk, H0, _ = hsnt.dehydrate(T[ray_mask.to(T.device)], 'transmission', num_materials=R, device=dev, verbose=0)
         W0 = np.zeros((T.shape[0], R), dtype=Wk.dtype); W0[keep] = Wk.reshape(-1, R)
     lats = [(lt, (a * (1 - a_range), a * (1 + a_range))) for lt, a in zip(lattices, a0)]
     # with the rays split over processes, the first process's spectra start every process (the same model everywhere);

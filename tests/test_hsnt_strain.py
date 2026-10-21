@@ -24,8 +24,8 @@ def test_adjoint(proj):
     g = torch.Generator().manual_seed(0)
     x = torch.randn(N, N, N, 2, generator=g)
     y = torch.randn(sum(proj.counts), 2, generator=g)
-    a = float((proj.fwd(x) * y).sum())
-    b = float((x * proj.back(y)).sum())
+    a = float((proj.fwd(x).cpu() * y).sum())             # back returns its result on the projector's device
+    b = float((x * proj.back(y).cpu()).sum())
     assert abs(a - b) <= 1e-4 * abs(a)
 
 
@@ -295,7 +295,7 @@ def test_fine_projector():
     cp = MultiProjector(n, series, 2, channel_offsets=[0.0, 0.0], ror_mask=False)
     g = torch.Generator().manual_seed(0)
     x = torch.rand(f * n, f * n, f * n, 2, generator=g); y = torch.rand(fp.V * n * n, 2, generator=g)
-    a = float((fp.fwd(x) * y).sum()); b = float((x * fp.back(y)).sum())
+    a = float((fp.fwd(x).cpu() * y).sum()); b = float((x * fp.back(y).cpu()).sum())   # back returns on the projector's device
     assert abs(a - b) <= 1e-4 * abs(a)
     xc = torch.rand(n, n, n, 2, generator=g)
     xf = xc.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
