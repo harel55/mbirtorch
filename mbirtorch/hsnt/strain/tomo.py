@@ -1123,7 +1123,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n); side = int(round(math.sqrt(rpv)))
         noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool(),
                                    detector_tiles)
-        phi = noise_info['dispersion_per_bin'] if per_bin_dispersion else noise_info['dispersion']
+        phi = np.asarray(noise_info['dispersion_per_bin']) if per_bin_dispersion else noise_info['dispersion']
         d = np.asarray(d, dtype=np.float64) / phi; inflation = noise_info['inflation']
     elif noise is not None:
         raise ValueError(f"noise must be None or 'measure', not {noise!r}")

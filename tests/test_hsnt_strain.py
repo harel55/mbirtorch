@@ -334,7 +334,7 @@ def test_measure_noise_per_bin():
     T = 1.0 + torch.sqrt(phi / d.clamp_min(1.0)) * torch.randn(images * side * side, K, generator=g, dtype=torch.float64)
     T[:, 300:310] = 0.0
     out = measure_noise(T, d.numpy(), (images, side, side))
-    per = out['dispersion_per_bin']
+    per = np.asarray(out['dispersion_per_bin'])
     assert per.shape == (K,) and np.isfinite(per).all()
     live = np.ones(K, bool); live[299:311] = False
     blocks = np.convolve(phi.numpy(), np.ones(DISPERSION_BLOCK) / DISPERSION_BLOCK, mode='same')   # the block average

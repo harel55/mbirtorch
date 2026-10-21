@@ -69,7 +69,7 @@ def noise_statistics(T, d, air, shape):
     level), less the open beam's own difference; pairs of bins with a dose of zero (gaps) are left out. Only correlations more than SIGNIFICANCE standard errors from zero
     enter the inflation. With the rays split over processes, the sums are taken over all of them. Returns a dict:
     dispersion, inflation, inflation_se, correlations [(drow, dchannel, correlation, standard error, pairs)], air_rays,
-    and dispersion_per_bin (bins,), the dispersion of each bin (_per_bin)."""
+    and dispersion_per_bin, the dispersion of each bin as a list (_per_bin)."""
     dev = T.device; K = T.shape[1]
     d = torch.as_tensor(np.asarray(d, dtype=np.float64), device=dev)
     ids = torch.as_tensor(np.nonzero(air)[0], device=dev)
@@ -115,7 +115,7 @@ def noise_statistics(T, d, air, shape):
     inflation = 1.0 + 2.0 * sum(r for r, _ in sig)                     # each offset counts in both directions
     inflation_se = 2.0 * float(np.sqrt(sum(s_ ** 2 for _, s_ in sig)))
     return dict(dispersion=phi, inflation=inflation, inflation_se=inflation_se, correlations=corr, air_rays=int(n),
-                dispersion_per_bin=_per_bin(pair_sum.cpu().numpy() / n, ok.cpu().numpy(), K, phi))
+                dispersion_per_bin=_per_bin(pair_sum.cpu().numpy() / n, ok.cpu().numpy(), K, phi).tolist())
 
 
 def _per_bin(phi_pairs, ok, K, phi):
