@@ -513,6 +513,7 @@ FE_PEAK = 1.5e-3                            # the largest strain component in th
 FE_SINGLE_CRYSTAL = (231.4e9, 134.7e9, 116.4e9)   # Fe single-crystal stiffness C11, C12, C44 (Pa)
 SKIN = dict(depth=0.15, gain=3.0)           # skin field: depth of the surface layer (share of the half side) and its stress gain
 SKIN_MAXWELL = (1.0, -0.7, 0.5)             # the skin field's Maxwell stress-function amplitudes
+SKIN_CHUNK = 65536                          # points per chunk of the skin field's Hessians
 ANISO_GAMMAS = (0.0, 0.09, 0.16, 0.25, 1.0 / 3.0)   # orientation factors the reflections are grouped by (anisotropic phantoms)
 FE_CUBE = dict(half=19.0 / 64, centre=(-0.5 / 64, -0.5 / 64, 7.0 / 64))   # half side and centre (y, x, z), units of n
 FE_ATTEN_3A = 0.1 * 64                      # the cube's attenuation per unit length at 3 Angstrom, times n per voxel
@@ -580,7 +581,8 @@ def fe_cube_skin_stress(N, offset=0.0):
     phis = [lambda p, S=SKIN_MAXWELL[0]: S * P(p[0]) * D(p[1]) * D(p[2]),
             lambda p, S=SKIN_MAXWELL[1]: S * D(p[0]) * P(p[1]) * D(p[2]),
             lambda p, S=SKIN_MAXWELL[2]: S * D(p[0]) * D(p[1]) * P(p[2])]
-    h1, h2, h3 = [torch.func.vmap(torch.func.hessian(f))(pts) for f in phis]
+    hess = lambda f: torch.cat([torch.func.vmap(torch.func.hessian(f))(pts[i:i + SKIN_CHUNK]) for i in range(0, len(pts), SKIN_CHUNK)])
+    h1, h2, h3 = [hess(f) for f in phis]                          # in chunks of points: bounded memory
     sig = torch.stack([h2[:, 2, 2] + h3[:, 1, 1], h3[:, 0, 0] + h1[:, 2, 2], h1[:, 1, 1] + h2[:, 0, 0],
                        -h3[:, 0, 1], -h1[:, 1, 2], -h2[:, 0, 2]], -1).numpy()
     out = np.zeros((N, N, N, 6)); out.reshape(-1, 6)[cube.reshape(-1)] = sig
@@ -777,10 +779,10 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
             gk = g.clone()
             gk[sl_['h'][0]:sl_['h'][1]] *= torch.as_tensor(group == gi, dtype=gk.dtype, device=gk.device)
             gk[sl_['c'][0]:sl_['c'][1]] = 0.0; gk[sl_['s'][0]:sl_['s'][1]] = 0.0
-            components.append(([s1 * trs + hs2 * (sig * w).sum(-1) for w in wts], gk))
+            components.append((lambda vi, s1=s1, hs2=hs2: s1 * trs + hs2 * (sig @ wts[vi]), gk))
         g_smooth = g.clone(); g_smooth[sl_['h'][0]:sl_['h'][1]] = 0.0
     else:
-        components = [([(et * w).sum(-1) for w in wts], g)]
+        components = [(lambda vi: (et * wts[vi]).sum(-1), g)]
         g_smooth = None
     P = S * V_ * n * n
     hold = np.zeros((S * V_, n, n))
@@ -788,8 +790,12 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     zc = (N - 1) / 2.0
     X = torch.zeros(P, M.Kf, dtype=torch.float32, device=device)
     path = None
-    for ci, (seen_all, g_c) in enumerate(components):
-        lv = np.linspace(min(s_[cube].min() for s_ in seen_all), max(s_[cube].max() for s_ in seen_all), levels)
+    for ci, (seen, g_c) in enumerate(components):
+        # each view's strains are formed when needed (one view's array at a time: all of them would not fit in memory)
+        lo_, hi_ = np.inf, -np.inf
+        for vi in range(S * V_):
+            sv = seen(vi)[cube]; lo_, hi_ = min(lo_, sv.min()), max(hi_, sv.max())
+        lv = np.linspace(lo_, hi_, levels)
         proj = np.zeros((levels, S * V_, n, n))                                  # path length per strain level
         for k, (perm, signs, shift, rot) in enumerate(mounts):
             tr = (tuple(perm), tuple(signs), tuple(float(v) * fine for v in shift), tuple(float(v) for v in rot))
@@ -809,7 +815,7 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
             whole, frac = MultiProjector._split(tr[2])
             d_rows, d_cols = detector_directions(angles)
             for v in range(V_):
-                idx = np.abs(seen_all[k * V_ + v][..., None] - lv).argmin(-1)
+                idx = np.abs(seen(k * V_ + v)[..., None] - lv).argmin(-1)
                 inds = torch.as_tensor(np.stack([(cube & (idx == l)) for l in range(levels)], -1), dtype=torch.float32, device=device)
                 vol = MultiProjector._to_series(inds, tr)
                 pv = Projector(N, angles[v:v + 1], levels, float(offsets[k]) * fine, False,
