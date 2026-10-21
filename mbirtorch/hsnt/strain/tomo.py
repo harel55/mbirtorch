@@ -286,8 +286,8 @@ class FineProjector:
     detector integrates over its pixel area (the phantom generator makes its data the same way). Use it so faces and
     interfaces can sit between the detector's pixel positions without forcing ringing into the densities; it costs
     factor^3 the voxels. Lengths are in units of the detector pixel, as for a MultiProjector of side n. Mount shifts
-    (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n. No mount
-    refinement (mount_step) on this projector."""
+    (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n, also to
+    set_mount and in parts, so TomoFit.mount_step works on it."""
 
     def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2):
         self.n_det, self.factor, self.Q = n, int(factor), Q
@@ -309,6 +309,29 @@ class FineProjector:
 
     def with_q(self, Q):
         return self if Q == self.Q else FineProjector(self.n_det, self.series, Q, self.offsets, self.ror_mask, self.factor)
+
+    @property
+    def parts(self):
+        """Each series' mount and projector, with the shifts in voxels of n, as a MultiProjector of side n gives them."""
+        f = self.factor
+        return [((tr[0], tr[1], tuple(v / f for v in tr[2]), tr[3]), p) for tr, p in self.inner.parts]
+
+    def set_mount(self, s, shift=None, rot=None, offset=None):
+        """Changes series s's mount (shift in voxels of n, rot in degrees) and its centre-of-rotation offset (detector
+        pixels), as MultiProjector.set_mount does."""
+        f = self.factor
+        self.inner.set_mount(s, shift=None if shift is None else [float(v) * f for v in shift], rot=rot,
+                             offset=None if offset is None else float(offset) * f)
+        if offset is not None:
+            self.offsets[s] = float(offset)
+        (perm, signs, sh, ro), _ = self.parts[s]
+        self.series[s] = ((perm, signs, sh, ro), self.series[s][1])
+
+    def project_series(self, s, vols):
+        """Returns series s's rays (detector pixels) for the sample volumes on the fine grid."""
+        n, f = self.n_det, self.factor
+        rays = self.inner.project_series(s, vols)
+        return rays.reshape(-1, n, f, n, f, rays.shape[-1]).mean((2, 4)).reshape(-1, rays.shape[-1]) / f
 
     def fwd(self, vols):
         n, f = self.n_det, self.factor

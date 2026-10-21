@@ -622,3 +622,20 @@ def test_fiber_texture_degree4():
     assert share.min() > 0.8
     ratio = c / np.array(cubic_k4('bcc', ns))[:, None]                    # the common degree-4 function, per edge
     assert np.allclose(ratio, ratio.mean(0), atol=0.03 * np.abs(ratio).max())
+
+
+def test_fine_projector_set_mount():
+    """A FineProjector whose mount is changed in place projects like one built with that mount, series by series, and
+    reports the mount in voxels of the detector grid."""
+    from mbirtorch.hsnt.strain.tomo import FineProjector
+    n = 8; ang = np.linspace(0, np.pi, 5)
+    series = [(((0, 1, 2), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ang), (((1, 2, 0), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ang)]
+    vol = torch.rand(2 * n, 2 * n, 2 * n, 1, generator=torch.Generator().manual_seed(1))
+    P = FineProjector(n, series, 1, channel_offsets=[0.0, 0.0], ror_mask=False)
+    P.set_mount(1, shift=(0.3, -0.2, 0.1), rot=(0.5, 0.0, -0.4), offset=0.25)
+    moved = [series[0], (((1, 2, 0), (1, 1, 1), (0.3, -0.2, 0.1), (0.5, 0.0, -0.4)), ang)]
+    Q = FineProjector(n, moved, 1, channel_offsets=[0.0, 0.25], ror_mask=False)
+    for k in range(2):
+        assert torch.allclose(P.project_series(k, vol), Q.project_series(k, vol), atol=1e-6)
+    assert np.allclose(P.parts[1][0][2], (0.3, -0.2, 0.1)) and abs(P.offsets[1] - 0.25) < 1e-12
+    assert torch.allclose(P.fwd(vol), Q.fwd(vol), atol=1e-6)
