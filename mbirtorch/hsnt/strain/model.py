@@ -51,6 +51,11 @@ def multiplicities(lattice, ns):
 
 # A global parameter whose Fisher information is below this fraction of the largest is held in the global step.
 INFO_FLOOR = 1e-12
+CONTAM_MAX_SHARE = 0.99      # the contamination shares' largest sum per bin (the neutrons keep the rest)
+LATTICE_HALF_WIDTH = 0.008   # relative half width of the lattice parameter search
+LATTICE_COARSE_STEP = 5e-4   # relative spacing of its coarse grid: about a Bragg edge's width
+LATTICE_TOL = 1e-6           # relative tolerance of its golden-section refinement
+GOLDEN = (math.sqrt(5) - 1) / 2   # the golden section's ratio
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
 CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
 CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvature)
@@ -136,7 +141,7 @@ class StageA:
             Hn, fn = Vn[:, :R].T, Vn[:, R:].T
             mn = self.parts(H=Hn, f=fn)[0]
             return deviance_terms(mn, T, d).sum(0, dtype=torch.float64) + (self.lam1 * fn).sum(0).double()
-        V = _projected_newton_rows(V, grad, F, per_bin_loss, cap=(R, 0.99))
+        V = _projected_newton_rows(V, grad, F, per_bin_loss, cap=(R, CONTAM_MAX_SHARE))
         self.H, self.f = V[:, :R].T.contiguous(), V[:, R:].T.contiguous()
 
     def kappa_step(self):
@@ -634,7 +639,33 @@ class FitB:
                 targets = targets.clone(); targets[r] *= factor; w[r] /= factor ** 2
                 self.scale_anchor = (k, targets, w)
 
-    def loss(self, g=None, W=None, f=None, eps=None):
+    # -- the data loss at the current state, remembered from the passes that compute it anyway (the derivative passes
+    # and the accepted trials of the line searches), so a step's starting loss and a driver's log cost no pass. It is
+    # tied to the state's tensors and their version counters, so any change to them makes it stale.
+    def _state_key(self):
+        return tuple((t, t._version if torch.is_tensor(t) else None) for t in (self.g, self.W, self.eps, self.f, self.T, self.ray_weight))
+
+    def remember_data_loss(self, value):
+        """Record value as the data loss (the deviance, no penalties) at the current state."""
+        self._data_memo = (self._state_key(), float(value))
+
+    def recall_data_loss(self):
+        """The data loss at the current state if a pass recorded it since the state last changed, else None (always
+        None with use_memo False, which recomputes every loss as before, for checks)."""
+        memo = getattr(self, "_data_memo", None)
+        if memo is None or not getattr(self, "use_memo", True):
+            return None
+        key, value = memo
+        same = all(a[0] is b[0] and a[1] == b[1] for a, b in zip(key, self._state_key()))
+        return value if same else None
+
+    def data_loss(self, g=None, W=None, f=None, eps=None):
+        """The deviance of all rays (no penalties) at the given parameters, the current ones by default."""
+        current = g is None and W is None and f is None and eps is None
+        if current:
+            v = self.recall_data_loss()
+            if v is not None:
+                return v
         g = self.g if g is None else g; f = self.f if f is None else f
         cache = self._state(g); tot = 0.0
         with torch.no_grad():
@@ -643,8 +674,18 @@ class FitB:
                 m = self.mean(sl, g, Ws, f, es, cache)[0]
                 tot += float(deviance_terms(m, self.T[sl], self.dose(sl)).sum(dtype=torch.float64))
         tot = all_sum_float(tot, self.T.device)
+        if current:
+            self.remember_data_loss(tot)
+        return tot
+
+    def penalties(self, g=None, f=None):
+        """The spline penalty and the contamination's L1 penalty at the given parameters, the current ones by default."""
+        g = self.g if g is None else g; f = self.f if f is None else f
         pen_c = float((self.lam_c * self.c).sum()) if hasattr(self, "lam_c") else float((self.lam1 * f).sum())
-        return tot + float(self.spline_penalty(g)) + pen_c
+        return float(self.spline_penalty(g)) + pen_c
+
+    def loss(self, g=None, W=None, f=None, eps=None):
+        return self.data_loss(g, W, f, eps) + self.penalties(g, f)
 
     # -- maps (and strain): per-pixel projected Newton
     def pixel_step(self):
@@ -679,15 +720,18 @@ class FitB:
             if self.eps is not None:
                 self.eps[sl] = V[:, R:]
 
-    def ray_system(self, sl, cache):
+    def ray_system(self, sl, cache, deviance=None):
         """Gradient (Pc, 2R) and Fisher information (Pc, 2R, 2R) of the deviance of the rays sl with respect to
         (W, U), where U = W * eps is the projected strain (the ray's mean strain times its projected density). Used by
-        a tomographic fit, where W and U are projections of volumes. Needs per-ray strain (eps not None)."""
+        a tomographic fit, where W and U are projections of volumes. Needs per-ray strain (eps not None). deviance: a
+        list to which the rays' deviance at the current state is appended (it costs nothing extra here)."""
         M = self.M
         Jac, m = self.ray_jacobian(sl, cache)
         mm = m.clamp_min(1e-12); T = self.T[sl]
         grad = torch.einsum('pk,pkn->pn', self.dose(sl) * (1 - T / mm), Jac).double()
         F = torch.einsum('pk,pka,pkb->pab', self.dose(sl) / mm, Jac, Jac).double()
+        if deviance is not None:
+            deviance.append(float(deviance_terms(m, T, self.dose(sl)).sum(dtype=torch.float64)))
         return grad, F
 
     def global_derivatives(self, idx):
@@ -811,12 +855,13 @@ class FitB:
         grad = torch.zeros(M.K, J, device=M.dev, dtype=torch.float64)
         Fx = torch.zeros(M.K, J, J, device=M.dev, dtype=torch.float64)
         Fi0 = torch.zeros(M.K, J, device=M.dev, dtype=torch.float64)
-        pear = 0.0
+        pear = 0.0; dev = 0.0
         with torch.no_grad():
             for sl in self.chunks():
                 T = self.T[sl]
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
+                dev += float(deviance_terms(m, T, self.dose(sl)).sum(dtype=torch.float64))
                 Dm = beta[:, None, :] - n[:, :, None]
                 grad += torch.einsum('pk,pkj->kj', self.dose(sl) * (1 - T / mm), Dm).double()
                 Fx += torch.einsum('pk,pka,pkb->kab', self.dose(sl) / mm, Dm, Dm).double()
@@ -825,7 +870,8 @@ class FitB:
                 # (beta near n, a vanishing score variance) is not free
                 Fi0 += (self.dose(sl) / n.clamp_min(1e-12) * (1 - n) ** 2).sum(0).double()[:, None].expand(-1, J)
                 pear += float((self.dose(sl) * (T - m) ** 2 / mm).sum(dtype=torch.float64))
-        all_sum(grad); all_sum(Fx); all_sum(Fi0); pear = all_sum_float(pear, M.dev)
+        all_sum(grad); all_sum(Fx); all_sum(Fi0); pear = all_sum_float(pear, M.dev); dev = all_sum_float(dev, M.dev)
+        self.remember_data_loss(dev)
         Fd = torch.diagonal(Fx, dim1=1, dim2=2)
         self.dispersion = pear / self.n_points
         A = self.A.double()
@@ -838,14 +884,17 @@ class FitB:
         else:
             Hc = ((A * A).T @ Fd).T.clamp_min(1e-30)
             c_new = (c_old - (gc + self.lam_c.double()) / Hc).clamp_min(0)
-        l0 = self.loss_c(self.c)
+        # the starting loss from this step's own pass when the current f is the current c's (as every step leaves it)
+        l0 = (dev + float((self.lam_c * self.c).sum())) if torch.equal(self._contamination_f(self.c), self.f) else self.loss_c(self.c)
+        dev_new = None
         for _ in range(10):
-            if self.loss_c(c_new.to(M.dt)) <= l0:
-                self.c = c_new.to(M.dt); break
+            d1 = self.loss_c_data(c_new.to(M.dt))
+            if d1 + float((self.lam_c * c_new.to(M.dt)).sum()) <= l0:
+                self.c = c_new.to(M.dt); dev_new = d1; break
             c_new = 0.5 * (c_new + c_old)
-        self.f = (self.c @ self.A.T)
-        tot = self.f.sum(0)
-        self.f = torch.where(tot[None] > 0.99, self.f * (0.99 / tot.clamp_min(1e-30))[None], self.f)
+        self.f = self._contamination_f(self.c)
+        if dev_new is not None:
+            self.remember_data_loss(dev_new)
 
     def _contamination_newton(self, A, gc, Fx, c0):
         """The minimizer over c >= 0 of the contamination loss's quadratic model at c0 plus the L1 thresholds, by FISTA:
@@ -867,15 +916,23 @@ class FitB:
             y = x_new + ((t - 1) / t_new) * (x_new - x); x, t = x_new, t_new
         return x.reshape(J, na)
 
-    def loss_c(self, c):
+    def _contamination_f(self, c):
+        """The contamination shares f = c A^T, scaled down where they would sum above CONTAM_MAX_SHARE."""
         f = c @ self.A.T
-        tot = f.sum(0); f = torch.where(tot[None] > 0.99, f * (0.99 / tot.clamp_min(1e-30))[None], f)
+        tot = f.sum(0)
+        return torch.where(tot[None] > CONTAM_MAX_SHARE, f * (CONTAM_MAX_SHARE / tot.clamp_min(1e-30))[None], f)
+
+    def loss_c_data(self, c):
+        """The deviance (no penalties) at the contamination coefficients c, the rest at the current state."""
+        f = self._contamination_f(c)
         cache = self._state(self.g); dv = 0.0
         with torch.no_grad():
             for sl in self.chunks():
                 dv += float(deviance_terms(self.mean(sl, f=f, cache=cache)[0], self.T[sl], self.dose(sl)).sum(dtype=torch.float64))
-        dv = all_sum_float(dv, self.T.device)
-        return dv + float((self.lam_c * c).sum())
+        return all_sum_float(dv, self.T.device)
+
+    def loss_c(self, c):
+        return self.loss_c_data(c) + float((self.lam_c * c).sum())
 
     # -- contamination: per bin, projected Newton with the L1 threshold
     def contamination_step(self):
@@ -908,7 +965,7 @@ class FitB:
                 tot += deviance_terms(self.mean(sl, f=fT.T, cache=cache)[0], self.T[sl], self.dose(sl)).sum(0, dtype=torch.float64)
             all_sum(tot)
             return tot + (self.lam1 * fT.T).sum(0).double()
-        self.f = _projected_newton_rows(self.f.T.contiguous(), grad, F, per_bin_loss, cap=(0, 0.99)).T.contiguous()
+        self.f = _projected_newton_rows(self.f.T.contiguous(), grad, F, per_bin_loss, cap=(0, CONTAM_MAX_SHARE)).T.contiguous()
 
     # -- globals: Levenberg-Marquardt Fisher scoring, derivatives by the chain rule
     def global_jacobian(self, sl, cache, idx, dmu, dRb):
@@ -978,7 +1035,8 @@ class FitB:
             step = torch.linalg.solve(A, grad[live])
             g_new = g0.clone(); g_new[idx_t[live]] = g0[idx_t[live]] - step
             g_new = torch.maximum(torch.minimum(g_new, M.ub), M.lb)
-            l1 = self.loss(g=g_new)
+            d1 = self.data_loss(g=g_new)
+            l1 = d1 + self.penalties(g=g_new)
             if l1 < l0:
                 # the move's root mean square in standard errors, from its length in the Fisher metric (with all
                 # correlations; a parameter held at a bound has not moved), for a stopping rule
@@ -991,6 +1049,7 @@ class FitB:
                     Fd = lf[1]
                 self.last_step_se = math.sqrt(max(float(moved @ (Fd[live][:, live] @ moved)), 0.0) / len(moved)) if len(moved) else 0.0
                 self.g = g_new
+                self.remember_data_loss(d1)
                 return l1, max(lam_ / 3, 1e-9)
             lam_ *= 10
         self.last_step_se = 0.0
@@ -1018,13 +1077,14 @@ class FitB:
         gp = self.g.clone().requires_grad_(True)
         with torch.no_grad():
             band = M.band_matrix(M.band(self.g))
-        grad = torch.zeros_like(self.g)
+        grad = torch.zeros_like(self.g); dev = 0.0
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
             m = self.mean(sl, g=gp, cache=cache)[0]
             dv = deviance_terms(m, self.T[sl], self.dose(sl)).sum(dtype=torch.float64)
-            grad += torch.autograd.grad(dv, gp)[0]
+            grad += torch.autograd.grad(dv, gp)[0]; dev += float(dv)
         all_sum(grad)
+        self.remember_data_loss(all_sum_float(dev, self.T.device))
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):
             grad += torch.autograd.grad(pen, gp)[0]
@@ -1055,14 +1115,16 @@ class FitB:
                 dRb[q] = M.band_matrix(jb[..., q])
         grad = torch.zeros(len(idx), device=M.dev, dtype=torch.float64)
         F = torch.zeros(len(idx), len(idx), device=M.dev, dtype=torch.float64)
-        P = self.T.shape[0]; gch = max(64, self.chunk // 4)
+        P = self.T.shape[0]; gch = max(64, self.chunk // 4); dev = 0.0
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
             Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb)
             mm = m.clamp_min(1e-12); T = self.T[sl]
             grad += torch.einsum('pk,npk->n', self.dose(sl) * (1 - T / mm), Jg).double()
             F += torch.einsum('pk,apk,bpk->ab', self.dose(sl) / mm, Jg, Jg).double()
+            dev += float(deviance_terms(m, T, self.dose(sl)).sum(dtype=torch.float64))
             del Jg
         all_sum(grad); all_sum(F)
+        self.remember_data_loss(all_sum_float(dev, self.T.device))
         gp = g0.clone().requires_grad_(True)
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):
@@ -1071,6 +1133,41 @@ class FitB:
             self.last_fisher_data = (list(idx), F.clone())          # without the penalties, for the step measure
             grad += gpen.detach()[idx]; F += Hpen.detach()
         return grad, F
+
+    def lattice_search(self, r, half_width=LATTICE_HALF_WIDTH, step=LATTICE_COARSE_STEP, rel_tol=LATTICE_TOL):
+        """Material r's lattice parameter: the loss on a grid of relative spacing `step` over a0 * (1 +- half_width),
+        then a golden-section search between the best grid point's neighbours, to rel_tol. The loss is not convex in a
+        (an edge sees no gradient far from its place), so the grid, whose spacing is about an edge's width, finds the
+        basin, and the search refines within it with fewer evaluations than a fine grid. Keeps the current value
+        unless a point is better. Returns (loss, a)."""
+        M = self.M; ia = M.slices[r]["a"]
+        a0 = float(self.g[ia])
+
+        def L(a):
+            gg = self.g.clone(); gg[ia] = a
+            return self.loss(g=gg)
+        n = int(round(2 * half_width / step)) + 1
+        grid = np.linspace(a0 * (1 - half_width), a0 * (1 + half_width), n)
+        vals = [L(a) for a in grid]
+        k = int(np.argmin(vals))
+        best = (self.loss(), a0)
+        if vals[k] < best[0]:
+            best = (vals[k], float(grid[k]))
+        lo, hi = float(grid[max(k - 1, 0)]), float(grid[min(k + 1, n - 1)])
+        x1, x2 = hi - GOLDEN * (hi - lo), lo + GOLDEN * (hi - lo)
+        f1, f2 = L(x1), L(x2)
+        while hi - lo > rel_tol * a0:
+            if f1 < f2:
+                hi, x2, f2 = x2, x1, f1
+                x1 = hi - GOLDEN * (hi - lo); f1 = L(x1)
+            else:
+                lo, x1, f1 = x1, x2, f2
+                x2 = lo + GOLDEN * (hi - lo); f2 = L(x2)
+        for f_, x_ in ((f1, x1), (f2, x2)):
+            if f_ < best[0]:
+                best = (f_, x_)
+        self.g[ia] = best[1]
+        return best
 
     def lattice_scan(self, r, half_width=0.004, n=21):
         """Line search on material r's lattice parameter (non-convex: an edge sees no gradient far from its place):

@@ -344,3 +344,52 @@ def test_measure_noise_dose_gaps():
     out = measure_noise(T, d.numpy(), (images, side, side))
     assert np.isfinite(out['dispersion']) and abs(out['dispersion'] / phi - 1) < 0.03
     assert abs(out['inflation'] - 1) < 0.05
+
+
+def test_data_loss_memo():
+    """The remembered data loss equals a fresh computation, goes stale when the state changes, and the global and
+    contamination steps take the same steps with it as without it."""
+    import copy
+    fit = _small_fit()
+    calls = []
+    mean0 = type(fit).mean
+    fit.mean = lambda *a, **k: (calls.append(1), mean0(fit, *a, **k))[1]
+    l1 = fit.loss(); n1 = len(calls); l2 = fit.loss()
+    assert l1 == l2 and len(calls) == n1                                         # the second loss costs no pass
+    with torch.no_grad():
+        fit.g[0] += 1e-6                                                          # an in-place change: stale
+    l3 = fit.loss()
+    assert len(calls) > n1 and l3 != l1
+    del fit.mean
+    fit.build_atoms(); fit.contamination_newton = True
+    a, b = copy.deepcopy(fit), copy.deepcopy(fit)
+    b.use_memo = False
+    for x in (a, b):
+        x.contamination_atoms_step()
+        x.global_step(1e-3)
+        x.contamination_atoms_step()
+    assert torch.equal(a.g, b.g) and torch.equal(a.c, b.c) and torch.equal(a.f, b.f)
+    assert abs(a.loss() - b.loss()) <= 1e-9 * abs(b.loss())
+
+
+def test_lattice_search():
+    """lattice_search finds the loss minimum in the lattice parameter from a start two edge widths away, to within
+    the tolerance of a fine grid around the truth, with fewer loss evaluations than the old two-scan grid."""
+    fit = _small_fit()
+    M = fit.M; ia = M.slices[0]['a']
+    a_true = float(fit.g[ia])
+    with torch.no_grad():
+        fit.g[ia] = a_true * (1 + 0.0012)
+    n_eval = []
+    loss0 = type(fit).loss
+    fit.loss = lambda *x, **k: (n_eval.append(1), loss0(fit, *x, **k))[1]
+    l_best, a_best = fit.lattice_search(0)
+    del fit.loss
+    fine = np.linspace(a_true * (1 - 0.001), a_true * (1 + 0.001), 401)
+    vals = []
+    for a_ in fine:
+        gg = fit.g.clone(); gg[ia] = a_
+        vals.append(fit.loss(g=gg))
+    a_grid = fine[int(np.argmin(vals))]
+    assert abs(a_best - a_grid) <= 2 * (fine[1] - fine[0]) and l_best <= min(vals) + 1e-9 * abs(min(vals))
+    assert len(n_eval) < 33 + 25 + 2

@@ -439,6 +439,14 @@ class TomoFit:
 
     def sync(self):
         self.fit.W, self.fit.eps = self.rays(self.V, self.E)
+        self._synced = (self.V, self.V._version, self.E, self.E._version, self.fit.W, self.fit.W._version,
+                        self.fit.eps, self.fit.eps._version)
+
+    def _is_synced(self):
+        """True when the fit's projected maps are this volume's: nothing changed since the last sync."""
+        s = getattr(self, "_synced", None)
+        return s is not None and s[0] is self.V and s[1] == self.V._version and s[2] is self.E and s[3] == self.E._version \
+            and s[4] is self.fit.W and s[5] == self.fit.W._version and s[6] is self.fit.eps and s[7] == self.fit.eps._version
 
     # ---- priors
     @staticmethod
@@ -603,15 +611,21 @@ class TomoFit:
             tot += 0.5 * self.eq_w * float((self._eq_residual(E, mask).double() ** 2).sum())
         return tot
 
-    def loss(self, V=None, E=None, mask=None):
+    def data_loss(self, V=None, E=None):
+        """The deviance of all rays (no priors) for the volumes V, E, the current ones by default (then the fit's
+        remembered value when a pass has computed it at this state)."""
+        if V is None and E is None and self._is_synced():
+            return self.fit.data_loss()
         V = self.V if V is None else V; E = self.E if E is None else E
         W, eps = self.rays(V, E)
         cache = self.fit._state(self.fit.g); tot = 0.0
         with torch.no_grad():
             for sl in self.fit.chunks():
                 tot += float(self.fit.ray_loss(sl, W[sl], eps[sl], cache).sum())
-        tot = all_sum_float(tot, V.device)
-        return tot + self.prior(V, E, mask)
+        return all_sum_float(tot, V.device)
+
+    def loss(self, V=None, E=None, mask=None):
+        return self.data_loss(V, E) + self.prior(self.V if V is None else V, self.E if E is None else E, mask)
 
     # ---- the Gauss-Newton step
     def volume_step(self):
@@ -622,9 +636,11 @@ class TomoFit:
         P = fit.T.shape[0]
         G = torch.zeros(P, 2 * R, device=fit.T.device, dtype=torch.float64)
         F = torch.zeros(P, 2 * R, 2 * R, device=fit.T.device, dtype=torch.float64)
+        devs = []
         with torch.no_grad():
             for sl in fit.chunks():
-                G[sl], F[sl] = fit.ray_system(sl, cache)
+                G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
+        fit.remember_data_loss(all_sum_float(sum(devs), fit.T.device))          # the deviance at this synced state
         G, F = G.float(), F.float()
         V, E = self.V, self.E
         mask = self._eq_mask() if self.elastic is not None else None
@@ -681,10 +697,11 @@ class TomoFit:
             l0 = self.loss(mask=mask)
             for alpha in (1.0, 0.5, 0.25):
                 Vn = (V + alpha * xV).clamp(0, self.v_max); En = E + alpha * xE
-                l1 = self.loss(Vn, En, mask=mask)
+                d1 = self.data_loss(Vn, En)
+                l1 = d1 + self.prior(Vn, En, mask)
                 if l1 < l0:
                     self.last_step_se = self._step_se(alpha * alpha * dec)
-                    self.V, self.E = Vn, En; self.sync()
+                    self.V, self.E = Vn, En; self.sync(); fit.remember_data_loss(d1)
                     self.damp = max(self.damp / 3, 1e-6)
                     return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l1
             self.damp *= 10
