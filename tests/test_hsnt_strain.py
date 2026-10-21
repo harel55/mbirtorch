@@ -639,3 +639,50 @@ def test_fine_projector_set_mount():
         assert torch.allclose(P.project_series(k, vol), Q.project_series(k, vol), atol=1e-6)
     assert np.allclose(P.parts[1][0][2], (0.3, -0.2, 0.1)) and abs(P.offsets[1] - 0.25) < 1e-12
     assert torch.allclose(P.fwd(vol), Q.fwd(vol), atol=1e-6)
+
+
+def test_skin_stress_field():
+    """The skin phantom's stress (phantom.fe_cube_skin_stress) is in equilibrium inside the cube; on the faces the
+    traction is near zero while the in-plane stresses are not, and they exceed the mid-plane's."""
+    from mbirtorch.hsnt.strain.phantom import fe_cube_skin_stress
+    from scipy import ndimage as nd
+    cube, sig = fe_cube_skin_stress(32)
+    g = lambda a, ax: np.gradient(a, axis=ax)                               # axes: rows y, cols x, slices z
+    xx, yy, zz, xy, yz, xz = [sig[..., k] for k in range(6)]
+    div = [g(xx, 1) + g(xy, 0) + g(xz, 2), g(xy, 1) + g(yy, 0) + g(yz, 2), g(xz, 1) + g(yz, 0) + g(zz, 2)]
+    deep = nd.binary_erosion(cube, iterations=2)
+    assert max(np.abs(d)[deep].max() for d in div) < 0.05 * np.abs(g(xx, 1))[deep].max()
+    c0 = np.where(cube.any((0, 2)))[0][0]; face = cube[:, c0, :]; peak = np.abs(sig[cube]).max()
+    traction = max(np.abs(sig[:, c0, :, k][face]).mean() for k in (0, 3, 5)) / peak
+    inplane = max(np.abs(sig[:, c0, :, k][face]).mean() for k in (1, 2)) / peak
+    mid = cube[:, 16, :]; inplane_mid = max(np.abs(sig[:, 16, :, k][mid]).mean() for k in (1, 2)) / peak
+    assert traction < 0.05 and inplane > 3 * traction and inplane > 1.5 * inplane_mid
+
+
+def test_diffraction_constants():
+    """For an isotropic crystal every reflection's diffraction constants are -nu/E and (1 + nu)/E. For Fe the Hill
+    moduli match the package's Fe values, and 200 responds about 35% more than 110 to a uniaxial stress."""
+    from mbirtorch.hsnt.strain.phantom import diffraction_constants, hill_moduli, FE_SINGLE_CRYSTAL, FE_ELASTIC
+    E, nu = FE_ELASTIC
+    iso = (E * (1 - nu) / ((1 + nu) * (1 - 2 * nu)), E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu)))
+    for gm in (0.0, 0.25, 1 / 3):
+        s1, hs2 = diffraction_constants(iso, gm)
+        assert np.isclose(s1, -nu / E) and np.isclose(hs2, (1 + nu) / E)
+    Eh, nuh = hill_moduli(FE_SINGLE_CRYSTAL)
+    assert abs(Eh / E - 1) < 0.01 and abs(nuh - nu) < 0.01
+    r200, r110 = [sum(diffraction_constants(FE_SINGLE_CRYSTAL, gm)) for gm in (0.0, 0.25)]
+    assert 1.25 < r200 / r110 < 1.45
+
+
+def test_anisotropic_phantom_isotropic_limit(monkeypatch):
+    """With isotropic single-crystal constants, the anisotropic phantom (one component per reflection group, the smooth
+    part added once) reproduces the standard phantom's data. The cube is shifted off the grid's symmetry, as in the
+    phantom runs: a symmetric cube puts many voxels' strains exactly between two levels, where rounding picks either."""
+    import mbirtorch.hsnt.strain.phantom as P
+    E, nu = P.FE_ELASTIC
+    monkeypatch.setattr(P, 'FE_SINGLE_CRYSTAL', (E * (1 - nu) / ((1 + nu) * (1 - 2 * nu)), E * nu / ((1 + nu) * (1 - 2 * nu)),
+                                                 E / (2 * (1 + nu))))
+    kw = dict(n=8, angles=np.linspace(0, np.pi, 4), fine=2, device='cpu', levels=7, kernel='ikeda_carpenter',
+              kernel_values=[0, 0.00118, 0.00039, 0.00059, 0, 0.0002, 0, 0], contamination=False, cube_shift=0.25)
+    a = P.make_fe_cube(**kw); b = P.make_fe_cube(**kw, elastic_anisotropy=True)
+    assert float((a['T'] == b['T']).double().mean()) > 0.9999

@@ -510,6 +510,10 @@ FE = dict(name='Fe', lattice='bcc', a=2.8665)
 FE_ELASTIC = (211e9, 0.29)                  # Young's modulus (Pa) and Poisson ratio of Fe
 FE_MAXWELL = (1.0, -0.6, 0.8)               # Maxwell stress-function amplitudes for the cube's residual stress
 FE_PEAK = 1.5e-3                            # the largest strain component in the cube
+FE_SINGLE_CRYSTAL = (231.4e9, 134.7e9, 116.4e9)   # Fe single-crystal stiffness C11, C12, C44 (Pa)
+SKIN = dict(depth=0.15, gain=3.0)           # skin field: depth of the surface layer (share of the half side) and its stress gain
+SKIN_MAXWELL = (1.0, -0.7, 0.5)             # the skin field's Maxwell stress-function amplitudes
+ANISO_GAMMAS = (0.0, 0.09, 0.16, 0.25, 1.0 / 3.0)   # orientation factors the reflections are grouped by (anisotropic phantoms)
 FE_CUBE = dict(half=19.0 / 64, centre=(-0.5 / 64, -0.5 / 64, 7.0 / 64))   # half side and centre (y, x, z), units of n
 FE_ATTEN_3A = 0.1 * 64                      # the cube's attenuation per unit length at 3 Angstrom, times n per voxel
 FE_AXIS = (1.035, 6.027, 2841)              # wavelength range (Angstrom) and bins of the default axis
@@ -544,6 +548,85 @@ def fe_cube_tensor(N, offset=0.0):
     eps = np.zeros((N, N, N, 6))
     eps.reshape(-1, 6)[cube.reshape(-1)] = e * FE_PEAK / np.abs(e).max()
     return cube, eps
+
+
+def _hooke_strain(sig, E, nu):
+    """Returns the isotropic elastic strain (..., 6) of the stress sig (..., 6), tensor shear components."""
+    tr = sig[..., :3].sum(-1, keepdims=True)
+    return np.concatenate([((1 + nu) * sig[..., :3] - nu * tr) / E, (1 + nu) * sig[..., 3:] / E], -1)
+
+
+def _hooke_stress(eps, E, nu):
+    """Returns the isotropic stress (..., 6) of the elastic strain eps (..., 6), tensor shear components."""
+    lam_, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+    tr = eps[..., :3].sum(-1, keepdims=True)
+    return np.concatenate([2 * mu * eps[..., :3] + lam_ * tr, 2 * mu * eps[..., 3:]], -1)
+
+
+def fe_cube_skin_stress(N, offset=0.0):
+    """Indicator (N, N, N) of the Fe cube and a residual stress (N, N, N, 6), COMPONENTS order, arbitrary scale, that is
+    a stricter test at the faces than fe_cube_tensor's. Maxwell stress functions S_1 P(x) D(y) D(z) (and cyclic), with
+    D(u) = (1 - u^2/h^2)^2 and P(u) = 1 + gain cosh(u/d)/cosh(h/d), satisfy equilibrium everywhere. Only the traction
+    vanishes on each face, so the in-plane stresses are nonzero there, as at a real free surface. P concentrates them in
+    a layer of depth d = SKIN['depth'] h under the faces. offset moves the cube as in fe_cube_tensor."""
+    c = (N - 1) / 2.0
+    h = FE_CUBE['half'] * N; dep = SKIN['depth'] * h
+    cy, cx, cz = ((v + offset) * N for v in FE_CUBE['centre'])
+    yy, xx, zz = np.meshgrid(np.arange(N) - c - cy, np.arange(N) - c - cx, np.arange(N) - c - cz, indexing='ij')
+    cube = (np.abs(yy) < h) & (np.abs(xx) < h) & (np.abs(zz) < h)
+    pts = torch.tensor(np.stack([xx, yy, zz], -1).reshape(-1, 3)[cube.reshape(-1)], dtype=torch.float64)
+    D = lambda u: (1 - u ** 2 / h ** 2) ** 2
+    P = lambda u: 1 + SKIN['gain'] * torch.cosh(u / dep) / math.cosh(h / dep)
+    phis = [lambda p, S=SKIN_MAXWELL[0]: S * P(p[0]) * D(p[1]) * D(p[2]),
+            lambda p, S=SKIN_MAXWELL[1]: S * D(p[0]) * P(p[1]) * D(p[2]),
+            lambda p, S=SKIN_MAXWELL[2]: S * D(p[0]) * D(p[1]) * P(p[2])]
+    h1, h2, h3 = [torch.func.vmap(torch.func.hessian(f))(pts) for f in phis]
+    sig = torch.stack([h2[:, 2, 2] + h3[:, 1, 1], h3[:, 0, 0] + h1[:, 2, 2], h1[:, 1, 1] + h2[:, 0, 0],
+                       -h3[:, 0, 1], -h1[:, 1, 2], -h2[:, 0, 2]], -1).numpy()
+    out = np.zeros((N, N, N, 6)); out.reshape(-1, 6)[cube.reshape(-1)] = sig
+    return cube, out
+
+
+def cubic_compliance(C):
+    """Returns the single-crystal compliances (s11, s12, s44) of a cubic crystal with stiffness C = (C11, C12, C44)."""
+    c11, c12, c44 = C
+    den = (c11 - c12) * (c11 + 2 * c12)
+    return (c11 + c12) / den, -c12 / den, 1.0 / c44
+
+
+def hill_moduli(C):
+    """Returns the Young's modulus and Poisson ratio of an untextured polycrystal of the cubic crystal C, by the Hill
+    average of the Voigt and Reuss bounds: the macroscopic stress-strain relation the phantom's true strain uses."""
+    c11, c12, c44 = C; s11, s12, s44 = cubic_compliance(C)
+    K = (c11 + 2 * c12) / 3
+    G = 0.5 * ((c11 - c12 + 3 * c44) / 5 + 5 / (4 * (s11 - s12) + 3 * s44))
+    return 9 * K * G / (3 * K + G), (3 * K - 2 * G) / (2 * (3 * K + G))
+
+
+def diffraction_constants(C, gamma):
+    """Returns the diffraction elastic constants (S1, S2 / 2) of reflections with orientation factor gamma =
+    (h^2 k^2 + k^2 l^2 + l^2 h^2) / (h^2 + k^2 + l^2)^2 in an untextured polycrystal of the cubic crystal C: the
+    Neerfeld-Hill mean of the Reuss and Voigt values. A reflection's lattice strain along d is
+    S1 tr(sigma) + S2/2 d.sigma.d."""
+    c11, c12, c44 = C; s11, s12, s44 = cubic_compliance(C)
+    s0 = s11 - s12 - s44 / 2
+    K = (c11 + 2 * c12) / 3; Gv = (c11 - c12 + 3 * c44) / 5
+    Ev, nuv = 9 * K * Gv / (3 * K + Gv), (3 * K - 2 * Gv) / (2 * (3 * K + Gv))
+    s1 = 0.5 * ((s12 + s0 * gamma) + (-nuv / Ev)); hs2 = 0.5 * ((s11 - s12 - 3 * s0 * gamma) + (1 + nuv) / Ev)
+    return s1, hs2
+
+
+def reflection_gammas(lattice, ns):
+    """Returns, for each h^2 + k^2 + l^2 in ns, the orientation factor gamma averaged over the (h, k, l) the lattice type
+    allows."""
+    from .bragg import LATTICES
+    allowed = LATTICES[lattice]; out = []
+    for n in ns:
+        n = int(round(n)); hm = int(math.isqrt(n)) + 1
+        v = [(h * h * k * k + k * k * l * l + l * l * h * h) / n ** 2 for h in range(-hm, hm + 1) for k in range(-hm, hm + 1)
+             for l in range(-hm, hm + 1) if h * h + k * k + l * l == n and allowed(abs(h), abs(k), abs(l))]
+        out.append(float(np.mean(v)))
+    return np.array(out)
 
 
 def _cubic_orbit(u):
@@ -625,7 +708,7 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', ke
 
 def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, offsets=None, levels=31, fine=2, seed=1,
                  device='cuda', axis=None, holder=True, contamination=True, kernel='two_scale', kernel_values=None,
-                 cube_shift=0.0, texture=None):
+                 cube_shift=0.0, texture=None, field='lobes', elastic_anisotropy=False):
     """Synthetic data shaped like the Fe cube measurement: a bcc Fe cube with a residual-stress strain tensor
     (fe_cube_tensor), seen by rotation series with their own mounts and a holder rod each.
 
@@ -643,7 +726,10 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     finer reconstruction grid. texture: (March-Dollase strength, axis polar angle, axis azimuth in the sample frame), or
     the 9 degree-4 coefficients of a cubic texture, for a textured cube: each view's Bragg edges carry that view's
     texture factor (model.Hybrid2.texture_factor). texture={'fiber': (strength, polar, azimuth[, crystal_dir])} gives
-    a cubic fiber texture instead (fiber_texture_factor), which has parts above degree 4."""
+    a cubic fiber texture instead (fiber_texture_factor), which has parts above degree 4. field='skin' uses the
+    stricter face test (fe_cube_skin_stress: in-plane stresses at the faces, concentrated in a surface layer).
+    elastic_anisotropy=True shifts each reflection's edge by its own lattice strain (diffraction_constants, Fe's
+    single-crystal stiffness), as in a real untextured polycrystal; E_true stays the macroscopic strain."""
     import mbirtorch
     from .geometry import series_weights
     from .tomo import MultiProjector, Projector, detector_directions
@@ -659,7 +745,13 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     d = dose * flux / np.mean(flux)
     M, g = fe_spectrum_model(lam, d, n, device, kernel=kernel, kernel_values=kernel_values, texture=texture)
     N = fine * n; V_ = len(angles); S = len(mounts)
-    cube, et = fe_cube_tensor(N, cube_shift / n)
+    sig = None
+    if field == 'skin':                              # the stricter face test, scaled so its largest strain is FE_PEAK
+        cube, sig_raw = fe_cube_skin_stress(N, cube_shift / n)
+        et_raw = _hooke_strain(sig_raw, *hill_moduli(FE_SINGLE_CRYSTAL))
+        scale = FE_PEAK / np.abs(et_raw).max(); sig, et = scale * sig_raw, scale * et_raw
+    else:
+        cube, et = fe_cube_tensor(N, cube_shift / n)
     wts = series_weights([((m[0], m[1], m[2]), angles) for m in mounts])         # (S views, 6)
     tex_fixed = None
     if texture is not None:
@@ -667,58 +759,94 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
         M.view_dirs = directions_from_weights(wts)
         if isinstance(texture, dict):                # a fiber texture (phantoms only): {'fiber': (strength, polar, azimuth[, crystal_dir])}
             tex_fixed = [fiber_texture_factor(M, 0, *texture['fiber'])]
-    seen_all = [(et * w).sum(-1) for w in wts]
-    lv = np.linspace(min(s[cube].min() for s in seen_all), max(s[cube].max() for s in seen_all), levels)
-    proj = np.zeros((levels, S * V_, n, n))                                      # path length per strain level
+    # components: (each voxel's strain seen by each view, the spectrum parameters). Without anisotropy one component,
+    # the macroscopic strain with every edge; with it, one per group of reflections (ANISO_GAMMAS), each group's edges
+    # shifted by its own lattice strain S1 tr(sigma) + S2/2 d.sigma.d, and the smooth part added once from path lengths
+    if elastic_anisotropy:
+        if sig is None:
+            sig = _hooke_stress(et, *hill_moduli(FE_SINGLE_CRYSTAL))
+        sl_ = M.slices[0]
+        gam = reflection_gammas(FE['lattice'], M.mats[0]['ns'].cpu().numpy())
+        group = np.abs(gam[:, None] - np.array(ANISO_GAMMAS)[None]).argmin(1)
+        trs = sig[..., :3].sum(-1)
+        components = []
+        for gi, G in enumerate(ANISO_GAMMAS):
+            if not np.any(group == gi):
+                continue
+            s1, hs2 = diffraction_constants(FE_SINGLE_CRYSTAL, G)
+            gk = g.clone()
+            gk[sl_['h'][0]:sl_['h'][1]] *= torch.as_tensor(group == gi, dtype=gk.dtype, device=gk.device)
+            gk[sl_['c'][0]:sl_['c'][1]] = 0.0; gk[sl_['s'][0]:sl_['s'][1]] = 0.0
+            components.append(([s1 * trs + hs2 * (sig * w).sum(-1) for w in wts], gk))
+        g_smooth = g.clone(); g_smooth[sl_['h'][0]:sl_['h'][1]] = 0.0
+    else:
+        components = [([(et * w).sum(-1) for w in wts], g)]
+        g_smooth = None
+    P = S * V_ * n * n
     hold = np.zeros((S * V_, n, n))
     holder_rows = []
     zc = (N - 1) / 2.0
-    for k, (perm, signs, shift, rot) in enumerate(mounts):
-        tr = (tuple(perm), tuple(signs), tuple(float(v) * fine for v in shift), tuple(float(v) for v in rot))
-        # the holder: a rod in the series frame on the rotation axis (slices), from just past the cube's far end
-        cube_s = MultiProjector._to_series(torch.as_tensor(cube[..., None], dtype=torch.float32, device=device), tr)[..., 0]
-        zs = torch.nonzero(cube_s.sum((0, 1)) > 0.5)[:, 0]
-        z0 = int(zs.max()) + 1 + int(round(HOLDER['gap'] * N))
-        yy, xx = np.meshgrid(np.arange(N) - zc, np.arange(N) - zc, indexing='ij')     # the axis is the grid's centre
-        rod = np.zeros((N, N, N), np.float32)
-        if holder and z0 < N:
-            rod[(yy ** 2 + xx ** 2 < (HOLDER['radius'] * N) ** 2), z0:] = 1.0
-        holder_rows.append(z0 // fine)
-        # the sample moves with the mount (the fractional part of the shift on the detector, as MultiProjector does);
-        # the holder rod stays on the rotation axis
-        whole, frac = MultiProjector._split(tr[2])
-        d_rows, d_cols = detector_directions(angles)
-        rod_t = torch.as_tensor(rod, device=device)[..., None]
-        for v in range(V_):
-            idx = np.abs(seen_all[k * V_ + v][..., None] - lv).argmin(-1)
-            inds = torch.as_tensor(np.stack([(cube & (idx == l)) for l in range(levels)], -1), dtype=torch.float32, device=device)
-            vol = MultiProjector._to_series(inds, tr)
-            pv = Projector(N, angles[v:v + 1], levels, float(offsets[k]) * fine, False,
-                           np.array([frac[0] * d_rows[v] + frac[1] * d_cols[v]]), frac[2])
-            ph_ = Projector(N, angles[v:v + 1], 1, float(offsets[k]) * fine, False)
-            rays = torch.cat([pv.fwd(vol), ph_.fwd(rod_t)], 1)                         # (N N, levels + 1)
-            b = (rays.T.reshape(levels + 1, n, fine, n, fine).mean((2, 4)) / fine).cpu().numpy()
-            proj[:, k * V_ + v] = b[:levels]; hold[k * V_ + v] = b[levels]
-    P = S * V_ * n * n
-    proj = proj.reshape(levels, P); hold = hold.reshape(P)
+    X = torch.zeros(P, M.Kf, dtype=torch.float32, device=device)
+    path = None
+    for ci, (seen_all, g_c) in enumerate(components):
+        lv = np.linspace(min(s_[cube].min() for s_ in seen_all), max(s_[cube].max() for s_ in seen_all), levels)
+        proj = np.zeros((levels, S * V_, n, n))                                  # path length per strain level
+        for k, (perm, signs, shift, rot) in enumerate(mounts):
+            tr = (tuple(perm), tuple(signs), tuple(float(v) * fine for v in shift), tuple(float(v) for v in rot))
+            if ci == 0:
+                # the holder: a rod in the series frame on the rotation axis (slices), from just past the cube's far end
+                cube_s = MultiProjector._to_series(torch.as_tensor(cube[..., None], dtype=torch.float32, device=device), tr)[..., 0]
+                zs = torch.nonzero(cube_s.sum((0, 1)) > 0.5)[:, 0]
+                z0 = int(zs.max()) + 1 + int(round(HOLDER['gap'] * N))
+                yy, xx = np.meshgrid(np.arange(N) - zc, np.arange(N) - zc, indexing='ij')     # the axis is the grid's centre
+                rod = np.zeros((N, N, N), np.float32)
+                if holder and z0 < N:
+                    rod[(yy ** 2 + xx ** 2 < (HOLDER['radius'] * N) ** 2), z0:] = 1.0
+                holder_rows.append(z0 // fine)
+                rod_t = torch.as_tensor(rod, device=device)[..., None]
+            # the sample moves with the mount (the fractional part of the shift on the detector, as MultiProjector does);
+            # the holder rod stays on the rotation axis
+            whole, frac = MultiProjector._split(tr[2])
+            d_rows, d_cols = detector_directions(angles)
+            for v in range(V_):
+                idx = np.abs(seen_all[k * V_ + v][..., None] - lv).argmin(-1)
+                inds = torch.as_tensor(np.stack([(cube & (idx == l)) for l in range(levels)], -1), dtype=torch.float32, device=device)
+                vol = MultiProjector._to_series(inds, tr)
+                pv = Projector(N, angles[v:v + 1], levels, float(offsets[k]) * fine, False,
+                               np.array([frac[0] * d_rows[v] + frac[1] * d_cols[v]]), frac[2])
+                rays = pv.fwd(vol)
+                if ci == 0:
+                    ph_ = Projector(N, angles[v:v + 1], 1, float(offsets[k]) * fine, False)
+                    rays = torch.cat([rays, ph_.fwd(rod_t)], 1)                         # (N N, levels + 1)
+                b = (rays.T.reshape(rays.shape[1], n, fine, n, fine).mean((2, 4)) / fine).cpu().numpy()
+                proj[:, k * V_ + v] = b[:levels]
+                if ci == 0:
+                    hold[k * V_ + v] = b[levels]
+        proj = proj.reshape(levels, P)
+        if path is None:
+            path = proj.sum(0)
+        with torch.no_grad():
+            for l, e_l in enumerate(lv):
+                w = torch.as_tensor(proj[l], dtype=torch.float32, device=device)
+                if float(w.max()) <= 0:
+                    continue
+                eps_t = torch.full((1, 1), float(e_l), dtype=torch.float64, device=device)
+                if texture is None:
+                    X += w[:, None] * M.spectra(g_c, eps_t)[0, 0].float()[None, :]
+                else:                               # each view's spectrum, with its own texture factor
+                    nv = S * V_; per = n * n
+                    spec = M.spectra(g_c, eps_t.expand(nv, 1), torch.arange(nv, device=device), tex_fixed)[:, 0].float()   # (views, Kf)
+                    for v in range(nv):
+                        X[v * per:(v + 1) * per] += w[v * per:(v + 1) * per, None] * spec[v][None, :]
+    hold = hold.reshape(P)
+    if g_smooth is not None:                          # the smooth part of the spectrum, once, along each ray's path in the sample
+        with torch.no_grad():
+            X += torch.as_tensor(path, dtype=torch.float32, device=device)[:, None] * M.spectra(g_smooth)[0].float()[None, :]
     blk = lambda a: a.reshape(n, fine, n, fine, n, fine).mean((1, 3, 5))
     frac = np.maximum(blk(cube.astype(np.float64)), 1e-12)
     V_true = blk(cube.astype(np.float64))[..., None]
     E_true = np.stack([blk(np.where(cube, et[..., c], 0.0)) / frac for c in range(6)], -1)[..., None, :]
     with torch.no_grad():
-        X = torch.zeros(P, M.Kf, dtype=torch.float32, device=device)
-        for l, e_l in enumerate(lv):
-            w = torch.as_tensor(proj[l], dtype=torch.float32, device=device)
-            if float(w.max()) <= 0:
-                continue
-            eps_t = torch.full((1, 1), float(e_l), dtype=torch.float64, device=device)
-            if texture is None:
-                X += w[:, None] * M.spectra(g, eps_t)[0, 0].float()[None, :]
-            else:                                   # each view's spectrum, with its own texture factor
-                nv = S * V_; per = n * n
-                spec = M.spectra(g, eps_t.expand(nv, 1), torch.arange(nv, device=device), tex_fixed)[:, 0].float()   # (views, Kf)
-                for v in range(nv):
-                    X[v * per:(v + 1) * per] += w[v * per:(v + 1) * per, None] * spec[v][None, :]
         mu0 = M.spectra(g)[0]
         X += torch.as_tensor(hold, dtype=torch.float32, device=device)[:, None] * float(HOLDER['atten'] * mu0.mean())
         n_t = M.apply_band(torch.exp(-X), M.band_matrix(M.band(g)))
