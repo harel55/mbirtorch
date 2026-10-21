@@ -331,7 +331,8 @@ class Hybrid2:
 
     # -- spectra and their parameter derivatives
     def spectra(self, g, eps=None):
-        """mu (R, Kf), float64; or (Pc, R, Kf) with per-pixel dilations eps (Pc, R)."""
+        """mu (R, Kf), float64; or (Pc, R, Kf) in the model's dtype with per-pixel dilations eps (Pc, R): the edge
+        positions are computed in float64, the per-pixel arrays (pixels x edges x bins) in the model's dtype."""
         x = self.lamf / self.lam_ref
         out = []
         for r, (m, sl) in enumerate(zip(self.mats, self.slices)):
@@ -346,25 +347,37 @@ class Hybrid2:
                 shape = shape * self.linked_shape(self.lamf[:, None], e[None, :], h[None, :], m["mult"][None, :], xp)
                 out.append(x * x * ((step * shape) @ h) + smooth)
             else:
-                ee = e[None, :] * (1 + eps[:, r:r + 1].double())
-                step = ((ee[:, :, None] - (self.lamf[None, None, :] - 0.5 * self.hf)) / self.hf).clamp(0, 1)
-                shape = 1 + t[None, :, None] * (self.lamf[None, None, :] - ee[:, :, None]) / ee[:, :, None]
-                shape = shape * self.linked_shape(self.lamf[None, None, :], ee[:, :, None], h[None, :, None],
-                                                  m["mult"][None, :, None], xp)
-                out.append(x * x * torch.einsum('pek,e->pk', step * shape, h) + smooth)
+                dt = self.dt
+                off, ee = self._edge_offsets(e, eps[:, r:r + 1])
+                step = (off / self.hf).clamp(0, 1)
+                shape = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]       # 1 + t (lam - ee) / ee
+                shape = shape * self.linked_shape(self.lamf.to(dt)[None, None, :], ee[:, :, None], h.to(dt)[None, :, None],
+                                                  m["mult"].to(dt)[None, :, None], xp).to(dt)
+                out.append((x * x).to(dt) * torch.einsum('pek,e->pk', step * shape, h.to(dt)) + smooth.to(dt))
         return torch.stack(out, 0) if eps is None else torch.stack(out, 1)
 
     def edge_terms(self, g, eps, r):
-        """Material r's edge terms under per-pixel dilations eps (Pc, R): (Pc, n_edges, Kf), each the spectrum's
-        derivative with respect to that edge's height when there is no linked shape model."""
+        """Material r's edge terms under per-pixel dilations eps (Pc, R): (Pc, n_edges, Kf) in the model's dtype, each the
+        spectrum's derivative with respect to that edge's height when there is no linked shape model."""
         m, sl = self.mats[r], self.slices[r]
         with torch.no_grad():
-            a = g[sl["a"]]; t = g[sl["t"][0]:sl["t"][1]]
-            x = self.lamf / self.lam_ref
-            ee = (2.0 * a / torch.sqrt(m["ns"]))[None, :] * (1 + eps[:, r:r + 1].double())
-            step = ((ee[:, :, None] - (self.lamf[None, None, :] - 0.5 * self.hf)) / self.hf).clamp(0, 1)
-            shape = 1 + t[None, :, None] * (self.lamf[None, None, :] - ee[:, :, None]) / ee[:, :, None]
+            dt = self.dt
+            a = g[sl["a"]]; t = g[sl["t"][0]:sl["t"][1]].to(dt)
+            x = (self.lamf / self.lam_ref).to(dt)
+            off, ee = self._edge_offsets(2.0 * a / torch.sqrt(m["ns"]), eps[:, r:r + 1])
+            step = (off / self.hf).clamp(0, 1)
+            shape = 1 - t[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
             return x * x * step * shape
+
+    def _edge_offsets(self, e, eps):
+        """For edges e (n_e,) under per-pixel dilations eps (Pc, 1): each dilated edge's position less each fine bin's
+        lower end, (Pc, n_e, Kf), and the dilated edges (Pc, n_e), in the model's dtype. The edge-to-bin offsets
+        and the dilation's shift are formed in float64 and added in the model's dtype: near an edge both are small, so
+        float32 keeps their precision where the difference of two wavelengths near 4 A would lose it."""
+        dt = self.dt
+        base = (e[:, None] - self.lamf[None, :] + 0.5 * self.hf).to(dt)               # (n_e, Kf)
+        shift = (e[None, :] * eps.double()).to(dt)                                    # (Pc, n_e)
+        return base[None] + shift[:, :, None], (e[None, :] * (1 + eps.double())).to(dt)
 
     def linked_shape(self, lam, edge, h, mult, xp):
         """Per-reflection shape factor below each edge from a few shared parameters (shapes broadcast; lam the

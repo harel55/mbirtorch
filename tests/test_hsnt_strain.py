@@ -393,3 +393,24 @@ def test_lattice_search():
     a_grid = fine[int(np.argmin(vals))]
     assert abs(a_best - a_grid) <= 2 * (fine[1] - fine[0]) and l_best <= min(vals) + 1e-9 * abs(min(vals))
     assert len(n_eval) < 33 + 25 + 2
+
+
+def test_spectra_float32():
+    """The per-pixel spectra in float32 (the model's dtype on the GPU) agree with float64 to single precision, and so
+    do their derivatives with respect to the dilation (what the strain is fitted from)."""
+    from mbirtorch.hsnt.strain.model import Hybrid2
+    lam = np.linspace(2.0, 4.4, 300)
+    mk = lambda dt: Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4,
+                            n_contam=1, device='cpu', two_scale=True, dtype=dt)
+    M32, M64 = mk(torch.float32), mk(torch.float64)
+    g = torch.zeros(M64.n_global, dtype=torch.float64)
+    sl = M64.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    eps = 1e-3 * torch.randn(64, 1, generator=torch.Generator().manual_seed(2), dtype=torch.float64)
+    s32, s64 = M32.spectra(g, eps), M64.spectra(g, eps)
+    assert s32.dtype == torch.float32 and s64.dtype == torch.float64
+    assert float((s32.double() - s64).abs().max()) < 1e-6 * float(s64.abs().max())
+    tg = torch.ones_like(eps)
+    d32 = torch.func.jvp(lambda e_: M32.spectra(g, e_), (eps,), (tg,))[1]
+    d64 = torch.func.jvp(lambda e_: M64.spectra(g, e_), (eps,), (tg,))[1]
+    assert float((d32.double() - d64).abs().max()) < 1e-3 * float(d64.abs().max())
