@@ -341,11 +341,12 @@ class Hybrid2:
         self.lb = torch.as_tensor(lb, **f64); self.ub = torch.as_tensor(ub, **f64)
 
     # -- spectra and their parameter derivatives
-    def spectra(self, g, eps=None, views=None):
+    def spectra(self, g, eps=None, views=None, tex=None):
         """mu (R, Kf), float64; or (Pc, R, Kf) in the model's dtype with per-pixel dilations eps (Pc, R): the edge
         positions are computed in float64, the per-pixel arrays (pixels x edges x bins) in the model's dtype. With
         shape_model 'texture3d' and views (Pc,) (each pixel's view), each pixel's edges carry its view's texture factor
-        (texture_factor); without views the spectra are a random powder's."""
+        (texture_factor; tex: the factors per material, already computed at g); without views the spectra are a random
+        powder's."""
         x = self.lamf / self.lam_ref
         out = []
         for r, (m, sl) in enumerate(zip(self.mats, self.slices)):
@@ -367,7 +368,7 @@ class Hybrid2:
                 shape = shape * self.linked_shape(self.lamf.to(dt)[None, None, :], ee[:, :, None], h.to(dt)[None, :, None],
                                                   m["mult"].to(dt)[None, :, None], xp).to(dt)
                 if self.shape_model == "texture3d" and views is not None:
-                    shape = shape * self.texture_factor(g, r)[views]
+                    shape = shape * (self.texture_factor(g, r) if tex is None else tex[r])[views]
                 out.append((x * x).to(dt) * torch.einsum('pek,e->pk', step * shape, h.to(dt)) + smooth.to(dt))
         return torch.stack(out, 0) if eps is None else torch.stack(out, 1)
 
@@ -636,6 +637,24 @@ class FitB:
         P = self.T.shape[0]
         return [slice(i, min(i + self.chunk, P)) for i in range(0, P, self.chunk)]
 
+    def _texture(self, g):
+        """The texture factors per material at g (texture3d), computed once per state of g and kept; None when g carries
+        derivatives (automatic differentiation then goes through the factor) or there is no view-dependent texture."""
+        if self.M.shape_model != "texture3d" or self.ray_view is None or g.requires_grad:
+            return None
+        try:
+            if torch._C._functorch.is_functorch_wrapped_tensor(g):
+                return None
+        except AttributeError:
+            pass
+        c = getattr(self, "_tex_cache", None)
+        if c is not None and c[0] is g and c[1] == g._version:
+            return c[2]
+        with torch.no_grad():
+            tex = [self.M.texture_factor(g, r) for r in range(self.M.R)]
+        self._tex_cache = (g, g._version, tex)
+        return tex
+
     def _views(self, sl):
         """The views of the rays sl, or None (a view-dependent spectrum needs them; see Hybrid2.texture_factor)."""
         return None if self.ray_view is None else self.ray_view[sl]
@@ -650,7 +669,7 @@ class FitB:
         if eps is None and self.eps is not None:
             eps = self.eps[sl]
         mu, Rb, kap = self._state(g) if cache is None else cache
-        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(g, eps, self._views(sl)).to(M.dt))
+        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(g, eps, self._views(sl), self._texture(g)).to(M.dt))
         E = torch.exp(-X)
         n = M.apply_band(E, Rb)
         beta = torch.exp(-W @ kap.T)
@@ -863,11 +882,11 @@ class FitB:
         T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
-        mus = M.spectra(self.g, eps, self._views(sl)).to(M.dt)                        # (Pc, R, Kf)
+        mus = M.spectra(self.g, eps, self._views(sl), self._texture(self.g)).to(M.dt)  # (Pc, R, Kf)
         cols_w, cols_u = [], []
         for r in range(R):
             tg = torch.zeros_like(eps); tg[:, r] = 1
-            _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, self._views(sl)), (eps.double(),), (tg.double(),))
+            _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, self._views(sl), self._texture(self.g)), (eps.double(),), (tg.double(),))
             dmu = dmu[:, r].to(M.dt)                                                  # d mu_r / d eps, (Pc, Kf)
             # X = sum_r W_r mu_r(U_r / W_r): dX/dU_r = mu_r', dX/dW_r (U fixed) = mu_r - eps_r mu_r'
             cols_w.append(-s * M.apply_band(E * (mus[:, r] - eps[:, r:r + 1] * dmu), Rb)
@@ -1030,7 +1049,7 @@ class FitB:
         self.f = _projected_newton_rows(self.f.T.contiguous(), grad, F, per_bin_loss, cap=(0, CONTAM_MAX_SHARE)).T.contiguous()
 
     # -- globals: Levenberg-Marquardt Fisher scoring, derivatives by the chain rule
-    def global_jacobian(self, sl, cache, idx, dmu, dRb):
+    def global_jacobian(self, sl, cache, idx, dmu, dRb, dtex=None):
         """dm/dg for the indices idx, (len(idx), Pc, K): materials through mu, resolution through the band, kappa
         through beta."""
         M = self.M
@@ -1040,11 +1059,25 @@ class FitB:
         eps = None if self.eps is None else self.eps[sl]
         terms = {}                                                                   # per material: x^2 step shape
         out = []
+        tex = self._texture(self.g); views = self._views(sl)
         for i in idx:
             if i < M.res_sl[0]:                                                      # a material parameter
                 r = next(rr for rr, slc in enumerate(M.slices) if slc["a"] <= i < slc["s"][1])
                 slr = M.slices[r]
-                if eps is not None and M.shape_model is None and slr["h"][0] <= i < slr["h"][1]:
+                if tex is not None and dtex is not None and eps is not None and (
+                        slr["h"][0] <= i < slr["h"][1] or slr["x"][0] <= i < slr["x"][1]):
+                    # texture3d: a height's derivative is its edge term times the view's factor; a texture parameter's
+                    # is the sum over edges of height x edge term x the factor's derivative (dtex, computed once)
+                    if r not in terms:
+                        terms[r] = M.edge_terms(self.g, eps, r)
+                    if slr["h"][0] <= i < slr["h"][1]:
+                        e_ = i - slr["h"][0]
+                        dm = terms[r][:, e_] * tex[r][views, e_]
+                    else:
+                        h = self.g[slr["h"][0]:slr["h"][1]].to(M.dt)
+                        dm = (h[None, :, None] * terms[r] * dtex[r][i - slr["x"][0]][views]).sum(1)
+                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                elif eps is not None and M.shape_model is None and slr["h"][0] <= i < slr["h"][1]:
                     # a height under per-pixel strain, without a linked shape model: its derivative is its own edge
                     # term, so one evaluation serves all heights of the material
                     if r not in terms:
@@ -1177,9 +1210,19 @@ class FitB:
                 dRb[q] = M.band_matrix(jb[..., q])
         grad = torch.zeros(len(idx), device=M.dev, dtype=torch.float64)
         F = torch.zeros(len(idx), len(idx), device=M.dev, dtype=torch.float64)
+        dtex = None
+        if M.shape_model == "texture3d" and self.ray_view is not None:
+            dtex = []
+            for r in range(M.R):
+                x0, x1 = M.slices[r]["x"]
+
+                def fac(xx, r=r, x0=x0, x1=x1):
+                    return M.texture_factor(torch.cat([g0[:x0], xx, g0[x1:]]), r)
+                J = torch.func.jacfwd(fac)(g0[x0:x1])                                   # (views, edges, Kf, 3)
+                dtex.append([J[..., k].to(M.dt) for k in range(x1 - x0)])
         P = self.T.shape[0]; gch = max(64, self.chunk // 4); dev = 0.0
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
-            Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb)
+            Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb, dtex)
             mm = m.clamp_min(1e-12); T = self.T[sl]
             grad += torch.einsum('pk,npk->n', self.dose(sl) * (1 - T / mm), Jg).double()
             F += torch.einsum('pk,apk,bpk->ab', self.dose(sl) / mm, Jg, Jg).double()
