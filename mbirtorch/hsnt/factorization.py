@@ -76,6 +76,7 @@ def _bin_terms(W, H, b, T, with_derivatives=True, chunk=2 ** 23):
     rows = max(1, chunk // max(T.shape[1], 1))
     Hd, bd = H.to(torch.float64), b.to(torch.float64)
     K, R = T.shape[1], H.shape[0]
+    rows_, cols_ = torch.triu_indices(R, R, device=T.device)
     loss = torch.zeros(K, dtype=torch.float64, device=T.device)
     grad = torch.zeros(K, R + 1, dtype=torch.float64, device=T.device)
     fisher = torch.zeros(K, R + 1, R + 1, dtype=torch.float64, device=T.device)
@@ -92,7 +93,9 @@ def _bin_terms(W, H, b, T, with_derivatives=True, chunk=2 ** 23):
         db = 1 - e                                                      # dm/db
         grad[:, :R] += (w * dH).T @ Wc
         grad[:, R] += (w * db).sum(0)
-        fisher[:, :R, :R] += torch.einsum('pk,pr,ps->krs', dH * dH / m, Wc, Wc)
+        pairs = (dH * dH / m).T @ (Wc[:, rows_] * Wc[:, cols_])                  # (bins, pairs)
+        fisher[:, rows_, cols_] += pairs
+        fisher[:, cols_, rows_] += torch.where(rows_ == cols_, torch.zeros_like(pairs), pairs)
         cross = (dH * db / m).T @ Wc
         fisher[:, :R, R] += cross
         fisher[:, R, :R] += cross
