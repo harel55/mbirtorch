@@ -50,6 +50,7 @@ INIT_PIXEL_STEPS = 3            # per-ray map fits in the warm-up
 MOUNT_FD = (0.05, 0.05, 0.1)    # finite-difference steps for the mount derivatives: degrees, voxels, detector channels
 MOUNT_MAX_STEP = (0.5, 0.5, 0.5) # largest change per mount step: degrees, voxels, detector channels
 ANCHOR_STIFFNESS = 1e3          # the spectrum scale pin's weight, relative to the largest global Fisher diagonal entry
+TEXTURE_AXIS_START = (0.6, 0.4)  # texture3d: the axis's starting polar and azimuthal angles (generic, off the axes)
 
 
 STACK_GAP = 2                    # empty slices between stacked volumes, so a fractional row offset cannot mix them
@@ -285,8 +286,8 @@ class FineProjector:
     detector integrates over its pixel area (the phantom generator makes its data the same way). Use it so faces and
     interfaces can sit between the detector's pixel positions without forcing ringing into the densities; it costs
     factor^3 the voxels. Lengths are in units of the detector pixel, as for a MultiProjector of side n. Mount shifts
-    (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n. No mount
-    refinement (mount_step) on this projector."""
+    (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n, also to
+    set_mount and in parts, so TomoFit.mount_step works on it."""
 
     def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2):
         self.n_det, self.factor, self.Q = n, int(factor), Q
@@ -308,6 +309,29 @@ class FineProjector:
 
     def with_q(self, Q):
         return self if Q == self.Q else FineProjector(self.n_det, self.series, Q, self.offsets, self.ror_mask, self.factor)
+
+    @property
+    def parts(self):
+        """Each series' mount and projector, with the shifts in voxels of n, as a MultiProjector of side n gives them."""
+        f = self.factor
+        return [((tr[0], tr[1], tuple(v / f for v in tr[2]), tr[3]), p) for tr, p in self.inner.parts]
+
+    def set_mount(self, s, shift=None, rot=None, offset=None):
+        """Changes series s's mount (shift in voxels of n, rot in degrees) and its centre-of-rotation offset (detector
+        pixels), as MultiProjector.set_mount does."""
+        f = self.factor
+        self.inner.set_mount(s, shift=None if shift is None else [float(v) * f for v in shift], rot=rot,
+                             offset=None if offset is None else float(offset) * f)
+        if offset is not None:
+            self.offsets[s] = float(offset)
+        (perm, signs, sh, ro), _ = self.parts[s]
+        self.series[s] = ((perm, signs, sh, ro), self.series[s][1])
+
+    def project_series(self, s, vols):
+        """Returns series s's rays (detector pixels) for the sample volumes on the fine grid."""
+        n, f = self.n_det, self.factor
+        rays = self.inner.project_series(s, vols)
+        return rays.reshape(-1, n, f, n, f, rays.shape[-1]).mean((2, 4)).reshape(-1, rays.shape[-1]) / f
 
     def fwd(self, vols):
         n, f = self.n_det, self.factor
@@ -856,7 +880,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
            d0_from_data=False, anchor_scale=True, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, ray_mask=None, precond='fft',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
-           smooth_sd=STRAIN_SMOOTH_SD, mask_method='median', mask_freeze=True, eq_stencil='corner', noise='measure'):
+           smooth_sd=STRAIN_SMOOTH_SD, mask_method='median', mask_freeze=True, eq_stencil='corner', noise='measure',
+           detector_tiles=(1, 1), shape_model=None):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -873,13 +898,17 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     (noise.measure_noise) and fits with the dose divided by the measured dispersion and the measured inflation in place
     of d and inflation, unless fewer than MIN_AIR_RAYS rays miss the sample (then d and inflation are used as given,
     with a warning); None uses d and inflation as given. The returned fit recomputes the global Fisher information every
-    FISHER_EVERY iterations."""
+    FISHER_EVERY iterations. detector_tiles: the detector's sensors as (rows, channels) tiles, each with its own
+    open-beam level when air rays are found. shape_model='cubic4' gives each cubic material its lowest-order texture
+    (9 coefficients, linear; model.harmonics4), starting as a random powder; it needs the strain-tensor weights, which
+    hold the views' beam directions."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n); side = int(round(math.sqrt(rpv)))
-        noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool())
+        noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool(),
+                                   detector_tiles)
         noise_info['used'] = noise_info['air_rays'] >= MIN_AIR_RAYS
         if noise_info['used']:
             d = np.asarray(d, dtype=np.float64) / noise_info['dispersion']; inflation = noise_info['inflation']
@@ -890,12 +919,13 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     elif noise is not None:
         raise ValueError(f"noise must be None or 'measure', not {noise!r}")
     R = len(lattices)
+    dev = str(T.device) if T.is_cuda else None   # a GPU tensor is factored on its own GPU, without a host copy
     if ray_mask is None:
-        W0, H0, _ = hsnt.dehydrate(T.cpu().numpy(), 'transmission', num_materials=R, verbose=0)
+        W0, H0, _ = hsnt.dehydrate(T, 'transmission', num_materials=R, device=dev, verbose=0)
         W0 = W0.reshape(-1, R)
     else:                                       # the spectra from the kept rays only; left-out rays start at zero
         keep = ray_mask.cpu().numpy().astype(bool)
-        Wk, H0, _ = hsnt.dehydrate(T[ray_mask.to(T.device)].cpu().numpy(), 'transmission', num_materials=R, verbose=0)
+        Wk, H0, _ = hsnt.dehydrate(T[ray_mask.to(T.device)], 'transmission', num_materials=R, device=dev, verbose=0)
         W0 = np.zeros((T.shape[0], R), dtype=Wk.dtype); W0[keep] = Wk.reshape(-1, R)
     lats = [(lt, (a * (1 - a_range), a * (1 + a_range))) for lt, a in zip(lattices, a0)]
     # with the rays split over processes, the first process's spectra start every process (the same model everywhere);
@@ -923,7 +953,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     targets = np.stack(targets)
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
-    M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True, kernel=kernel)
+    M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True, kernel=kernel,
+                shape_model=shape_model)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     if kernel_values is not None:                       # a calibrated kernel, held fixed
@@ -936,6 +967,11 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     for r in range(R):
         ls_init_material(M, g, r, targets[r], a0[r])
         M.lb[M.slices[r]['a']] = M.ub[M.slices[r]['a']] = a0[r]                    # d0 reference
+        if shape_model == 'texture3d':                                             # a random powder to start
+            x0 = M.slices[r]['x'][0]
+            g[x0] = 1.0; g[x0 + 1] = TEXTURE_AXIS_START[0]; g[x0 + 2] = TEXTURE_AXIS_START[1]
+        elif shape_model == 'cubic4':                                              # a random powder: no degree-4 term
+            g[M.slices[r]['x'][0]:M.slices[r]['x'][1]] = 0.0
     Mx = np.linalg.lstsq(targets.T, H0_local.T.astype(np.float64), rcond=None)[0].T
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
     # the pipeline's per-ray fits of the maps to the initial spectra (no strain yet)
@@ -956,6 +992,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask)
     fit.fisher_every = FISHER_EVERY
+    if shape_model == 'cubic4':                                                    # each view's beam, each ray's view
+        from .geometry import directions_from_weights
+        assert weights is not None, 'a view-dependent texture needs the strain-tensor weights (they hold the beam directions)'
+        rpv = getattr(proj, 'rays_per_view', proj.n * proj.n)
+        M.view_dirs = directions_from_weights(weights)
+        fit.ray_view = torch.arange(T.shape[0] // rpv, device=T.device).repeat_interleave(rpv)
     if kappa_prior is not None:
         # the standard deviation as a multiple of the warm-up spectra's mean attenuation (kappa's own units)
         fit.kappa_prior = kappa_prior * float(np.abs(targets).mean())

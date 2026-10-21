@@ -1,4 +1,5 @@
 """Tests of the experimental strain-tomography projectors in ``mbirtorch.hsnt.strain``."""
+import math
 import numpy as np
 import pytest
 import torch
@@ -23,8 +24,8 @@ def test_adjoint(proj):
     g = torch.Generator().manual_seed(0)
     x = torch.randn(N, N, N, 2, generator=g)
     y = torch.randn(sum(proj.counts), 2, generator=g)
-    a = float((proj.fwd(x) * y).sum())
-    b = float((x * proj.back(y)).sum())
+    a = float((proj.fwd(x).cpu() * y).sum())             # back returns its result on the projector's device
+    b = float((x * proj.back(y).cpu()).sum())
     assert abs(a - b) <= 1e-4 * abs(a)
 
 
@@ -292,7 +293,7 @@ def test_fine_projector():
     cp = MultiProjector(n, series, 2, channel_offsets=[0.0, 0.0], ror_mask=False)
     g = torch.Generator().manual_seed(0)
     x = torch.rand(f * n, f * n, f * n, 2, generator=g); y = torch.rand(fp.V * n * n, 2, generator=g)
-    a = float((fp.fwd(x) * y).sum()); b = float((x * fp.back(y)).sum())
+    a = float((fp.fwd(x).cpu() * y).sum()); b = float((x * fp.back(y).cpu()).sum())   # back returns on the projector's device
     assert abs(a - b) <= 1e-4 * abs(a)
     xc = torch.rand(n, n, n, 2, generator=g)
     xf = xc.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
@@ -412,3 +413,274 @@ def test_spectra_float32():
     d32 = torch.func.jvp(lambda e_: M32.spectra(g, e_), (eps,), (tg,))[1]
     d64 = torch.func.jvp(lambda e_: M64.spectra(g, e_), (eps,), (tg,))[1]
     assert float((d32.double() - d64).abs().max()) < 1e-3 * float(d64.abs().max())
+
+
+def test_normalize_views():
+    """normalize_views recovers each view's exposure, and with tiles each sensor's gain, from the air rays, and flags
+    the (view, tile) far off."""
+    from mbirtorch.hsnt.strain.noise import normalize_views
+    images, side, K = 12, 16, 200
+    g = torch.Generator().manual_seed(3)
+    yy, xx = np.meshgrid(np.arange(side) - side / 2, np.arange(side) - side / 2, indexing='ij')
+    disk = torch.as_tensor(np.broadcast_to(yy ** 2 + xx ** 2 < 16, (images, side, side)).reshape(-1))
+    m = torch.where(disk, 0.6, 1.0).double()[:, None].expand(-1, K)
+    gain = 1.0 + 0.004 * torch.randn(images, 2, 2, generator=g, dtype=torch.float64); gain[7, 1, 0] = 1.05
+    pix = gain.repeat_interleave(side // 2, 1).repeat_interleave(side // 2, 2).reshape(-1)
+    T = m * pix[:, None] + 0.002 * torch.randn(images * side * side, K, generator=g, dtype=torch.float64)
+    lv, flagged = normalize_views(T, (images, side, side), tiles=(2, 2))
+    rel = gain.reshape(images, 4).numpy(); rel = rel / np.median(rel)
+    assert np.abs(lv - rel).max() < 3e-4 and flagged == [(7, 2)]
+    lv2, _ = normalize_views(T, (images, side, side), tiles=(2, 2))
+    assert np.abs(lv2 - 1).max() < 3e-4                                         # every view and tile at the median level
+
+
+def _small_fit_texture(seed=0, strength=0.7, noise=True):
+    """A small FitB on the CPU with a March-Dollase texture (texture3d) of the given strength: one bcc material, eight
+    views with their own beam directions, per-ray dilations, counts from the model (their means when noise is False)."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    lam = np.linspace(2.0, 4.4, 300)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64, shape_model='texture3d')
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    g[sl['x'][0]] = strength; g[sl['x'][0] + 1] = 0.9; g[sl['x'][0] + 2] = 0.4
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    gen = torch.Generator().manual_seed(seed)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
+    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64), eps=eps, chunk=16)
+    fit.ray_view = torch.arange(P) % 8
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0 if noise else m.clone()
+    return fit
+
+
+def test_texture_factor():
+    """The texture factor is 1 for a random powder, averages to about 1 over beam directions, does not depend on the
+    axis's sign, and differs between views for a textured sample."""
+    fit = _small_fit_texture()
+    M = fit.M; x0 = M.slices[0]['x'][0]; g = fit.g.clone()
+    g[x0] = 1.0
+    assert torch.allclose(M.texture_factor(g, 0), torch.ones(()).double(), atol=1e-9)
+    g[x0] = 0.7
+    d = torch.randn(4000, 3, generator=torch.Generator().manual_seed(5), dtype=torch.float64)
+    keep = M.view_dirs; M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    avg = M.texture_factor(g, 0).mean(0)                                     # over beam directions
+    e = 2.0 * float(g[M.slices[0]['a']]) / np.sqrt(M.mats[0]['ns'].numpy())
+    below = (M.lamf.numpy()[None, :] < 0.95 * e[:, None])                     # bins below each edge
+    assert abs(float(avg.numpy()[below].mean()) - 1.0) < 0.03
+    M.view_dirs = keep
+    f1 = M.texture_factor(g, 0)
+    g2 = g.clone(); g2[x0 + 1] = math.pi - g[x0 + 1]; g2[x0 + 2] = g[x0 + 2] + math.pi    # the opposite axis
+    assert torch.allclose(f1, M.texture_factor(g2, 0), atol=1e-9)
+    assert float((f1.max(0).values - f1.min(0).values).max()) > 0.1
+
+
+def test_texture_global_grad():
+    """With texture3d the gradient by automatic differentiation (global_grad) equals global_system's for the texture,
+    height and lattice parameters (the per-view factor enters both)."""
+    fit = _small_fit_texture()
+    M = fit.M; sl = M.slices[0]
+    idx = list(range(sl['h'][0], sl['h'][1])) + list(range(sl['x'][0], sl['x'][1]))
+    g1, F = fit.global_system(idx)
+    g2 = fit.global_grad(idx)
+    assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
+    assert bool((torch.diagonal(F) > 0).all())
+
+
+def test_texture_search():
+    """texture_search, started from a random powder, finds an axis whose loss is below the powder's and close to the
+    truth's (the small fit's data come from a texture of strength 0.7)."""
+    fit = _small_fit_texture()
+    M = fit.M; x0 = M.slices[0]['x'][0]
+    l_true = fit.loss()
+    with torch.no_grad():
+        fit.g[x0] = 1.0; fit.g[x0 + 1] = 0.3; fit.g[x0 + 2] = 2.0
+    l_powder = fit.loss()
+    l_best, (st, th, ph) = fit.texture_search(0, strength=0.7, n_dirs=48)
+    assert l_best < l_powder and (l_best - l_true) < 0.5 * (l_powder - l_true)
+
+
+def test_texture_search_weak():
+    """texture_search finds a weak texture (strength 0.92, noiseless data): from a random powder, the axis it keeps is
+    within 30 degrees of the truth, its strength is plate-like (below 1), and its loss is below the powder's."""
+    fit = _small_fit_texture(strength=0.92, noise=False)
+    M = fit.M; x0 = M.slices[0]['x'][0]
+    with torch.no_grad():
+        fit.g[x0] = 1.0; fit.g[x0 + 1] = 0.3; fit.g[x0 + 2] = 2.0
+    l_powder = fit.loss()
+    l_best, (st, th, ph) = fit.texture_search(0)
+    n = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
+    n_true = np.array([np.sin(0.9) * np.cos(0.4), np.sin(0.9) * np.sin(0.4), np.cos(0.9)])
+    assert l_best < l_powder and st < 1.0 and abs(float(n @ n_true)) > np.cos(np.radians(30))
+
+
+def _small_fit_cubic4(seed=0, coeffs=None):
+    """Builds the small fit of _small_fit_texture with the cubic4 model. The data come from a degree-4 cubic texture
+    with coefficients coeffs (default: a fiber about a tilted axis) on eight views."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
+    lam = np.linspace(2.0, 4.4, 300)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64, shape_model='cubic4')
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    if coeffs is None:
+        n = torch.tensor([np.sin(0.9) * np.cos(0.4), np.sin(0.9) * np.sin(0.4), np.cos(0.9)], dtype=torch.float64)
+        coeffs = 0.05 * harmonics4(n)
+    g[sl['x'][0]:sl['x'][1]] = torch.as_tensor(coeffs, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    gen = torch.Generator().manual_seed(seed)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
+    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64), eps=eps, chunk=16)
+    fit.ray_view = torch.arange(P) % 8
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
+    return fit
+
+
+def test_cubic4_harmonics():
+    """harmonics4 gives 9 orthogonal functions with a root mean square of 1 over the sphere. Each is orthogonal to the
+    degree-2 monomials, so none has a degree-2 part. cubic_k4 is 0.4 for bcc 200, -0.1 for 110, 211 and 220, and -4/15
+    for 222."""
+    from mbirtorch.hsnt.strain.model import harmonics4, cubic_k4, _sphere_quadrature
+    pts, w = _sphere_quadrature()
+    Y = harmonics4(pts)
+    G = (w[:, None, None] * Y[:, :, None] * Y[:, None, :]).sum(0)
+    assert torch.allclose(G, torch.eye(9, dtype=torch.float64), atol=1e-10)
+    for q in (pts[:, 0] ** 2, pts[:, 0] * pts[:, 1], pts[:, 2] ** 2):
+        assert float((w[:, None] * Y * q[:, None]).sum(0).abs().max()) < 1e-12
+    assert np.allclose(cubic_k4('bcc', [4, 2, 6, 8, 12]), [0.4, -0.1, -0.1, -0.1, -4 / 15])
+
+
+def test_cubic4_factor():
+    """The cubic4 factor is 1 for a random powder. Below each edge it equals the pole density averaged over the
+    diffraction cone, checked against a direct average on the cone."""
+    from mbirtorch.hsnt.strain.model import harmonics4
+    fit = _small_fit_cubic4()
+    M = fit.M; sl = M.slices[0]; x0 = sl['x'][0]; g = fit.g.clone()
+    g0 = g.clone(); g0[x0:x0 + 9] = 0.0
+    assert torch.allclose(M.texture_factor(g0, 0), torch.ones(()).double(), atol=1e-12)
+    F = M.texture_factor(g, 0)                                            # (views, edges, Kf)
+    c = g[x0:x0 + 9]; k4 = M.mats[0]['k4']
+    b = torch.as_tensor(M.view_dirs[0], dtype=torch.float64)
+    e = 2.0 * float(g[sl['a']]) / torch.sqrt(M.mats[0]['ns'])
+    for ie in range(len(e)):
+        for frac in (0.999, 0.97, 0.9, 0.8):
+            k = int(torch.argmin((M.lamf - frac * e[ie]).abs()))
+            st = float(M.lamf[k] / e[ie])
+            if st >= 1.0:
+                continue
+            # normals at 90 deg - theta from the beam: a cone about b with cos(half angle) = sin(theta)
+            u = torch.linalg.svd(torch.stack([b, torch.randn(3, dtype=torch.float64)]))[2][-1]; v = torch.linalg.cross(b, u)
+            phi = torch.linspace(0, 2 * np.pi, 721, dtype=torch.float64)[:-1]
+            sn = st * b[None] + np.sqrt(1 - st * st) * (torch.cos(phi)[:, None] * u[None] + torch.sin(phi)[:, None] * v[None])
+            direct = (1 + k4[ie] * (harmonics4(sn) @ c)).mean()
+            assert abs(float(F[0, ie, k]) - float(direct)) < 1e-9
+
+
+def test_cubic4_global_grad():
+    """With cubic4 the gradient by automatic differentiation (global_grad) equals global_system's for the texture
+    coefficients and the heights."""
+    fit = _small_fit_cubic4()
+    M = fit.M; sl = M.slices[0]
+    idx = list(range(sl['h'][0], sl['h'][1])) + list(range(sl['x'][0], sl['x'][1]))
+    g1, F = fit.global_system(idx)
+    g2 = fit.global_grad(idx)
+    assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
+    assert bool((torch.diagonal(F) > 0).all())
+
+
+def test_fiber_texture_degree4():
+    """A cubic fiber texture (phantom.fiber_texture_factor) is 1 for a random powder and averages to 1 over beam
+    directions. Its edge factors are mostly of degree 4, and each reflection's degree-4 part is k4(hkl) times one
+    common function of the beam direction, which is the form of the cubic4 model."""
+    from mbirtorch.hsnt.strain.phantom import fe_spectrum_model, fiber_texture_factor
+    from mbirtorch.hsnt.strain.model import harmonics4, cubic_k4, _sphere_quadrature
+    lam = np.linspace(1.9, 4.4, 600)
+    M, g = fe_spectrum_model(lam, np.full_like(lam, 1000.0), 16, 'cpu', texture={'fiber': (0.75, 0.9, 0.4)})
+    pts, w = _sphere_quadrature(); M.view_dirs = pts.numpy(); w = w.numpy()      # beam directions: an exact quadrature
+    assert float((fiber_texture_factor(M, 0, 1.0, 0.9, 0.4) - 1).abs().max()) < 1e-12
+    F = fiber_texture_factor(M, 0, 0.75, 0.9, 0.4).double().numpy()
+    ns = M.mats[0]['ns'].numpy(); e = 2 * 0.5 * sum(M.mats[0]['a_range']) / np.sqrt(ns)
+    at = np.array([F[:, i, int(np.argmin(np.abs(M.lamf.numpy() - 0.999 * ee)))] for i, ee in enumerate(e)])
+    mean = at @ w
+    assert np.allclose(mean, 1.0, atol=0.01)
+    Y = harmonics4(pts).numpy()
+    c = (at - mean[:, None]) @ (w[:, None] * Y)                            # each edge's degree-4 coefficients
+    share = (c ** 2).sum(1) / (((at - mean[:, None]) ** 2) @ w)
+    assert share.min() > 0.8
+    ratio = c / np.array(cubic_k4('bcc', ns))[:, None]                    # the common degree-4 function, per edge
+    assert np.allclose(ratio, ratio.mean(0), atol=0.03 * np.abs(ratio).max())
+
+
+def test_fine_projector_set_mount():
+    """A FineProjector whose mount is changed in place projects like one built with that mount, series by series, and
+    reports the mount in voxels of the detector grid."""
+    from mbirtorch.hsnt.strain.tomo import FineProjector
+    n = 8; ang = np.linspace(0, np.pi, 5)
+    series = [(((0, 1, 2), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ang), (((1, 2, 0), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ang)]
+    vol = torch.rand(2 * n, 2 * n, 2 * n, 1, generator=torch.Generator().manual_seed(1))
+    P = FineProjector(n, series, 1, channel_offsets=[0.0, 0.0], ror_mask=False)
+    P.set_mount(1, shift=(0.3, -0.2, 0.1), rot=(0.5, 0.0, -0.4), offset=0.25)
+    moved = [series[0], (((1, 2, 0), (1, 1, 1), (0.3, -0.2, 0.1), (0.5, 0.0, -0.4)), ang)]
+    Q = FineProjector(n, moved, 1, channel_offsets=[0.0, 0.25], ror_mask=False)
+    for k in range(2):
+        assert torch.allclose(P.project_series(k, vol), Q.project_series(k, vol), atol=1e-6)
+    assert np.allclose(P.parts[1][0][2], (0.3, -0.2, 0.1)) and abs(P.offsets[1] - 0.25) < 1e-12
+    assert torch.allclose(P.fwd(vol), Q.fwd(vol), atol=1e-6)
+
+
+def test_skin_stress_field():
+    """The skin phantom's stress (phantom.fe_cube_skin_stress) is in equilibrium inside the cube; on the faces the
+    traction is near zero while the in-plane stresses are not, and they exceed the mid-plane's."""
+    from mbirtorch.hsnt.strain.phantom import fe_cube_skin_stress
+    from scipy import ndimage as nd
+    cube, sig = fe_cube_skin_stress(32)
+    g = lambda a, ax: np.gradient(a, axis=ax)                               # axes: rows y, cols x, slices z
+    xx, yy, zz, xy, yz, xz = [sig[..., k] for k in range(6)]
+    div = [g(xx, 1) + g(xy, 0) + g(xz, 2), g(xy, 1) + g(yy, 0) + g(yz, 2), g(xz, 1) + g(yz, 0) + g(zz, 2)]
+    deep = nd.binary_erosion(cube, iterations=2)
+    assert max(np.abs(d)[deep].max() for d in div) < 0.05 * np.abs(g(xx, 1))[deep].max()
+    c0 = np.where(cube.any((0, 2)))[0][0]; face = cube[:, c0, :]; peak = np.abs(sig[cube]).max()
+    traction = max(np.abs(sig[:, c0, :, k][face]).mean() for k in (0, 3, 5)) / peak
+    inplane = max(np.abs(sig[:, c0, :, k][face]).mean() for k in (1, 2)) / peak
+    mid = cube[:, 16, :]; inplane_mid = max(np.abs(sig[:, 16, :, k][mid]).mean() for k in (1, 2)) / peak
+    assert traction < 0.05 and inplane > 3 * traction and inplane > 1.5 * inplane_mid
+
+
+def test_diffraction_constants():
+    """For an isotropic crystal every reflection's diffraction constants are -nu/E and (1 + nu)/E. For Fe the Hill
+    moduli match the package's Fe values, and 200 responds about 35% more than 110 to a uniaxial stress."""
+    from mbirtorch.hsnt.strain.phantom import diffraction_constants, hill_moduli, FE_SINGLE_CRYSTAL, FE_ELASTIC
+    E, nu = FE_ELASTIC
+    iso = (E * (1 - nu) / ((1 + nu) * (1 - 2 * nu)), E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu)))
+    for gm in (0.0, 0.25, 1 / 3):
+        s1, hs2 = diffraction_constants(iso, gm)
+        assert np.isclose(s1, -nu / E) and np.isclose(hs2, (1 + nu) / E)
+    Eh, nuh = hill_moduli(FE_SINGLE_CRYSTAL)
+    assert abs(Eh / E - 1) < 0.01 and abs(nuh - nu) < 0.01
+    r200, r110 = [sum(diffraction_constants(FE_SINGLE_CRYSTAL, gm)) for gm in (0.0, 0.25)]
+    assert 1.25 < r200 / r110 < 1.45
+
+
+def test_anisotropic_phantom_isotropic_limit(monkeypatch):
+    """With isotropic single-crystal constants, the anisotropic phantom (one component per reflection group, the smooth
+    part added once) reproduces the standard phantom's data. The cube is shifted off the grid's symmetry, as in the
+    phantom runs: a symmetric cube puts many voxels' strains exactly between two levels, where rounding picks either."""
+    import mbirtorch.hsnt.strain.phantom as P
+    E, nu = P.FE_ELASTIC
+    monkeypatch.setattr(P, 'FE_SINGLE_CRYSTAL', (E * (1 - nu) / ((1 + nu) * (1 - 2 * nu)), E * nu / ((1 + nu) * (1 - 2 * nu)),
+                                                 E / (2 * (1 + nu))))
+    kw = dict(n=8, angles=np.linspace(0, np.pi, 4), fine=2, device='cpu', levels=7, kernel='ikeda_carpenter',
+              kernel_values=[0, 0.00118, 0.00039, 0.00059, 0, 0.0002, 0, 0], contamination=False, cube_shift=0.25)
+    a = P.make_fe_cube(**kw); b = P.make_fe_cube(**kw, elastic_anisotropy=True)
+    assert float((a['T'] == b['T']).double().mean()) > 0.9999

@@ -45,6 +45,23 @@ def _clean_transmission(T):
     return info
 
 
+def _clean_transmission_tensor(T):
+    """This function does what ``_clean_transmission`` does for a torch tensor, on the tensor's
+    device.  It leaves T unchanged, and it copies T only when an entry needs cleaning.  It returns
+    (T, info)."""
+    import torch
+    info = {}
+    bad = ~torch.isfinite(T)
+    if bool(bad.any()):
+        info["nonfinite_frac"] = float(bad.double().mean())
+        T = torch.where(bad, torch.zeros_like(T), T)
+    negative = T < 0
+    if bool(negative.any()):
+        info["negative_frac"] = float(negative.double().mean())
+        T = T.clamp_min(0.0)
+    return T, info
+
+
 def _warn_cleaning(info):
     if info.get("nonfinite_frac"):
         warnings.warn(f"{100 * info['nonfinite_frac']:.3g}% of the entries are NaN or have an infinite transmission; "
@@ -57,22 +74,33 @@ def _warn_cleaning(info):
 def _to_transmission(data, dataset_type):
     """This function converts the data to a float32 transmission array of shape (pixels, bins).
     It cleans the transmission array with ``_clean_transmission``.  It returns the transmission
-    array and the shape of the input."""
+    array and the shape of the input.  A torch tensor gives a tensor on the same device, and it is
+    copied only when the conversion or the cleaning needs a copy.  Any other input gives a numpy
+    array."""
+    import torch
     if dataset_type not in ("attenuation", "transmission"):
         raise ValueError("'dataset_type' must be either 'attenuation' or 'transmission'.")
-    a = _to_host(data)
+    on_device = torch.is_tensor(data)
+    a = data.detach() if on_device else _to_host(data)
     if a.ndim < 2:
-        raise ValueError(f"data must have at least one leading axis and a spectral last axis; got shape {a.shape}")
-    shape = a.shape
-    a = a.reshape(-1, shape[-1]).astype(np.float32, copy=False)
-    if dataset_type == "attenuation":
-        with np.errstate(over="ignore", invalid="ignore"):
-            T = np.exp(-a)
+        raise ValueError(f"data must have at least one leading axis and a spectral last axis; got shape {tuple(a.shape)}")
+    shape = tuple(a.shape)
+    if on_device:
+        a = a.reshape(-1, shape[-1]).to(torch.float32)
+        T = torch.exp(-a) if dataset_type == "attenuation" else a
     else:
-        T = a.copy()
-    _warn_cleaning(_clean_transmission(T))
+        a = a.reshape(-1, shape[-1]).astype(np.float32, copy=False)
+        if dataset_type == "attenuation":
+            with np.errstate(over="ignore", invalid="ignore"):
+                T = np.exp(-a)
+        else:
+            T = a.copy()
+    T, info = _clean_transmission_tensor(T) if on_device else (T, _clean_transmission(T))
+    _warn_cleaning(info)
     if not bool((T > 0).any()):
         raise ValueError("the data hold no counts: the transmission is zero everywhere")
+    if on_device:
+        return T.contiguous(), shape
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
@@ -138,6 +166,7 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             subspace_basis is ``H``, with shape :math:`(N_m, N_k)`.  Both are float32.
             dataset_type is the dataset_type of the input.
     """
+    import torch
     from ._device import _default_device
     from ._fit import _fit
     from .rank import _estimate_rank
@@ -152,7 +181,12 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     device = _default_device(device)
     lead = shape[:-1]
     mask = _sample_mask(sample_mask, lead)
-    T = T_all if mask is None else np.ascontiguousarray(T_all[mask])
+    if mask is None:
+        T = T_all
+    elif torch.is_tensor(T_all):
+        T = T_all[torch.from_numpy(mask).to(T_all.device)].contiguous()
+    else:
+        T = np.ascontiguousarray(T_all[mask])
     pixels = f"{T.shape[0]}" if mask is None else f"{T.shape[0]} of {T_all.shape[0]} (sample_mask)"
     if subspace_basis is not None:
         from ._fit import _fit_fixed_basis
@@ -178,8 +212,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             print("   -Pixels: ", pixels, f"; spectra: {spectra} ({solve})")
     if mask is not None:
         if check_mask and not mask.all():
-            _check_outside(T, W, np.ascontiguousarray(T_all[~mask]), H, dose, device, mode, chunk_pixels, max_steps,
-                           rel_tol, compile_mode, verbose)
+            _check_outside(_to_host(T), W, np.ascontiguousarray(_to_host(T_all)[~mask]), H, dose, device, mode,
+                           chunk_pixels, max_steps, rel_tol, compile_mode, verbose)
         W_all = np.zeros((T_all.shape[0], W.shape[1]), dtype=np.float32)
         W_all[mask] = W
         W = W_all

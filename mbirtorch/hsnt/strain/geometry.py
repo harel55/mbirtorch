@@ -66,3 +66,18 @@ def series_weights(series):
         nx, ny, nz = n3.T
         out.append(np.stack([nx * nx, ny * ny, nz * nz, 2 * nx * ny, 2 * ny * nz, 2 * nx * nz], 1))
     return np.concatenate(out)
+
+
+def directions_from_weights(w):
+    """The beam directions (views, 3) in the sample frame (x, y, z), up to sign, from series_weights' strain-component
+    weights (n_x^2, n_y^2, n_z^2, 2 n_x n_y, 2 n_y n_z, 2 n_x n_z): each view's largest component is taken positive and
+    the others' signs come from their products with it."""
+    w = np.asarray(w, dtype=np.float64)
+    d = np.sqrt(np.clip(w[:, :3], 0.0, None))
+    pair = {(0, 1): 3, (1, 2): 4, (0, 2): 5}
+    for v in range(len(w)):
+        k = int(np.argmax(d[v]))
+        for j in range(3):
+            if j != k and w[v, pair[tuple(sorted((k, j)))]] < 0:
+                d[v, j] = -d[v, j]
+    return d
