@@ -417,18 +417,19 @@ def test_spectra_float32():
 
 
 def test_normalize_views():
-    """normalize_views recovers each view's exposure scale from its air rays and flags the view that is far off."""
+    """normalize_views recovers each view's exposure, and with tiles each sensor's gain, from the air rays, and flags
+    the (view, tile) far off."""
     from mbirtorch.hsnt.strain.noise import normalize_views
     images, side, K = 12, 16, 200
     g = torch.Generator().manual_seed(3)
-    scale = 1.0 + 0.004 * torch.randn(images, generator=g, dtype=torch.float64); scale[7] = 1.05
     yy, xx = np.meshgrid(np.arange(side) - side / 2, np.arange(side) - side / 2, indexing='ij')
     disk = torch.as_tensor(np.broadcast_to(yy ** 2 + xx ** 2 < 16, (images, side, side)).reshape(-1))
     m = torch.where(disk, 0.6, 1.0).double()[:, None].expand(-1, K)
-    T = m * scale.repeat_interleave(side * side)[:, None] + 0.002 * torch.randn(images * side * side, K, generator=g, dtype=torch.float64)
-    lv, out = normalize_views(T, (images, side, side))
-    rel = scale.numpy() / np.median(scale.numpy())
-    assert np.abs(lv - rel).max() < 2e-4 and list(out) == [7]
-    air = ~np.broadcast_to(yy ** 2 + xx ** 2 < 36, (images, side, side)).reshape(-1)
-    lv2, _ = normalize_views(T, (images, side, side))
-    assert np.abs(lv2 - 1).max() < 2e-4                                        # normalized: every view at the median level
+    gain = 1.0 + 0.004 * torch.randn(images, 2, 2, generator=g, dtype=torch.float64); gain[7, 1, 0] = 1.05
+    pix = gain.repeat_interleave(side // 2, 1).repeat_interleave(side // 2, 2).reshape(-1)
+    T = m * pix[:, None] + 0.002 * torch.randn(images * side * side, K, generator=g, dtype=torch.float64)
+    lv, flagged = normalize_views(T, (images, side, side), tiles=(2, 2))
+    rel = gain.reshape(images, 4).numpy(); rel = rel / np.median(rel)
+    assert np.abs(lv - rel).max() < 3e-4 and flagged == [(7, 2)]
+    lv2, _ = normalize_views(T, (images, side, side), tiles=(2, 2))
+    assert np.abs(lv2 - 1).max() < 3e-4                                         # every view and tile at the median level

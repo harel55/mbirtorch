@@ -1066,7 +1066,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='corner',
-           noise=None):
+           noise=None, detector_tiles=(1, 1)):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1084,13 +1084,15 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     voxels, by mask_method), and its spectrum's linear parameters (edge heights, smooth part, spline) and contamination
     attenuations are multiplied by it, so the predicted data are unchanged. noise='measure' measures the counts' noise on
     the rays that miss the sample (noise.measure_noise) and fits with the dose divided by the measured dispersion and
-    the measured inflation in place of d and inflation; None uses d and inflation as given."""
+    the measured inflation in place of d and inflation; None uses d and inflation as given. detector_tiles: the
+    detector's sensors as (rows, channels) tiles, each with its own open-beam level when air rays are found."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n); side = int(round(math.sqrt(rpv)))
-        noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool())
+        noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool(),
+                                   detector_tiles)
         d = np.asarray(d, dtype=np.float64) / noise_info['dispersion']; inflation = noise_info['inflation']
     elif noise is not None:
         raise ValueError(f"noise must be None or 'measure', not {noise!r}")
