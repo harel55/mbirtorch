@@ -599,3 +599,26 @@ def test_cubic4_global_grad():
     g2 = fit.global_grad(idx)
     assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
     assert bool((torch.diagonal(F) > 0).all())
+
+
+def test_fiber_texture_degree4():
+    """A cubic fiber texture (phantom.fiber_texture_factor) is 1 for a random powder and averages to 1 over beam
+    directions. Its edge factors are mostly of degree 4, and each reflection's degree-4 part is k4(hkl) times one
+    common function of the beam direction, which is the form of the cubic4 model."""
+    from mbirtorch.hsnt.strain.phantom import fe_spectrum_model, fiber_texture_factor
+    from mbirtorch.hsnt.strain.model import harmonics4, cubic_k4, _sphere_quadrature
+    lam = np.linspace(1.9, 4.4, 600)
+    M, g = fe_spectrum_model(lam, np.full_like(lam, 1000.0), 16, 'cpu', texture={'fiber': (0.75, 0.9, 0.4)})
+    pts, w = _sphere_quadrature(); M.view_dirs = pts.numpy(); w = w.numpy()      # beam directions: an exact quadrature
+    assert float((fiber_texture_factor(M, 0, 1.0, 0.9, 0.4) - 1).abs().max()) < 1e-12
+    F = fiber_texture_factor(M, 0, 0.75, 0.9, 0.4).double().numpy()
+    ns = M.mats[0]['ns'].numpy(); e = 2 * 0.5 * sum(M.mats[0]['a_range']) / np.sqrt(ns)
+    at = np.array([F[:, i, int(np.argmin(np.abs(M.lamf.numpy() - 0.999 * ee)))] for i, ee in enumerate(e)])
+    mean = at @ w
+    assert np.allclose(mean, 1.0, atol=0.01)
+    Y = harmonics4(pts).numpy()
+    c = (at - mean[:, None]) @ (w[:, None] * Y)                            # each edge's degree-4 coefficients
+    share = (c ** 2).sum(1) / (((at - mean[:, None]) ** 2) @ w)
+    assert share.min() > 0.8
+    ratio = c / np.array(cubic_k4('bcc', ns))[:, None]                    # the common degree-4 function, per edge
+    assert np.allclose(ratio, ratio.mean(0), atol=0.03 * np.abs(ratio).max())

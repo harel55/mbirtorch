@@ -515,6 +515,10 @@ FE_ATTEN_3A = 0.1 * 64                      # the cube's attenuation per unit le
 FE_AXIS = (1.035, 6.027, 2841)              # wavelength range (Angstrom) and bins of the default axis
 FE_A_RANGE = 0.02                           # relative lattice-parameter range of the model (as the Fe cube fits use)
 HOLDER = dict(radius=14.0 / 64, gap=1.0 / 64, atten=0.27)  # rod radius and gap past the cube (units of n); attenuation
+FIBER_COS_POINTS = 257                      # fiber texture: the pole density's table over cos(angle to the fiber axis)
+FIBER_PHI_POINTS = 96                       # fiber texture: rotations about each pole averaged
+FIBER_TABLE = (65, 257)                     # fiber texture: the factor's table over |cos psi| (beam to axis) and sin(theta)
+FIBER_CONE_POINTS = 48                      # fiber texture: points on each diffraction cone
 #                                                            relative to the cube's mean attenuation
 
 
@@ -542,6 +546,57 @@ def fe_cube_tensor(N, offset=0.0):
     return cube, eps
 
 
+def _cubic_orbit(u):
+    """Returns the distinct directions (one of each +/- pair) that the cubic point group makes of crystal direction u."""
+    import itertools
+    out = []
+    for perm in itertools.permutations(range(3)):
+        for sg in itertools.product((1, -1), repeat=3):
+            v = np.array([sg[i] * u[perm[i]] for i in range(3)], float); v /= np.linalg.norm(v)
+            if not any(abs(abs(float(v @ w)) - 1) < 1e-9 for w in out):
+                out.append(v)
+    return np.array(out)
+
+
+def fiber_texture_factor(M, r, strength, polar, azimuth, crystal_dir=(1, 0, 0)):
+    """Returns material r's texture factor (views, edges, fine bins) for a fiber texture, for phantoms. The crystal
+    direction crystal_dir and its cubic equivalents lie along the sample axis (polar, azimuth) with a March-Dollase
+    spread of the given strength (1: a random powder). Each reflection's pole density, averaged over the families that
+    share h^2 + k^2 + l^2, is averaged over its diffraction cone in each view (M.view_dirs). Unlike the cubic4 model,
+    this texture has parts of degree 6 and higher."""
+    from .bragg import LATTICES
+    m, sl = M.mats[r], M.slices[r]
+    allowed = LATTICES[m["lattice"]]; orbit = _cubic_orbit(crystal_dir)
+    cchi = np.linspace(0.0, 1.0, FIBER_COS_POINTS)                                    # cos(pole to fiber axis)
+    schi = np.sqrt(1 - cchi ** 2); phi = 2 * np.pi * np.arange(FIBER_PHI_POINTS) / FIBER_PHI_POINTS
+    march = lambda c: (strength ** 2 * c * c + (1 - c * c) / strength) ** -1.5
+    pole = []                                                                          # (edges, FIBER_COS_POINTS)
+    for nsq in m["ns"].cpu().numpy():
+        nsq = int(round(nsq)); hm = int(math.isqrt(nsq)) + 1
+        H = np.array([(h, k, l) for h in range(-hm, hm + 1) for k in range(-hm, hm + 1) for l in range(-hm, hm + 1)
+                      if h * h + k * k + l * l == nsq and allowed(abs(h), abs(k), abs(l))], float) / math.sqrt(nsq)
+        cb = np.abs(H @ orbit.T); sb = np.sqrt(np.clip(1 - cb ** 2, 0, None))           # (vectors, orbit)
+        ca = cchi[:, None, None, None] * cb[None, :, :, None] + schi[:, None, None, None] * sb[None, :, :, None] * np.cos(phi)
+        pole.append(march(ca).mean((1, 2, 3)))
+    pole = np.array(pole)
+    # the factor over (|cos psi|, sin theta): the pole density averaged over the cone of normals at 90 deg - theta
+    nc, ns_ = FIBER_TABLE
+    cp = np.linspace(0, 1, nc)[:, None, None]; st = np.linspace(0, 1, ns_)[None, :, None]
+    psi = 2 * np.pi * np.arange(FIBER_CONE_POINTS) / FIBER_CONE_POINTS
+    cc = np.abs(st * cp + np.sqrt(1 - st * st) * np.sqrt(1 - cp * cp) * np.cos(psi))    # |cos| normal to axis, (nc, ns_, cone)
+    table = np.stack([np.interp(cc, cchi, pe).mean(-1) for pe in pole])                # (edges, nc, ns_)
+    axis = np.array([math.sin(polar) * math.cos(azimuth), math.sin(polar) * math.sin(azimuth), math.cos(polar)])
+    cpv = np.abs(np.asarray(M.view_dirs, float) @ axis).clip(max=1.0)                  # (views,)
+    e = 2.0 * (0.5 * sum(m["a_range"])) / np.sqrt(m["ns"].cpu().numpy())               # edges at the range's middle
+    stk = np.clip(M.lamf.cpu().numpy()[None, :] / e[:, None], 0.0, 1.0)                # (edges, Kf)
+    u = stk * (ns_ - 1); j0 = np.clip(np.floor(u).astype(int), 0, ns_ - 2); fu = u - j0
+    v = cpv * (nc - 1); i0 = np.clip(np.floor(v).astype(int), 0, nc - 2); fv = (v - i0)[:, None, None]
+    ei = np.arange(len(e))[None, :, None]; a_ = i0[:, None, None]; b_ = j0[None]
+    lo = (1 - fu) * table[ei, a_, b_] + fu * table[ei, a_, b_ + 1]
+    hi = (1 - fu) * table[ei, a_ + 1, b_] + fu * table[ei, a_ + 1, b_ + 1]
+    return torch.as_tensor((1 - fv) * lo + fv * hi, dtype=M.dt, device=M.dev)
+
+
 def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', kernel_values=None, texture=None):
     """A Hybrid2 model for bcc Fe on the axis lam and its parameter vector: Bragg heights j d, a smooth part, the
     resolution kernel, scaled so the attenuation per voxel at 3 Angstrom is FE_ATTEN_3A / n. kernel: the kernel's form
@@ -550,7 +605,7 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', ke
     of a cubic texture (shape model cubic4); the caller sets view_dirs."""
     M = Hybrid2(lam, dose_per_bin, [(FE['lattice'], (FE['a'] * (1 - FE_A_RANGE), FE['a'] * (1 + FE_A_RANGE)))], n_spline=8, n_contam=2,
                 device=device, two_scale=True, kernel=kernel,
-                shape_model=None if texture is None else ('cubic4' if len(texture) == 9 else 'texture3d'))
+                shape_model=None if texture is None else ('cubic4' if isinstance(texture, dict) or len(texture) == 9 else 'texture3d'))
     g = torch.zeros(M.n_global, dtype=torch.float64, device=device)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL if kernel_values is None else kernel_values, dtype=torch.float64)
     sl = M.slices[0]
@@ -558,7 +613,7 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', ke
     ns = M.mats[0]['ns'].cpu().numpy(); d = FE['a'] / np.sqrt(ns)
     g[sl['h'][0]:sl['h'][1]] = torch.as_tensor(np.array(multiplicities(FE['lattice'], ns), float) * d)
     g[sl['c'][0]] = 0.3; g[sl['c'][0] + 1] = 0.2
-    if texture is not None:
+    if texture is not None and not isinstance(texture, dict):
         g[sl['x'][0]:sl['x'][1]] = torch.as_tensor(np.asarray(texture, float))
     with torch.no_grad():
         mu = M.spectra(g)[0].cpu().numpy()
@@ -587,7 +642,8 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     axes by this many detector pixels (a multiple of 1 / fine), so that its faces can fall between the planes of a
     finer reconstruction grid. texture: (March-Dollase strength, axis polar angle, axis azimuth in the sample frame), or
     the 9 degree-4 coefficients of a cubic texture, for a textured cube: each view's Bragg edges carry that view's
-    texture factor (model.Hybrid2.texture_factor)."""
+    texture factor (model.Hybrid2.texture_factor). texture={'fiber': (strength, polar, azimuth[, crystal_dir])} gives
+    a cubic fiber texture instead (fiber_texture_factor), which has parts above degree 4."""
     import mbirtorch
     from .geometry import series_weights
     from .tomo import MultiProjector, Projector, detector_directions
@@ -605,9 +661,12 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     N = fine * n; V_ = len(angles); S = len(mounts)
     cube, et = fe_cube_tensor(N, cube_shift / n)
     wts = series_weights([((m[0], m[1], m[2]), angles) for m in mounts])         # (S views, 6)
+    tex_fixed = None
     if texture is not None:
         from .geometry import directions_from_weights
         M.view_dirs = directions_from_weights(wts)
+        if isinstance(texture, dict):                # a fiber texture (phantoms only): {'fiber': (strength, polar, azimuth[, crystal_dir])}
+            tex_fixed = [fiber_texture_factor(M, 0, *texture['fiber'])]
     seen_all = [(et * w).sum(-1) for w in wts]
     lv = np.linspace(min(s[cube].min() for s in seen_all), max(s[cube].max() for s in seen_all), levels)
     proj = np.zeros((levels, S * V_, n, n))                                      # path length per strain level
@@ -657,7 +716,7 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
                 X += w[:, None] * M.spectra(g, eps_t)[0, 0].float()[None, :]
             else:                                   # each view's spectrum, with its own texture factor
                 nv = S * V_; per = n * n
-                spec = M.spectra(g, eps_t.expand(nv, 1), torch.arange(nv, device=device))[:, 0].float()   # (views, Kf)
+                spec = M.spectra(g, eps_t.expand(nv, 1), torch.arange(nv, device=device), tex_fixed)[:, 0].float()   # (views, Kf)
                 for v in range(nv):
                     X[v * per:(v + 1) * per] += w[v * per:(v + 1) * per, None] * spec[v][None, :]
         mu0 = M.spectra(g)[0]
