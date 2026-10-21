@@ -518,13 +518,14 @@ HOLDER = dict(radius=14.0 / 64, gap=1.0 / 64, atten=0.27)  # rod radius and gap 
 #                                                            relative to the cube's mean attenuation
 
 
-def fe_cube_tensor(N):
+def fe_cube_tensor(N, offset=0.0):
     """Indicator (N, N, N) of the Fe cube and its strain tensor (N, N, N, 6), COMPONENTS order, in the projector
     layout (rows y, cols x, slices z). The residual stress comes from Maxwell stress functions S_i b^3 with b the
-    product of (1 - u^2 / h^2) over the cube's three axes: it satisfies equilibrium and is traction-free."""
+    product of (1 - u^2 / h^2) over the cube's three axes: it satisfies equilibrium and is traction-free. offset moves
+    the cube along all three axes, as a fraction of the grid side."""
     c = (N - 1) / 2.0
     h = FE_CUBE['half'] * N
-    cy, cx, cz = (v * N for v in FE_CUBE['centre'])
+    cy, cx, cz = ((v + offset) * N for v in FE_CUBE['centre'])
     yy, xx, zz = np.meshgrid(np.arange(N) - c - cy, np.arange(N) - c - cx, np.arange(N) - c - cz, indexing='ij')
     cube = (np.abs(yy) < h) & (np.abs(xx) < h) & (np.abs(zz) < h)
     pts = torch.tensor(np.stack([xx, yy, zz], -1).reshape(-1, 3)[cube.reshape(-1)], dtype=torch.float64)
@@ -563,7 +564,8 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', ke
 
 
 def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, offsets=None, levels=31, fine=2, seed=1,
-                 device='cuda', axis=None, holder=True, contamination=True, kernel='two_scale', kernel_values=None):
+                 device='cuda', axis=None, holder=True, contamination=True, kernel='two_scale', kernel_values=None,
+                 cube_shift=0.0):
     """Synthetic data shaped like the Fe cube measurement: a bcc Fe cube with a residual-stress strain tensor
     (fe_cube_tensor), seen by rotation series with their own mounts and a holder rod each.
 
@@ -576,7 +578,9 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     binned back to n x n. Rays are series-major, then (view, row, channel), as MultiProjector orders them.
     Returns a dict with T, lam, dose_per_bin, angles, mounts, offsets, V_true (n, n, n, 1), E_true (n, n, n, 1, 6),
     the true spectrum, and holder_rows (the first detector row of the holder in each series). kernel, kernel_values:
-    the resolution kernel the data are generated with (see fe_spectrum_model)."""
+    the resolution kernel the data are generated with (see fe_spectrum_model). cube_shift moves the cube along all three
+    axes by this many detector pixels (a multiple of 1 / fine), so that its faces can fall between the planes of a
+    finer reconstruction grid."""
     import mbirtorch
     from .geometry import series_weights
     from .tomo import MultiProjector, Projector, detector_directions
@@ -592,7 +596,7 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     d = dose * flux / np.mean(flux)
     M, g = fe_spectrum_model(lam, d, n, device, kernel=kernel, kernel_values=kernel_values)
     N = fine * n; V_ = len(angles); S = len(mounts)
-    cube, et = fe_cube_tensor(N)
+    cube, et = fe_cube_tensor(N, cube_shift / n)
     wts = series_weights([((m[0], m[1], m[2]), angles) for m in mounts])         # (S views, 6)
     seen_all = [(et * w).sum(-1) for w in wts]
     lv = np.linspace(min(s[cube].min() for s in seen_all), max(s[cube].max() for s in seen_all), levels)

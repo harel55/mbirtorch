@@ -320,3 +320,14 @@ def test_measure_noise():
     assert out['air_rays'] <= int((~near).sum())                                 # no ray near the disk counts as air
     assert abs(out['dispersion'] / phi - 1) < 0.02
     assert abs(out['inflation'] - (1 + 2 * rho)) < 0.05
+
+
+def test_fe_cube_offset():
+    """fe_cube_tensor's offset moves the cube and its strain by whole voxels when it is a multiple of 1 / N."""
+    from mbirtorch.hsnt.strain.phantom import fe_cube_tensor
+    N = 32
+    c0, e0 = fe_cube_tensor(N)
+    c1, e1 = fe_cube_tensor(N, 1.0 / N)
+    roll = lambda a: np.roll(np.roll(np.roll(a, 1, 0), 1, 1), 1, 2)
+    assert np.array_equal(roll(c0), c1)
+    assert np.allclose(roll(e0), e1)
