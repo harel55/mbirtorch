@@ -880,7 +880,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, ray_mask=None, precond='fft',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='median', mask_freeze=True, eq_stencil='corner', noise='measure',
-           detector_tiles=(1, 1), shape_model=None):
+           detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -900,7 +900,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     FISHER_EVERY iterations. detector_tiles: the detector's sensors as (rows, channels) tiles, each with its own
     open-beam level when air rays are found. shape_model='cubic4' gives each cubic material its lowest-order texture
     (9 coefficients, linear; model.harmonics4), starting as a random powder; it needs the strain-tensor weights, which
-    hold the views' beam directions."""
+    hold the views' beam directions. per_bin_dispersion=True divides the dose by each bin's measured dispersion
+    (noise.noise_statistics' dispersion_per_bin) instead of the overall one; it needs noise='measure'."""
     from mbirtorch import hsnt
     if shape_model not in SHAPE_MODELS:
         raise ValueError(f"shape_model must be one of {SHAPE_MODELS}, not {shape_model!r}")
@@ -912,7 +913,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
                                    detector_tiles)
         noise_info['used'] = noise_info['air_rays'] >= MIN_AIR_RAYS
         if noise_info['used']:
-            d = np.asarray(d, dtype=np.float64) / noise_info['dispersion']; inflation = noise_info['inflation']
+            phi = np.asarray(noise_info['dispersion_per_bin']) if per_bin_dispersion else noise_info['dispersion']
+            d = np.asarray(d, dtype=np.float64) / phi; inflation = noise_info['inflation']
         else:
             import warnings
             warnings.warn(f"only {noise_info['air_rays']} rays miss the sample: the noise is not measured, the given dose "

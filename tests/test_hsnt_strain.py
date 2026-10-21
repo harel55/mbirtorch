@@ -321,6 +321,26 @@ def test_measure_noise():
     assert abs(out['inflation'] - (1 + 2 * rho)) < 0.05
 
 
+def test_measure_noise_per_bin():
+    """measure_noise's per-bin dispersion follows a dispersion that ramps from 3 to 6 across the bins, and its mean
+    equals the overall dispersion; the bins of a dose gap keep the overall value."""
+    from mbirtorch.hsnt.strain.noise import measure_noise, DISPERSION_BLOCK
+    images, side, K = 16, 16, 640
+    g = torch.Generator().manual_seed(2)
+    phi = torch.linspace(3.0, 6.0, K, dtype=torch.float64)
+    d = torch.full((K,), 900.0, dtype=torch.float64); d[300:310] = 0.0
+    T = 1.0 + torch.sqrt(phi / d.clamp_min(1.0)) * torch.randn(images * side * side, K, generator=g, dtype=torch.float64)
+    T[:, 300:310] = 0.0
+    out = measure_noise(T, d.numpy(), (images, side, side))
+    per = np.asarray(out['dispersion_per_bin'])
+    assert per.shape == (K,) and np.isfinite(per).all()
+    live = np.ones(K, bool); live[299:311] = False
+    blocks = np.convolve(phi.numpy(), np.ones(DISPERSION_BLOCK) / DISPERSION_BLOCK, mode='same')   # the block average
+    inner = live & (np.arange(K) > DISPERSION_BLOCK) & (np.arange(K) < K - DISPERSION_BLOCK)
+    assert np.abs(per[inner] / blocks[inner] - 1).max() < 0.1
+    assert np.all(per[302:308] == out['dispersion'])
+
+
 def test_fe_cube_offset():
     """fe_cube_tensor's offset moves the cube and its strain by whole voxels when it is a multiple of 1 / N."""
     from mbirtorch.hsnt.strain.phantom import fe_cube_tensor

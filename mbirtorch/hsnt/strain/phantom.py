@@ -721,7 +721,7 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     (detector channels). The holder is a rod on each series' rotation axis past the cube's end, with a flat attenuation
     spectrum; it is not part of the sample, so a fit should leave its detector rows out (holder_rows). Counts are
     Poisson with their variance inflated by `inflation` (counts drawn at dose / inflation, scaled back), as the
-    measured detector's correlated counts. The volume is generated on a grid `fine` times finer and the detector
+    measured detector's correlated counts. `inflation` is a number or one value per wavelength bin. The volume is generated on a grid `fine` times finer and the detector
     binned back to n x n. Rays are series-major, then (view, row, channel), as MultiProjector orders them.
     Returns a dict with T, lam, dose_per_bin, angles, mounts, offsets, V_true (n, n, n, 1), E_true (n, n, n, 1, 6),
     the true spectrum, and holder_rows (the first detector row of the holder in each series). kernel, kernel_values:
@@ -865,7 +865,8 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
         m = (1 - f.sum(0)) * n_t + torch.ones(P, 2, device=device) @ f
         gen = torch.Generator(device=device).manual_seed(seed)
         dd = torch.as_tensor(d, dtype=torch.float32, device=device)
-        T = torch.poisson(dd * m / inflation, generator=gen) * inflation / dd
+        infl = torch.as_tensor(np.asarray(inflation, dtype=np.float32), device=device)   # a number or one per bin
+        T = torch.poisson(dd * m / infl, generator=gen) * infl / dd
     return dict(T=T, lam=lam, dose_per_bin=d, angles=angles, mounts=mounts, offsets=offsets, V_true=V_true,
                 E_true=E_true, mu_true=mu0.cpu().numpy(), lamf=M.lamf.cpu().numpy(), g_true=g.cpu().numpy(),
                 f_true=f.cpu().numpy(), holder_rows=holder_rows, n=n, inflation=inflation)
