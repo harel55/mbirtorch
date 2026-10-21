@@ -2,7 +2,8 @@ import torch
 
 from ._linalg import (_attenuation_for_start, _batched_spd_solve, _joint_blocks, _joint_dot,
                       _nonneg_least_squares_start, _reseed_dead)
-from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal, stable_nnal_derivatives
+from ._loss import (BACKGROUND_MAX, _background_logs, _background_terms, _nnal_prep, _nnal_rowwise, stable_nnal,
+                    stable_nnal_derivatives)
 
 
 # The Armijo test treats a loss increase below this many times eps * |row loss| as float32 rounding.
@@ -211,11 +212,12 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
 
 
 def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
-                          compile_mode=None, nonneg_W=True):
+                          compile_mode=None, nonneg_W=True, background=None):
     """This function minimizes the non-negative attenuation loss by alternating projected Newton
-    steps on W and on H."""
+    steps on W and on H.  The argument ``background`` is the fixed additive background of each
+    bin (see ``_nnal_prep``), or None."""
     _, _, rowwise, step_fn = _kernels(compile_mode)
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T, background)
     W, H = W_init, H_init
     X = W @ H
     prev_loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
@@ -264,7 +266,7 @@ def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compil
     return W
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
-                      nonneg_W=True, w_mask=None, patience=1):
+                      nonneg_W=True, w_mask=None, patience=1, fit_background=False):
     """This function solves for W and H together by a truncated Newton method with preconditioned
     CG.  It starts from the given W and H, and returns (W, H, steps, total_cg).
 
@@ -273,12 +275,19 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     step.  The solve stops after ``patience`` accepted steps in a row with a relative loss change
     of at most rel_tol.  With nonneg_W=False, W is not constrained to be nonnegative.  When
     ``w_mask`` is given, the coefficients outside the mask stay at their current values.
+
+    With fit_background=True, ``prep`` holds a background (see ``_nnal_prep``), and the solve
+    also updates the background of each bin, within [0, BACKGROUND_MAX], with the Fisher
+    information in place of its Hessian.  The function then returns (W, H, steps, total_cg, b).
     """
     nnal = stable_nnal if nnal is None else nnal
     deriv = stable_nnal_derivatives if deriv is None else deriv
     prep = _nnal_prep(T) if prep is None else prep
     W = W.clone()
     H = H.clone()
+    b = torch.exp(prep[3][1]) if fit_background else None
+    dot = lambda aW, bW, aH, bH, ab=None, bb=None: (_joint_dot(aW, bW, aH, bH)
+                                                    + ((ab * bb).sum() if fit_background else 0.0))
     rank = W.shape[1]
     rows, cols = torch.triu_indices(rank, rank, device=W.device)
     loss = nnal(W @ H, T, prep, dtype=torch.float64)
@@ -300,13 +309,20 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
             fW = fW & ~((W >= uW * (1 - _ACTIVE_TOL)) & (gW < 0))
             fH = fH & ~((H >= uH * (1 - _ACTIVE_TOL)) & (gH < 0))
         gW, gH = gW * fW, gH * fH
-        gnorm2 = _joint_dot(gW, gW, gH, gH)
+        gb = fb = Cb = Db = None
+        if fit_background:
+            gb, Cb, Db = _background_terms(X, T, b)
+            fb = ~(((b <= 0) & (gb > 0)) | ((b >= BACKGROUND_MAX) & (gb < 0)))
+            gb = gb * fb
+        gnorm2 = dot(gW, gW, gH, gH, gb, gb)
         if not torch.isfinite(gnorm2) or gnorm2 == 0:
             break
         # This KKT test stops the solve when the model fits the data exactly.  In that case the
         # loss goes to zero, and the relative change of the loss stays large.  The loss test below
         # is the main test.
         gnorm = (gW.norm(dim=0) * W.norm(dim=0)).sum() + (gH.norm(dim=1) * H.norm(dim=1)).sum()
+        if fit_background:
+            gnorm = gnorm + gb.norm() * b.norm()
         if gnorm0 is None:
             gnorm0 = gnorm
         elif rel_tol > 0 and gnorm <= max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps) * gnorm0:
@@ -315,55 +331,67 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         LW = _joint_blocks(Z @ (H[rows] * H[cols]).T, rows, cols, rank, fW, 1e-8)
         LH = _joint_blocks(((W[:, rows] * W[:, cols]).T @ Z).T, rows, cols, rank, fH.T, 1e-8)
 
-        def precond(rW, rH):
+        def precond(rW, rH, rb=None):
             zW = torch.cholesky_solve(rW.unsqueeze(-1), LW).squeeze(-1) * fW
             zH = torch.cholesky_solve(rH.T.unsqueeze(-1), LH).squeeze(-1).T * fH
             # A row with a zero Hessian block can overflow the preconditioner.  For such rows, CG
             # uses the residual without preconditioning.
             zW = torch.where(torch.isfinite(zW), zW, rW)
             zH = torch.where(torch.isfinite(zH), zH, rH)
-            return zW, zH
+            zb = rb / Db.clamp_min(torch.finfo(Db.dtype).tiny) * fb if fit_background else None
+            return zW, zH, zb
 
-        def hvp(dW, dH):
+        def hvp(dW, dH, db=None):
             dW, dH = dW * fW, dH * fH
             dX = dW @ H + W @ dH
             ZdX = Z * dX
+            hb = None
+            if fit_background:
+                db = db * fb
+                hb = ((Cb * dX).sum(0) + Db * db) * fb + lam * db
+                ZdX = ZdX + Cb * db
             return ((ZdX @ H.T + G @ dH.T) * fW + lam * dW,
-                    (W.T @ ZdX + dW.T @ G) * fH + lam * dH)
+                    (W.T @ ZdX + dW.T @ G) * fH + lam * dH, hb)
 
         xW = torch.zeros_like(gW)
         xH = torch.zeros_like(gH)
-        rW, rH = -gW, -gH
-        zW, zH = precond(rW, rH)
-        pW, pH = zW.clone(), zH.clone()
-        rz = _joint_dot(rW, zW, rH, zH)
-        r0 = _joint_dot(rW, rW, rH, rH)
+        xb = torch.zeros_like(gb) if fit_background else None
+        rW, rH, rb = -gW, -gH, (-gb if fit_background else None)
+        zW, zH, zb = precond(rW, rH, rb)
+        pW, pH, pb = zW.clone(), zH.clone(), (zb.clone() if fit_background else None)
+        rz = dot(rW, zW, rH, zH, rb, zb)
+        r0 = dot(rW, rW, rH, rH, rb, rb)
         tol2 = (torch.clamp(gnorm2.sqrt().sqrt(), max=0.5) ** 2) * r0
         ncg = 0
         for ncg in range(1, cg_max + 1):
-            ApW, ApH = hvp(pW, pH)
-            pAp = _joint_dot(pW, ApW, pH, ApH)
+            ApW, ApH, Apb = hvp(pW, pH, pb)
+            pAp = dot(pW, ApW, pH, ApH, pb, Apb)
             if pAp <= 0:
-                if ncg == 1: xW, xH = zW, zH
+                if ncg == 1: xW, xH, xb = zW, zH, zb
                 break
             a = rz / pAp
             xW = xW + a * pW
             xH = xH + a * pH
             rW = rW - a * ApW
             rH = rH - a * ApH
-            if _joint_dot(rW, rW, rH, rH) <= tol2:
+            if fit_background:
+                xb = xb + a * pb
+                rb = rb - a * Apb
+            if dot(rW, rW, rH, rH, rb, rb) <= tol2:
                 break
-            zW, zH = precond(rW, rH)
-            rz_new = _joint_dot(rW, zW, rH, zH)
-            b = rz_new / rz
-            pW = zW + b * pW
-            pH = zH + b * pH
+            zW, zH, zb = precond(rW, rH, rb)
+            rz_new = dot(rW, zW, rH, zH, rb, zb)
+            beta = rz_new / rz
+            pW = zW + beta * pW
+            pH = zH + beta * pH
+            if fit_background:
+                pb = zb + beta * pb
             rz = rz_new
         total_cg += ncg
 
-        slope = _joint_dot(gW, xW, gH, xH)
+        slope = dot(gW, xW, gH, xH, gb, xb)
         if slope >= 0:
-            xW, xH = -gW, -gH
+            xW, xH, xb = -gW, -gH, (-gb if fit_background else None)
             slope = -gnorm2
         a, accepted = 1.0, False
         for _ in range(30):
@@ -371,7 +399,11 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
             Hn = torch.minimum((H + a * xH).clamp_(min=0), uH) if nonneg_W else (H + a * xH).clamp_(min=0)
             if nonneg_W:                                 # recompute the bound on W from the new H
                 Wn = torch.minimum(Wn, _partner_bound(Hn, 1))
-            new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
+            prep_n = prep
+            if fit_background:
+                bn = (b + a * xb).clamp(0.0, BACKGROUND_MAX)
+                prep_n = prep[:3] + (_background_logs(bn),)
+            new_loss = nnal(Wn @ Hn, T, prep_n, dtype=torch.float64)
             if torch.isfinite(new_loss) and new_loss <= loss + 1e-4 * a * slope:
                 accepted = True
                 break
@@ -383,28 +415,35 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         lam = max(lam * 0.3, 1e-14)
         # At the limit of float precision, no step is accepted, and the test lam > 1e6 ends the solve.
         rel_change = torch.abs(loss - new_loss) / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny)
-        W, H, loss = Wn, Hn, new_loss
+        W, H, loss, prep = Wn, Hn, new_loss, prep_n
+        if fit_background:
+            b = bn
         quiet = quiet + 1 if bool(rel_change <= rel_tol) else 0
         if rel_tol > 0 and quiet >= patience:
             break
+    if fit_background:
+        return W, H, step, total_cg, b
     return W, H, step, total_cg
 
 
 def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
-                          warmup_steps=5, cg_max=10, compile_mode=None):
+                          warmup_steps=5, cg_max=10, compile_mode=None, background=None, fit_background=False):
     """This function minimizes the loss over W and H.  It first takes a few block Newton steps,
     and then it solves for W and H together by a preconditioned Newton method.
 
     The first block Newton steps bring the factors near the solution.  The joint solve then
     converges quickly.  With update_H=False, this function solves only for W, by block Newton
     steps.  When the map or spectrum of a component becomes zero, ``_reseed_dead`` replaces the
-    component with small random values.
+    component with small random values.  The argument ``background`` is the additive background
+    of each bin (see ``_nnal_prep``), or None.  The background stays fixed unless fit_background
+    is True.  In that case the joint solve also fits it, and the function returns
+    (W, H, steps, background).
     """
     if not update_H:
         return block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=False, W_init=W_init,
-                                     H_init=H_init, compile_mode=compile_mode)
+                                     H_init=H_init, compile_mode=compile_mode, background=background)
     nnal_fn, deriv_fn, _, step_fn = _kernels(compile_mode)
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T, background)
     W, H = W_init, H_init
     steps = min(warmup_steps, max_steps)
     for i in range(steps):
@@ -413,21 +452,29 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
         H, X, _ = step_fn(H, W, X, T, prep, 1)
         if i + 1 < max_steps:                             # replace zero components only when another step follows
             W, H, _ = _reseed_dead(W, H, T, seed=i + 1)
-    before = None                                         # (W, H, loss, steps) before zero components are replaced
+    before = None                                 # (W, H, loss, steps, background) before zero components are replaced
     for attempt in range(_MAX_RESEEDS + 1):
         if steps >= max_steps:
             break
-        W, H, taken, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps - steps, cg_max=cg_max, rel_tol=rel_tol,
-                                           prep=prep, nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE)
+        out = _joint_newton_pcg(T, W, H, max_steps=max_steps - steps, cg_max=cg_max, rel_tol=rel_tol, prep=prep,
+                                nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE, fit_background=fit_background)
+        W, H, taken = out[:3]
+        if fit_background:
+            background = out[4]
+            prep = prep[:3] + (_background_logs(background),)
         steps += taken
         if before is not None and bool(nnal_fn(W @ H, T, prep, dtype=torch.float64) >= before[2]):
             W, H, steps = before[0], before[1], before[3]           # restore the saved W, H, and step count
+            if fit_background:
+                background = before[4]
             break
         if attempt == _MAX_RESEEDS or steps >= max_steps:
             break
         W_new, H_new, n_dead = _reseed_dead(W, H, T, seed=100 + attempt)
         if n_dead == 0:
             break
-        before = (W, H, nnal_fn(W @ H, T, prep, dtype=torch.float64), steps)
+        before = (W, H, nnal_fn(W @ H, T, prep, dtype=torch.float64), steps, background)
         W, H = W_new, H_new
+    if fit_background:
+        return W, H, steps, background
     return W, H, steps
