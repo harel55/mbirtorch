@@ -9,7 +9,7 @@ wrong there. measure_noise finds those rays and returns two numbers for a fit:
 - the inflation: the variance of a sum over many pixels relative to the sum of their variances, from the correlation
   of the noise between neighbouring pixels (1 for independent pixels). The contamination thresholds use it.
 
-tomo.warmup does both with noise='measure'.
+tomo.warmup does both with noise='measure'. normalize_views corrects each view's exposure from its air rays.
 """
 import numpy as np
 import torch
@@ -22,14 +22,16 @@ NOISE_SIGMAS = 3.0      # a ray sees the sample if its mean transmission is this
 AIR_QUANTILE = 0.9      # the open-beam level is the median of the rays above this quantile of mean transmission
 SIGNIFICANCE = 3.0      # a correlation enters the inflation if it is this many standard errors from zero
 CHUNK = 4096            # rays per chunk
+VIEW_OUTLIER = 5.0      # a view's level is flagged when it is this many robust spreads from the median level
 
 
 def air_rays(T, shape, excluded=None):
     """The rays that see only the open beam: True where a ray's mean transmission is within NOISE_SIGMAS standard
-    errors of the open-beam level and the ray lies AIR_MARGIN pixels from any ray that falls short. T (rays, bins);
-    shape (images, rows, channels), the rays' layout (one image per view); excluded (rays,) bool marks rays to leave
-    out, such as those through a sample holder. The standard errors come from each ray's own differences between
-    adjacent bins, so no noise level is assumed."""
+    errors of its image's open-beam level and the ray lies AIR_MARGIN pixels from any ray that falls short. T (rays,
+    bins); shape (images, rows, channels), the rays' layout (one image per view); excluded (rays,) bool marks rays to
+    leave out, such as those through a sample holder. The standard errors come from each ray's own differences between
+    adjacent bins, so no noise level is assumed. The level is each image's own (its exposure may differ from the
+    others'), from its brightest rays: at least 1 - AIR_QUANTILE of each image must be air."""
     from scipy import ndimage as nd
     P, K = T.shape
     mt = torch.empty(P, dtype=torch.float64, device=T.device); se = torch.empty_like(mt)
@@ -37,9 +39,9 @@ def air_rays(T, shape, excluded=None):
         x = T[s:s + CHUNK].double()
         mt[s:s + CHUNK] = x.mean(1)
         se[s:s + CHUNK] = torch.sqrt((x.diff(dim=1) ** 2).sum(1) / 2) / K
-    mt, se = mt.cpu().numpy(), se.cpu().numpy()
-    bright = mt > np.quantile(mt, AIR_QUANTILE) - NOISE_SIGMAS * np.median(se)
-    level = np.median(mt[bright])
+    mt, se = mt.cpu().numpy().reshape(shape[0], -1), se.cpu().numpy().reshape(shape[0], -1)
+    bright = mt > np.quantile(mt, AIR_QUANTILE, axis=1, keepdims=True) - NOISE_SIGMAS * np.median(se, axis=1, keepdims=True)
+    level = np.array([np.median(m_[b_]) for m_, b_ in zip(mt, bright)])[:, None]          # each image's open beam
     sample = (mt < level - NOISE_SIGMAS * se).reshape(shape)
     sample = nd.binary_dilation(sample, structure=np.ones((1, 3, 3), bool), iterations=AIR_MARGIN)
     air = ~sample.reshape(-1)
@@ -106,3 +108,32 @@ def measure_noise(T, d, shape, excluded=None):
     rays (air_rays; shape and excluded as there). Use it before a fit: the dose divided by the dispersion, and the
     inflation for the contamination thresholds. Returns noise_statistics' dict."""
     return noise_statistics(T, d, air_rays(T, shape, excluded), shape)
+
+
+def view_levels(T, air, shape):
+    """Each image's mean transmission over its air rays, relative to the median over the images: the image's exposure
+    scale (1 where an image has no air rays). T (rays, bins); air (rays,) bool; shape (images, rows, channels), one
+    image per view. Returns the levels (images,) and the images flagged as outliers (more than VIEW_OUTLIER robust
+    spreads from the median, the spread from the median absolute deviation)."""
+    per = shape[1] * shape[2]; air = np.asarray(air, bool)
+    lv = np.ones(shape[0])
+    for i in range(shape[0]):
+        a = np.nonzero(air[i * per:(i + 1) * per])[0]
+        if len(a):
+            lv[i] = float(T[torch.as_tensor(i * per + a, device=T.device)].double().mean())
+    lv = lv / np.median(lv)
+    spread = 1.4826 * np.median(np.abs(lv - 1.0))
+    outliers = np.nonzero(np.abs(lv - 1.0) > VIEW_OUTLIER * max(spread, 1e-12))[0]
+    return lv, outliers
+
+
+def normalize_views(T, shape, excluded=None):
+    """Divide each view's transmission by its exposure scale (view_levels, measured on its air rays), in place: views
+    measured with slightly different exposures otherwise disagree by a constant factor that no model term absorbs.
+    shape and excluded as for air_rays. Returns the levels and the outlier images."""
+    lv, outliers = view_levels(T, air_rays(T, shape, excluded), shape)
+    per = shape[1] * shape[2]
+    with torch.no_grad():
+        for i in range(shape[0]):
+            T[i * per:(i + 1) * per] /= float(lv[i])
+    return lv, outliers
