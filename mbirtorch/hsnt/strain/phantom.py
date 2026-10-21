@@ -546,9 +546,11 @@ def fe_spectrum_model(lam, dose_per_bin, n, device='cpu', kernel='two_scale', ke
     """A Hybrid2 model for bcc Fe on the axis lam and its parameter vector: Bragg heights j d, a smooth part, the
     resolution kernel, scaled so the attenuation per voxel at 3 Angstrom is FE_ATTEN_3A / n. kernel: the kernel's form
     (model.Hybrid2); kernel_values: its 8 parameters (default: JOINT_KERNEL, a two-scale kernel). texture: (March-Dollase
-    strength, axis polar angle, axis azimuth) for a textured cube (shape model texture3d; the caller sets view_dirs)."""
+    strength, axis polar angle, axis azimuth) for a textured cube (shape model texture3d), or the 9 degree-4 coefficients
+    of a cubic texture (shape model cubic4); the caller sets view_dirs."""
     M = Hybrid2(lam, dose_per_bin, [(FE['lattice'], (FE['a'] * (1 - FE_A_RANGE), FE['a'] * (1 + FE_A_RANGE)))], n_spline=8, n_contam=2,
-                device=device, two_scale=True, kernel=kernel, shape_model=None if texture is None else 'texture3d')
+                device=device, two_scale=True, kernel=kernel,
+                shape_model=None if texture is None else ('cubic4' if len(texture) == 9 else 'texture3d'))
     g = torch.zeros(M.n_global, dtype=torch.float64, device=device)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(JOINT_KERNEL if kernel_values is None else kernel_values, dtype=torch.float64)
     sl = M.slices[0]
@@ -583,8 +585,9 @@ def make_fe_cube(n=64, angles=None, dose=1919.0, inflation=6.0, mounts=None, off
     the true spectrum, and holder_rows (the first detector row of the holder in each series). kernel, kernel_values:
     the resolution kernel the data are generated with (see fe_spectrum_model). cube_shift moves the cube along all three
     axes by this many detector pixels (a multiple of 1 / fine), so that its faces can fall between the planes of a
-    finer reconstruction grid. texture: (March-Dollase strength, axis polar angle, axis azimuth in the sample frame) for
-    a textured cube: each view's Bragg edges carry that view's texture factor (model.Hybrid2.texture_factor)."""
+    finer reconstruction grid. texture: (March-Dollase strength, axis polar angle, axis azimuth in the sample frame), or
+    the 9 degree-4 coefficients of a cubic texture, for a textured cube: each view's Bragg edges carry that view's
+    texture factor (model.Hybrid2.texture_factor)."""
     import mbirtorch
     from .geometry import series_weights
     from .tomo import MultiProjector, Projector, detector_directions

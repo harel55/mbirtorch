@@ -519,3 +519,82 @@ def test_texture_search_weak():
     n = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
     n_true = np.array([np.sin(0.9) * np.cos(0.4), np.sin(0.9) * np.sin(0.4), np.cos(0.9)])
     assert l_best < l_powder and st < 1.0 and abs(float(n @ n_true)) > np.cos(np.radians(30))
+
+
+def _small_fit_cubic4(seed=0, coeffs=None):
+    """The small textured fit of _small_fit_texture with the cubic4 model: a degree-4 cubic texture (coefficients
+    coeffs, default a fiber about a tilted axis) on eight views."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
+    lam = np.linspace(2.0, 4.4, 300)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64, shape_model='cubic4')
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    if coeffs is None:
+        n = torch.tensor([np.sin(0.9) * np.cos(0.4), np.sin(0.9) * np.sin(0.4), np.cos(0.9)], dtype=torch.float64)
+        coeffs = 0.05 * harmonics4(n)
+    g[sl['x'][0]:sl['x'][1]] = torch.as_tensor(coeffs, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    gen = torch.Generator().manual_seed(seed)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
+    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64), eps=eps, chunk=16)
+    fit.ray_view = torch.arange(P) % 8
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
+    return fit
+
+
+def test_cubic4_harmonics():
+    """harmonics4 gives 9 orthogonal functions of root mean square 1 over the sphere, with no degree-2 part: each is
+    orthogonal to the degree-2 monomials. cubic_k4 is 0.4 for bcc 200, -0.1 for 110, 211 and 220, -4/15 for 222."""
+    from mbirtorch.hsnt.strain.model import harmonics4, cubic_k4, _sphere_quadrature
+    pts, w = _sphere_quadrature()
+    Y = harmonics4(pts)
+    G = (w[:, None, None] * Y[:, :, None] * Y[:, None, :]).sum(0)
+    assert torch.allclose(G, torch.eye(9, dtype=torch.float64), atol=1e-10)
+    for q in (pts[:, 0] ** 2, pts[:, 0] * pts[:, 1], pts[:, 2] ** 2):
+        assert float((w[:, None] * Y * q[:, None]).sum(0).abs().max()) < 1e-12
+    assert np.allclose(cubic_k4('bcc', [4, 2, 6, 8, 12]), [0.4, -0.1, -0.1, -0.1, -4 / 15])
+
+
+def test_cubic4_factor():
+    """The cubic4 factor is 1 for a random powder; at an edge it equals the pole density along the beam; below the edge
+    it equals the pole density averaged over the diffraction cone (checked against a direct average on the cone)."""
+    from mbirtorch.hsnt.strain.model import harmonics4
+    fit = _small_fit_cubic4()
+    M = fit.M; sl = M.slices[0]; x0 = sl['x'][0]; g = fit.g.clone()
+    g0 = g.clone(); g0[x0:x0 + 9] = 0.0
+    assert torch.allclose(M.texture_factor(g0, 0), torch.ones(()).double(), atol=1e-12)
+    F = M.texture_factor(g, 0)                                            # (views, edges, Kf)
+    c = g[x0:x0 + 9]; k4 = M.mats[0]['k4']
+    b = torch.as_tensor(M.view_dirs[0], dtype=torch.float64)
+    e = 2.0 * float(g[sl['a']]) / torch.sqrt(M.mats[0]['ns'])
+    for ie in range(len(e)):
+        for frac in (0.999, 0.97, 0.9, 0.8):
+            k = int(torch.argmin((M.lamf - frac * e[ie]).abs()))
+            st = float(M.lamf[k] / e[ie])
+            if st >= 1.0:
+                continue
+            # normals at 90 deg - theta from the beam: a cone about b with cos(half angle) = sin(theta)
+            u = torch.linalg.svd(torch.stack([b, torch.randn(3, dtype=torch.float64)]))[2][-1]; v = torch.linalg.cross(b, u)
+            phi = torch.linspace(0, 2 * np.pi, 721, dtype=torch.float64)[:-1]
+            sn = st * b[None] + np.sqrt(1 - st * st) * (torch.cos(phi)[:, None] * u[None] + torch.sin(phi)[:, None] * v[None])
+            direct = (1 + k4[ie] * (harmonics4(sn) @ c)).mean()
+            assert abs(float(F[0, ie, k]) - float(direct)) < 1e-9
+
+
+def test_cubic4_global_grad():
+    """With cubic4 the gradient by automatic differentiation (global_grad) equals global_system's for the texture
+    coefficients and the heights."""
+    fit = _small_fit_cubic4()
+    M = fit.M; sl = M.slices[0]
+    idx = list(range(sl['h'][0], sl['h'][1])) + list(range(sl['x'][0], sl['x'][1]))
+    g1, F = fit.global_system(idx)
+    g2 = fit.global_grad(idx)
+    assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
+    assert bool((torch.diagonal(F) > 0).all())
