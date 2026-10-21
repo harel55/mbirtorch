@@ -52,7 +52,7 @@ def noise_statistics(T, d, air, shape):
     """The dispersion, the noise correlation per neighbour offset and the inflation of the transmission T (rays,
     bins) at dose d (bins,), measured on the rays where air (rays,) is True; shape as for air_rays. The noise is taken
     from the differences between adjacent bins of each ray (independent noise; the differences also remove each ray's
-    level), less the open beam's own difference. Only correlations more than SIGNIFICANCE standard errors from zero
+    level), less the open beam's own difference; pairs of bins with a dose of zero (gaps) are left out. Only correlations more than SIGNIFICANCE standard errors from zero
     enter the inflation. With the rays split over processes, the sums are taken over all of them. Returns a dict:
     dispersion, inflation, inflation_se, correlations [(drow, dchannel, correlation, standard error, pairs)], air_rays."""
     dev = T.device; K = T.shape[1]
@@ -64,16 +64,18 @@ def noise_statistics(T, d, air, shape):
         x = T[ids[s:s + CHUNK]].double()
         sT += x.sum(0); sD += (x[:, :-1] - x[:, 1:]).sum(0)
     m = all_sum(sT) / n; common = all_sum(sD) / n                      # open-beam level; its own difference
-    vd = (m / d)[:-1] + (m / d)[1:]                                     # Poisson variance of a difference per bin
+    ok = (d[:-1] > 0) & (d[1:] > 0); K1 = float(ok.sum())                # bin pairs with counts in both bins
+    dd = d.clamp_min(torch.finfo(d.dtype).tiny)
+    vd = ((m / dd)[:-1] + (m / dd)[1:])[ok]                              # Poisson variance of a difference per bin
 
     def z(rows):
         x = T[rows].double()
-        return (x[:, :-1] - x[:, 1:] - common) / torch.sqrt(vd)
+        return (x[:, :-1] - x[:, 1:] - common)[:, ok] / torch.sqrt(vd)
 
     acc = 0.0
     for s in range(0, len(ids), CHUNK):
         acc += float((z(ids[s:s + CHUNK]) ** 2).sum())
-    phi = all_sum_float(acc, dev) / (n * (K - 1))
+    phi = all_sum_float(acc, dev) / (n * K1)
     flat = np.arange(T.shape[0]).reshape(shape); A = np.asarray(air, bool).reshape(shape)
     rho = {}
     for dr in range(0, MAX_OFFSET + 1):
@@ -91,7 +93,7 @@ def noise_statistics(T, d, air, shape):
             if npair == 0:
                 continue
             # adjacent differences share a bin (correlation -1/2), so the products in neighbouring bins correlate by 1/4
-            rho[(dr, dc)] = (all_sum_float(acc, dev) / (npair * (K - 1) * phi), float(np.sqrt(1.5 / (npair * (K - 1)))), int(npair))
+            rho[(dr, dc)] = (all_sum_float(acc, dev) / (npair * K1 * phi), float(np.sqrt(1.5 / (npair * K1))), int(npair))
     sig = [(r, s_) for r, s_, _ in rho.values() if abs(r) > SIGNIFICANCE * s_]
     corr = [(dr, dc, r, s_, npair) for (dr, dc), (r, s_, npair) in rho.items()]
     inflation = 1.0 + 2.0 * sum(r for r, _ in sig)                     # each offset counts in both directions

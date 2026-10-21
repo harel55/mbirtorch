@@ -331,3 +331,16 @@ def test_fe_cube_offset():
     roll = lambda a: np.roll(np.roll(np.roll(a, 1, 0), 1, 1), 1, 2)
     assert np.array_equal(roll(c0), c1)
     assert np.allclose(roll(e0), e1)
+
+
+def test_measure_noise_dose_gaps():
+    """Bins with a dose of zero (shutter gaps) are left out of the noise measurement."""
+    from mbirtorch.hsnt.strain.noise import measure_noise
+    images, side, K, phi = 8, 16, 300, 3.0
+    g = torch.Generator().manual_seed(1)
+    d = torch.full((K,), 800.0, dtype=torch.float64); d[100:110] = 0.0
+    T = 1.0 + torch.sqrt(phi / d.clamp_min(1.0)) * torch.randn(images * side * side, K, generator=g, dtype=torch.float64)
+    T[:, 100:110] = 0.0
+    out = measure_noise(T, d.numpy(), (images, side, side))
+    assert np.isfinite(out['dispersion']) and abs(out['dispersion'] / phi - 1) < 0.03
+    assert abs(out['inflation'] - 1) < 0.05
