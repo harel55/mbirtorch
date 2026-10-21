@@ -492,3 +492,16 @@ def test_texture_global_grad():
     g2 = fit.global_grad(idx)
     assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
     assert bool((torch.diagonal(F) > 0).all())
+
+
+def test_texture_search():
+    """texture_search, started from a random powder, finds an axis whose loss is below the powder's and close to the
+    truth's (the small fit's data come from a texture of strength 0.7)."""
+    fit = _small_fit_texture()
+    M = fit.M; x0 = M.slices[0]['x'][0]
+    l_true = fit.loss()
+    with torch.no_grad():
+        fit.g[x0] = 1.0; fit.g[x0 + 1] = 0.3; fit.g[x0 + 2] = 2.0
+    l_powder = fit.loss()
+    l_best, (st, th, ph) = fit.texture_search(0, strength=0.7, n_dirs=48)
+    assert l_best < l_powder and (l_best - l_true) < 0.5 * (l_powder - l_true)

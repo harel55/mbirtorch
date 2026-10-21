@@ -60,6 +60,8 @@ TEXTURE_R_RANGE = (0.3, 3.0)     # texture3d: the March-Dollase strength's bound
 TEXTURE_ANGLE_BOUND = 2 * math.pi  # texture3d: the axis angles' bounds (the factor is periodic in both)
 TEXTURE_TABLE = (65, 257)        # texture3d: the factor's table over |cos psi| and sin(theta)
 TEXTURE_CONE_POINTS = 48         # texture3d: points on each diffraction cone
+TEXTURE_SEARCH_DIRS = 24         # texture3d: axis directions tried by texture_search (over a hemisphere)
+TEXTURE_SEARCH_STRENGTH = 0.8    # texture3d: the strength tried by texture_search (and its inverse)
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
 CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
 CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvature)
@@ -1238,6 +1240,26 @@ class FitB:
             self.last_fisher_data = (list(idx), F.clone())          # without the penalties, for the step measure
             grad += gpen.detach()[idx]; F += Hpen.detach()
         return grad, F
+
+    def texture_search(self, r, strength=TEXTURE_SEARCH_STRENGTH, n_dirs=TEXTURE_SEARCH_DIRS):
+        """Material r's texture axis (texture3d) by a search: the loss with the axis at each of n_dirs directions spread
+        over a hemisphere (a Fibonacci lattice; the factor does not depend on the axis's sign), at the strength
+        `strength` and at its inverse (plate-like and needle-like textures), against the current parameters; keeps the
+        best. From a random powder the axis has no gradient, and the loss is not convex in it, so the global steps alone
+        may not find it. Returns (loss, (strength, polar, azimuth))."""
+        M = self.M; x0 = M.slices[r]["x"][0]
+        best = (self.loss(), tuple(float(v) for v in self.g[x0:x0 + 3]))
+        k = np.arange(n_dirs) + 0.5
+        polar = np.arccos(1 - k / n_dirs); azim = math.pi * (1 + math.sqrt(5)) * k
+        for s_ in (strength, 1.0 / strength):
+            for th, ph in zip(polar, azim):
+                gg = self.g.clone(); gg[x0] = s_; gg[x0 + 1] = float(th); gg[x0 + 2] = float(ph % (2 * math.pi))
+                l_ = self.loss(g=gg)
+                if l_ < best[0]:
+                    best = (l_, (s_, float(th), float(ph % (2 * math.pi))))
+        with torch.no_grad():
+            self.g[x0:x0 + 3] = torch.tensor(best[1], dtype=self.g.dtype, device=self.g.device)
+        return best
 
     def lattice_search(self, r, half_width=LATTICE_HALF_WIDTH, step=LATTICE_COARSE_STEP, rel_tol=LATTICE_TOL):
         """Material r's lattice parameter: the loss on a grid of relative spacing `step` over a0 * (1 +- half_width),
