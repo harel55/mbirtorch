@@ -38,7 +38,7 @@ Please use the following BibTeX citation when referencing this software.
   title = {{MBIRTorch}: {H}igh-performance tomographic reconstruction using {PyTorch}},
   author = {Gregery T. Buzzard and Charles A. Bouman and Jingsong Lin and Ziyun Li},
   howpublished = {Software library available from \url{https://github.com/cabouman/mbirtorch}},
-  note = {Version 0.1.2},
+  note = {Version 0.2.0},
   year = 2026
 }
 ```

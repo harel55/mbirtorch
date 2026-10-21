@@ -3,13 +3,12 @@ Performance Dashboard
 
 MBIRTorch's reconstruction performance — run time, peak memory, and **correctness** — is tracked
 automatically over time, on both CPU and GPU, by a companion project,
-`mbirjax_metrics <https://github.com/gbuzzard/mbirjax_metrics>`__.  When a tracked branch changes, a
+`mbirtorch_metrics <https://github.com/cabouman/mbirtorch_metrics>`__.  When a tracked branch changes, a
 scheduled job re-measures it and publishes an interactive dashboard:
 
-**Live dashboard:** https://gbuzzard.github.io/mbirjax_metrics/
+**Live dashboard:** https://cabouman.github.io/mbirtorch_metrics/
 
-MBIRTorch and MBIRJAX share this dashboard: MBIRTorch's measurements appear on the ``cpu-torch``
-and ``gpu-torch`` platforms next to MBIRJAX's, so the two implementations can be compared directly.
+The dashboard has a ``cpu`` and a ``gpu`` platform, each with one line per tracked branch.
 The dashboard rebuilds and republishes automatically whenever new measurements are pushed, so that
 link is always current; you do not need to run anything to read it.
 
@@ -40,6 +39,6 @@ Running it yourself
 
 The dashboard is a single self-contained page generated from a YAML time series; no server is needed.
 The measurement engine, the nightly harness, and the build script all live in the
-`mbirjax_metrics <https://github.com/gbuzzard/mbirjax_metrics>`__ repository — see its ``README`` and
+`mbirtorch_metrics <https://github.com/cabouman/mbirtorch_metrics>`__ repository — see its ``README`` and
 the ``action_scripts/`` and ``tooling/`` guides there for how runs are measured, gated, and scheduled,
 and how to build the dashboard locally.

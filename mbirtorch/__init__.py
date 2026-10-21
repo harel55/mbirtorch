@@ -5,7 +5,7 @@ public functions take and return numpy arrays.  With ``output_sharded=True``, a 
 the tensor on the GPUs instead.  mbirtorch uses all available GPUs automatically.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 # These lines put the torch.compile caches under ~/.mbirtorch.  They take effect only if
 # mbirtorch is imported before torch compiles anything.
