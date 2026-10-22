@@ -678,6 +678,21 @@ def test_set_view_offsets():
         assert np.allclose(P.with_q(2).view_extra[1], extra[1])
 
 
+def test_set_view_angles():
+    """MultiProjector and FineProjector: per-view angle offsets set in place project like a projector whose series has
+    those angles, and they survive with_q."""
+    from mbirtorch.hsnt.strain.tomo import FineProjector
+    n = 8; ang = np.linspace(0, np.pi, 5); extra = np.array([0.0, 0.01, 0.0, -0.02, 0.0])
+    mk = lambda a_: [(((0, 1, 2), (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)), ang), (((1, 2, 0), (1, 1, 1), (0.3, 0.0, 0.0), (0.0, 0.0, 0.0)), a_)]
+    for cls, side in ((MultiProjector, n), (FineProjector, 2 * n)):
+        vol = torch.rand(side, side, side, 1, generator=torch.Generator().manual_seed(3))
+        P = cls(n, mk(ang), 1, channel_offsets=[0.0, 0.0], ror_mask=False); P.set_view_angles(1, extra)
+        Q = cls(n, mk(ang + extra), 1, channel_offsets=[0.0, 0.0], ror_mask=False)
+        for k in range(2):
+            assert torch.allclose(P.project_series(k, vol).cpu(), Q.project_series(k, vol).cpu(), atol=1e-6)
+        assert np.allclose(P.with_q(2).view_angle_extra[1], extra)
+
+
 def test_skin_stress_field():
     """The skin phantom's stress (phantom.fe_cube_skin_stress) is in equilibrium inside the cube; on the faces the
     traction is near zero while the in-plane stresses are not, and they exceed the mid-plane's."""
