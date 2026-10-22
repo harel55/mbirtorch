@@ -49,6 +49,9 @@ EPS_W_MIN = 1e-8                # rays with less projected density carry no stra
 INIT_PIXEL_STEPS = 3            # per-ray map fits in the warm-up
 MOUNT_FD = (0.05, 0.05, 0.1)    # finite-difference steps for the mount derivatives: degrees, voxels, detector channels
 MOUNT_MAX_STEP = (0.5, 0.5, 0.5) # largest change per mount step: degrees, voxels, detector channels
+VIEW_OFFSET_FD = 0.1            # finite-difference step (detector channels) for the per-view offsets' derivatives
+VIEW_OFFSET_MAX_STEP = 0.5      # largest change of a view's own channel offset per step (detector channels)
+VIEW_OFFSET_DAMP = 1e-2         # relative damping of the per-view offset step
 ANCHOR_STIFFNESS = 1e3          # the spectrum scale pin's weight, relative to the largest global Fisher diagonal entry
 TEXTURE_AXIS_START = (0.6, 0.4)  # texture3d: the axis's starting polar and azimuthal angles (generic, off the axes)
 
@@ -161,31 +164,49 @@ class MultiProjector:
     (beam_geometry.PERMS) with its own angles. fwd stacks the series' rays (series-major); back sums the series'
     back-projections, permuted back to the sample frame. One series with the identity permutation is a Projector."""
 
-    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True):
+    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, view_extra=None):
         """series: a list of (axis, angles), axis a key of beam_geometry.PERMS, or (transform, angles) with transform =
         (perm, signs, shift[, rot]): the series' volume is the sample volume permuted (frame axis i = sample axis
         perm[i]), flipped where signs < 0, rotated by rot (degrees about the frame's axes 0, 1, 2, as a rotation vector,
         about the grid's centre, by trilinear interpolation) and shifted by shift voxels (a measured mount). The whole
         part of the shift rolls the volume (wrapping around); the fractional part moves the detector instead (a
         channel offset per view and a row offset), so the volume is not resampled. The beam directions
-        (beam_geometry.series_weights) do not include rot."""
+        (beam_geometry.series_weights) do not include rot. view_extra: per series, each view's own channel offset
+        (detector channels; None means zeros), for a view that is shifted on the detector relative to the others."""
         from .geometry import PERMS
         self.n, self.Q, self.series = n, Q, list(series)
         offs = channel_offsets or [0.0] * len(self.series)
         self.offsets, self.ror_mask = [float(o) for o in offs], ror_mask
+        self.view_extra = [np.zeros(len(ang)) if view_extra is None or view_extra[k] is None else np.asarray(view_extra[k], float)
+                           for k, (_, ang) in enumerate(self.series)]
         self.parts, self._dirs = [], []
         for (ax, ang), off in zip(self.series, self.offsets):
             tr = (PERMS[ax], (1, 1, 1), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)) if isinstance(ax, str) else \
                 (tuple(int(v) for v in ax[0]), tuple(int(v) for v in ax[1]), tuple(float(v) for v in ax[2]),
                  tuple(float(v) for v in ax[3]) if len(ax) > 3 else (0.0, 0.0, 0.0))
             self._dirs.append(None)
-            vo, ro = self._detector_shift(len(self.parts), ang, tr[2])
+            vo, ro = self._view_offsets(len(self.parts), ang, tr[2])
             self.parts.append((tr, Projector(n, ang, Q, off, ror_mask, vo, ro)))
         self.counts = [p.V * n * n for _, p in self.parts]
         self.V = sum(p.V for _, p in self.parts)
 
     def with_q(self, Q):
-        return self if Q == self.Q else MultiProjector(self.n, self.series, Q, self.offsets, self.ror_mask)
+        return self if Q == self.Q else MultiProjector(self.n, self.series, Q, self.offsets, self.ror_mask, self.view_extra)
+
+    def _view_offsets(self, s, angles, shift):
+        """Series s's per-view channel offsets (its fractional shift's and each view's own) and its row offset."""
+        vo, ro = self._detector_shift(s, angles, shift)
+        e = self.view_extra[s]
+        if np.any(e):
+            vo = e.copy() if vo is None else vo + e
+        return vo, ro
+
+    def set_view_offsets(self, s, offsets):
+        """Set each view's own channel offset in series s (detector channels)."""
+        self.view_extra[s] = np.asarray(offsets, float)
+        tr, p = self.parts[s]
+        vo, row = self._view_offsets(s, p.angles, tr[2])
+        p.set_geometry(self.offsets[s], vo, row)
 
     @staticmethod
     def _split(shift):
@@ -258,9 +279,9 @@ class MultiProjector:
               tuple(float(v) for v in (ro if rot is None else rot)))
         if offset is not None:
             self.offsets[s] = float(offset)
-        vo, row = self._detector_shift(s, p.angles, tr[2])
-        p.set_geometry(self.offsets[s], vo, row)
         self.parts[s] = (tr, p)
+        vo, row = self._view_offsets(s, p.angles, tr[2])
+        p.set_geometry(self.offsets[s], vo, row)
         ax, ang = self.series[s]
         self.series[s] = ((perm, signs, tr[2], tr[3]), ang)
 
@@ -287,12 +308,15 @@ class FineProjector:
     interfaces can sit between the detector's pixel positions without forcing ringing into the densities; it costs
     factor^3 the voxels. Lengths are in units of the detector pixel, as for a MultiProjector of side n. Mount shifts
     (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n, also to
-    set_mount and in parts, so TomoFit.mount_step works on it."""
+    set_mount and in parts, so TomoFit.mount_step works on it. view_extra: per series, each view's own channel offset
+    (detector pixels), as for a MultiProjector."""
 
-    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2):
+    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2, view_extra=None):
         self.n_det, self.factor, self.Q = n, int(factor), Q
         self.series, self.ror_mask = list(series), ror_mask
         self.offsets = [float(o) for o in (channel_offsets or [0.0] * len(self.series))]
+        self.view_extra = [np.zeros(len(ang)) if view_extra is None or view_extra[k] is None else np.asarray(view_extra[k], float)
+                           for k, (_, ang) in enumerate(self.series)]
         f = self.factor
         fine_series = []
         for ax, ang in self.series:
@@ -301,14 +325,21 @@ class FineProjector:
             else:
                 tr = (ax[0], ax[1], tuple(float(v) * f for v in ax[2])) + ((tuple(ax[3]),) if len(ax) > 3 else ())
                 fine_series.append((tr, ang))
-        self.inner = MultiProjector(f * n, fine_series, Q, [o * f for o in self.offsets], ror_mask)
+        self.inner = MultiProjector(f * n, fine_series, Q, [o * f for o in self.offsets], ror_mask,
+                                    [e * f for e in self.view_extra])
         self.n = f * n                                       # the volume's side
         self.V = self.inner.V
         self.rays_per_view = n * n
         self.counts = [c // f ** 2 for c in self.inner.counts]
 
     def with_q(self, Q):
-        return self if Q == self.Q else FineProjector(self.n_det, self.series, Q, self.offsets, self.ror_mask, self.factor)
+        return self if Q == self.Q else FineProjector(self.n_det, self.series, Q, self.offsets, self.ror_mask, self.factor,
+                                                      self.view_extra)
+
+    def set_view_offsets(self, s, offsets):
+        """Set each view's own channel offset in series s (detector pixels)."""
+        self.view_extra[s] = np.asarray(offsets, float)
+        self.inner.set_view_offsets(s, self.view_extra[s] * self.factor)
 
     @property
     def parts(self):
@@ -922,6 +953,57 @@ class TomoFit:
                 return dict(alpha=alpha, loss_decrease=l0 - l1, mounts=mounts())
         apply(0.0); self.sync()
         return dict(alpha=0.0, loss_decrease=0.0, mounts=mounts())
+
+    def view_offset_step(self, series=None, damp=VIEW_OFFSET_DAMP):
+        """One Gauss-Newton step on each view's own channel offset (detector channels), for a view that is shifted on
+        the detector relative to the other views of its series (poorly calibrated view metadata). Each view's rays depend
+        only on its own offset, so central differences of two projections per series (VIEW_OFFSET_FD) give every view's
+        derivative. The step is held to zero mean in each series, because the series' centre-of-rotation offset
+        (mount_step) carries the mean, and capped at VIEW_OFFSET_MAX_STEP; a backtracking line search on the loss accepts
+        it. series lists the series to refine (default: all). The projector must support set_view_offsets (MultiProjector
+        or FineProjector), and the rays must not be split over processes. Returns the accepted offsets per series."""
+        proj, fit, R, C = self.proj, self.fit, self.R, self.C
+        series = list(range(len(proj.parts))) if series is None else list(series)
+        self.sync()
+        cache = fit._state(fit.g)
+        P = fit.T.shape[0]
+        G = torch.zeros(P, 2 * R, device=fit.T.device, dtype=torch.float64)
+        F = torch.zeros(P, 2 * R, 2 * R, device=fit.T.device, dtype=torch.float64)
+        with torch.no_grad():
+            for sl in fit.chunks():
+                G[sl], F[sl] = fit.ray_system(sl, cache)
+        n = self.V.shape[0]
+        vols = torch.cat([self.V, (self.V[..., None] * self.E).reshape(n, n, n, R * C)], -1)
+        bounds = np.cumsum([0] + proj.counts)
+        to_wu = lambda d, w: torch.cat([d[:, :R], (d[:, R:].reshape(-1, R, C) * w[:, None, :]).sum(-1)], 1)
+        steps = []
+        for s_ in series:
+            sl = slice(int(bounds[s_]), int(bounds[s_ + 1])); w = self.w_ray[sl]
+            e0 = np.asarray(proj.view_extra[s_], float); nv = len(e0); h = VIEW_OFFSET_FD
+            with torch.no_grad():
+                proj.set_view_offsets(s_, e0 + h); a_ = proj.project_series(s_, vols)
+                proj.set_view_offsets(s_, e0 - h); b_ = proj.project_series(s_, vols)
+            proj.set_view_offsets(s_, e0)
+            J = to_wu((a_ - b_) / (2 * h), w).double()                                # (Ps, 2R)
+            assert J.shape[0] % nv == 0, 'the rays of a series must not be split over processes'
+            g = (G[sl] * J).sum(1).reshape(nv, -1).sum(1)
+            Fv = torch.einsum('pa,pab,pb->p', J, F[sl], J).reshape(nv, -1).sum(1)
+            d = -g / (Fv * (1 + damp)).clamp_min(torch.finfo(Fv.dtype).tiny)
+            d = (d - d.mean()).clamp(-VIEW_OFFSET_MAX_STEP, VIEW_OFFSET_MAX_STEP)
+            steps.append((s_, e0, d.cpu().numpy()))
+        l0 = self.loss()
+
+        def apply(alpha):
+            for s_, e0, d in steps:
+                proj.set_view_offsets(s_, e0 + alpha * d)
+        offsets = lambda: [np.asarray(proj.view_extra[k], float).tolist() for k in range(len(proj.parts))]
+        for alpha in (1.0, 0.5, 0.25):
+            apply(alpha); self.sync()
+            l1 = self.loss()
+            if l1 < l0:
+                return dict(alpha=alpha, loss_decrease=l0 - l1, offsets=offsets())
+        apply(0.0); self.sync()
+        return dict(alpha=0.0, loss_decrease=0.0, offsets=offsets())
 
     def recenter_strain(self, full=False):
         """Move each material's mean isotropic strain into its lattice parameter, so the strain is measured from the
