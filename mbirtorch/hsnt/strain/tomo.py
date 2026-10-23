@@ -25,7 +25,7 @@ import time
 import numpy as np
 import torch
 
-from .model import DEBYE_TEMPERATURE_DEFAULT, LEGENDRE_DEGREE, Hybrid2, FitB, ls_init_material
+from .model import LEGENDRE_DEGREE, Hybrid2, FitB, ls_init_material
 from .bragg import warm_start, BraggSpectrum
 from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
@@ -1221,8 +1221,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='corner',
-           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, smooth_model='legendre', cross_sections=None,
-           temperature=DEBYE_TEMPERATURE_DEFAULT):
+           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1247,9 +1246,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     starts as a random powder. shape_model='cubic4' gives each cubic material its lowest-order texture instead (9
     coefficients, linear; model.harmonics4), also starting as a random powder. per_bin_dispersion=True divides the dose
     by each bin's measured dispersion (noise.noise_statistics' dispersion_per_bin) instead of the overall one; it needs
-    noise='measure'. smooth_model='debye' uses the physical phonon term for each spectrum's smooth part instead of the Legendre polynomial (model.Hybrid2;
-    cross_sections: each material's mass and tabulated cross-sections, as model.Hybrid2 takes them; temperature: the
-    sample's, in K)."""
+    noise='measure'."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -1297,7 +1294,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
     M = Hybrid2(lam, d, lats, smooth_degree=smooth_degree, n_contam=n_contam, device=device, two_scale=True, kernel=kernel,
-                shape_model=shape_model, smooth_model=smooth_model, cross_sections=cross_sections, temperature=temperature)
+                shape_model=shape_model)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     if kernel_values is not None:                       # a calibrated kernel, held fixed

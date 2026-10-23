@@ -34,7 +34,6 @@ import torch
 from scipy.stats import norm
 
 from .bragg import emg_median, legendre_columns, reflections
-from .phonons import DebyeTable, THETA_MAX, THETA_MIN
 from ._dist import all_sum, all_sum_float
 
 
@@ -117,12 +116,9 @@ VIEW_TEXTURES = ("texture3d", "cubic4")   # shape models whose spectra depend on
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
 CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
 CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvature)
-DEBYE_TEMPERATURE_DEFAULT = 293.15   # smooth_model 'debye': the sample temperature (K) unless given
-DEBYE_THETA_START = 400.0    # smooth_model 'debye': the Debye temperature (K) the starting fit uses
-ABS_REF_WAVELENGTH = 1.798   # smooth_model 'debye': wavelength (A) of tabulated absorption cross-sections (2200 m/s)
-LEGENDRE_DEGREE = 8          # smooth_model 'legendre': the polynomial's degree (the spline's effective degrees of freedom
+LEGENDRE_DEGREE = 8          # the smooth part's polynomial degree (the spline's effective degrees of freedom
                              # on the real Fe cube, q79, were 8.9)
-LEGENDRE_CURVATURE = 1e-2    # smooth_model 'legendre': the curvature penalty's weight relative to FitB.ridge (q79 used 1.1e-2)
+LEGENDRE_CURVATURE = 1e-2    # the smooth part's curvature penalty weight relative to FitB.ridge (q79 used 1.1e-2)
 
 
 def deviance_terms(m, T, d):
@@ -299,21 +295,14 @@ def _emg_cdf(x, sigma, tau):
 class Hybrid2:
     """Structure of the stage-B model: grids, the banded resolution operator, materials and the parameter layout.
     Global parameter vector g: per material [a, h (n_e), c0, c1, smooth block (n_smooth)], then res (s0, s1, t0, t1),
-    then kappa (J x R). The smooth (non-Bragg) part of each spectrum is c0 + c1 x plus the smooth block's term:
-    - smooth_model 'debye' (the physical one): s (sigma_abs lam / ABS_REF_WAVELENGTH + sigma_inc + sigma_bound D(lam; theta)),
-      the material's absorption, incoherent and phonon (inelastic) cross-sections, with D the inelastic cross-section of
-      a Debye solid per unit bound cross-section (phonons.py). The smooth block holds the scale s and log(theta); c0
-      and c1 are held at 0, so the term carries the linear dependence and theta keeps its meaning (with free linear
-      terms theta traded with them). cross_sections (one dict per material: mass in amu, sigma_abs at
-      ABS_REF_WAVELENGTH, sigma_inc and sigma_bound in barns, from tables) and temperature (K) are required.
-    - smooth_model 'legendre' (when the cross-sections are not known): a polynomial of degree smooth_degree in the
-      wavelength, its terms above the linear one as Legendre polynomials, with a curvature penalty
-      (FitB.spline_penalty)."""
+    then kappa (J x R). The smooth (non-Bragg) part of each spectrum is a polynomial of degree smooth_degree in the
+    wavelength: c0 + c1 x, and the smooth block's terms above the linear one as Legendre polynomials, with a curvature
+    penalty (FitB.spline_penalty). A physical form (absorption, incoherent and Debye phonon cross-sections) was tried on
+    2026-10-23 and dropped: the same strain on NCrystal phantoms, too rigid on measured multi-material data."""
     BAND = (-240, 220)                                   # fine-grid offsets of a bin's band: the tail is on the left
 
     def __init__(self, lam, dose_per_bin, lattices, smooth_degree=LEGENDRE_DEGREE, n_contam=2, device="cuda", dtype=torch.float32,
-                 pad=0.1, edge_slope=False, two_scale=False, shape_model=None, kernel="two_scale", smooth_model="legendre",
-                 cross_sections=None, temperature=DEBYE_TEMPERATURE_DEFAULT):
+                 pad=0.1, edge_slope=False, two_scale=False, shape_model=None, kernel="two_scale"):
         self.dev, self.dt = device, dtype
         lam = np.asarray(lam, dtype=np.float64)
         lo, hi = bin_intervals(lam)
@@ -333,27 +322,15 @@ class Hybrid2:
         self.band_idx = torch.as_tensor(idx, device=device)                         # (K, bw) fine indices
         self.band_valid = torch.as_tensor((jk[:, None] + offs[None, :] >= 0) & (jk[:, None] + offs[None, :] < self.Kf), device=device)
         self.lam_ref = float(lam.mean())
-        self.smooth_model = smooth_model
-        if smooth_model == "debye":
-            assert cross_sections is not None and len(cross_sections) == len(lattices), \
-                "smooth_model 'debye' needs the cross-sections of each material"
-            self.debye = [DebyeTable(lamf, xs['mass'], temperature, device=device) for xs in cross_sections]
-            self.debye_bound = [float(xs['sigma_bound']) for xs in cross_sections]
-            # absorption (1 / velocity, so proportional to lam) and incoherent parts, per material (Kf,)
-            self.debye_linear = [torch.as_tensor(xs['sigma_abs'] * lamf / ABS_REF_WAVELENGTH + xs['sigma_inc'], **f64)
-                                 for xs in cross_sections]
-            self.B = None; self.n_smooth = 2                                           # amplitude, log Debye temperature
-        else:
-            assert smooth_model == "legendre", smooth_model
-            t = 2 * (lamf - lamf[0]) / (lamf[-1] - lamf[0]) - 1
-            B = legendre_columns(t, smooth_degree)
-            self.B = torch.as_tensor(B, device=device, dtype=dtype); self.n_smooth = B.shape[1]
-            # the curvature penalty's matrix: second derivatives in x = lam / lam_ref over the measured range, times
-            # sqrt(dx), so that |B_curv b|^2 is the integral of the squared curvature
-            x = lamf / float(lam.mean()); dx = float(x[1] - x[0])
-            inner = ((lamf >= lo[0]) & (lamf <= hi[-1]))[1:-1]
-            d2 = (B[2:] - 2 * B[1:-1] + B[:-2]) / dx ** 2
-            self.B_curv = torch.as_tensor(d2[inner] * math.sqrt(dx), device=device, dtype=torch.float64)
+        t = 2 * (lamf - lamf[0]) / (lamf[-1] - lamf[0]) - 1
+        B = legendre_columns(t, smooth_degree)
+        self.B = torch.as_tensor(B, device=device, dtype=dtype); self.n_smooth = B.shape[1]
+        # the curvature penalty's matrix: second derivatives in x = lam / lam_ref over the measured range, times
+        # sqrt(dx), so that |B_curv b|^2 is the integral of the squared curvature
+        x = lamf / float(lam.mean()); dx = float(x[1] - x[0])
+        inner = ((lamf >= lo[0]) & (lamf <= hi[-1]))[1:-1]
+        d2 = (B[2:] - 2 * B[1:-1] + B[:-2]) / dx ** 2
+        self.B_curv = torch.as_tensor(d2[inner] * math.sqrt(dx), device=device, dtype=torch.float64)
         self.R = len(lattices); self.J = n_contam
         self.mats = []
         for lt, (a_lo, a_hi) in lattices:
@@ -378,10 +355,6 @@ class Hybrid2:
         for m, sl in zip(self.mats, self.slices):
             lb[sl["a"]], ub[sl["a"]] = m["a_range"]
             lb[sl["h"][0]:sl["h"][1]] = 0.0
-            if smooth_model == "debye":                       # c0, c1 held at 0; scale >= 0; Debye temperature in the table
-                lb[sl["c"][0]:sl["c"][1]] = 0.0; ub[sl["c"][0]:sl["c"][1]] = 0.0
-                lb[sl["s"][0]] = 0.0
-                lb[sl["s"][0] + 1], ub[sl["s"][0] + 1] = math.log(THETA_MIN), math.log(THETA_MAX)
             # per-reflection first-order shape (extinction, texture): t in [-1, 1] keeps the term >= 0 below the edge
             lb[sl["t"][0]:sl["t"][1]] = -1.0 if edge_slope else 0.0
             ub[sl["t"][0]:sl["t"][1]] = 1.0 if edge_slope else 0.0
@@ -444,8 +417,7 @@ class Hybrid2:
             xp = g[sl["x"][0]:sl["x"][1]]
             c = g[sl["c"][0]:sl["c"][1]]; s = g[sl["s"][0]:sl["s"][1]]
             e = 2.0 * a / torch.sqrt(m["ns"])
-            smooth = c[0] + c[1] * x + (self.B.double() @ s if self.B is not None
-                                        else s[0] * (self.debye_linear[r] + self.debye_bound[r] * self.debye[r](s[1])))
+            smooth = c[0] + c[1] * x + self.B.double() @ s
             if eps is None:
                 step = ((e[None, :] - (self.lamf[:, None] - 0.5 * self.hf)) / self.hf).clamp(0, 1)
                 shape = 1 + t[None, :] * (self.lamf[:, None] - e[None, :]) / e[None, :]          # (Kf, n_e)
@@ -784,8 +756,6 @@ class FitB:
         tot = 0.0
         scale = getattr(self, "spline_scale", None)
         for r, sl in enumerate(self.M.slices):
-            if self.M.smooth_model != "legendre":                           # a physical term: no penalty
-                break
             b = g[sl["s"][0]:sl["s"][1]]
             w = self.ridge * LEGENDRE_CURVATURE * (1.0 if scale is None else float(scale[r]))
             tot = tot + w * ((self.M.B_curv @ b.double()) ** 2).sum()
@@ -810,8 +780,6 @@ class FitB:
         with torch.no_grad():
             for key in ("h", "c", "s"):
                 self.g[sl[key][0]:sl[key][1]] *= factor
-            if M.smooth_model == "debye":                                       # the Debye temperature is not a scale
-                self.g[sl["s"][0] + 1] /= factor
             for j in range(M.J):
                 self.g[M.kap_sl[0] + j * M.R + r] *= factor
             if getattr(self, "spline_scale", None) is None:
@@ -1462,9 +1430,7 @@ def _projected_newton_mixed(V, grad, F, row_loss, nonneg):
 # ================================================================================================ starting values
 def ls_init_material(M, g, r, target, a0):
     """Material r's starting coefficients (heights >= 0, c0, c1 and the smooth block) by bounded least squares of its
-    instrument-smoothed spectrum on `target` (a spectrum on the measured bins), at lattice parameter a0. With
-    smooth_model 'debye' the Debye temperature is held at DEBYE_THETA_START and the term's scale (>= 0) is fitted.
-    Writes into g (in place) and returns the residual rms."""
+    instrument-smoothed spectrum on `target` (a spectrum on the measured bins), at lattice parameter a0. Writes into g (in place) and returns the residual rms."""
     from scipy.optimize import lsq_linear
     sl = M.slices[r]
     g[sl['a']] = a0
@@ -1475,23 +1441,12 @@ def ls_init_material(M, g, r, target, a0):
         e = 2 * a0 / np.sqrt(M.mats[r]['ns'].cpu().numpy())
         step = np.clip((e[None, :] - (lamf[:, None] - 0.5 * hf)) / hf, 0, 1)
         ne = len(e)
-        if M.smooth_model == "debye":
-            # the physical smooth part at the starting Debye temperature, its scale >= 0 fitted with the heights
-            ph = (M.debye_linear[r] + M.debye_bound[r] * M.debye[r](torch.tensor(math.log(DEBYE_THETA_START), dtype=torch.float64,
-                                                                                  device=M.lamf.device))).cpu().numpy()
-            Dfine = np.concatenate([(x * x)[:, None] * step, ph[:, None]], 1)
-            A = Rt @ Dfine
-            sol = lsq_linear(A, np.asarray(target, dtype=np.float64), bounds=(np.zeros(ne + 1), np.inf))
-            g[sl['s'][0]] = float(sol.x[ne]); g[sl['s'][0] + 1] = math.log(DEBYE_THETA_START)
-            rms = float(np.sqrt(np.mean((A @ sol.x - target) ** 2)))
-            sol.x = np.concatenate([sol.x[:ne], [0.0, 0.0], sol.x[ne:]])
-        else:
-            Dfine = np.concatenate([(x * x)[:, None] * step, np.ones((M.Kf, 1)), x[:, None], M.B.double().cpu().numpy()], 1)
-            A = Rt @ Dfine
-            sol = lsq_linear(A, np.asarray(target, dtype=np.float64),
-                             bounds=(np.concatenate([np.zeros(ne), -np.inf * np.ones(2 + M.n_smooth)]), np.inf))
-            g[sl['s'][0]:sl['s'][1]] = torch.as_tensor(sol.x[ne + 2:])
-            rms = float(np.sqrt(np.mean((A @ sol.x - target) ** 2)))
+        Dfine = np.concatenate([(x * x)[:, None] * step, np.ones((M.Kf, 1)), x[:, None], M.B.double().cpu().numpy()], 1)
+        A = Rt @ Dfine
+        sol = lsq_linear(A, np.asarray(target, dtype=np.float64),
+                         bounds=(np.concatenate([np.zeros(ne), -np.inf * np.ones(2 + M.n_smooth)]), np.inf))
+        g[sl['s'][0]:sl['s'][1]] = torch.as_tensor(sol.x[ne + 2:])
+        rms = float(np.sqrt(np.mean((A @ sol.x - target) ** 2)))
         g[sl['h'][0]:sl['h'][1]] = torch.as_tensor(sol.x[:ne])
         g[sl['c'][0]:sl['c'][1]] = torch.as_tensor(sol.x[ne:ne + 2])
         return rms
