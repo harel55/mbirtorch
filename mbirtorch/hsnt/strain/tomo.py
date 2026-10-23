@@ -1247,7 +1247,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     starts as a random powder. shape_model='cubic4' gives each cubic material its lowest-order texture instead (9
     coefficients, linear; model.harmonics4), also starting as a random powder. per_bin_dispersion=True divides the dose
     by each bin's measured dispersion (noise.noise_statistics' dispersion_per_bin) instead of the overall one; it needs
-    noise='measure'."""
+    noise='measure'. smooth_model='debye' replaces each spectrum's spline with the physical phonon term (model.Hybrid2;
+    masses: each material's mean atomic mass in amu; temperature: the sample's, in K)."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
