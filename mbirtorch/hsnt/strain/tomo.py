@@ -25,7 +25,7 @@ import time
 import numpy as np
 import torch
 
-from .model import Hybrid2, FitB, ls_init_material
+from .model import DEBYE_TEMPERATURE_DEFAULT, Hybrid2, FitB, ls_init_material
 from .bragg import warm_start, BraggSpectrum
 from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
@@ -1221,7 +1221,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='corner',
-           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False):
+           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, smooth_model='spline', masses=None,
+           temperature=DEBYE_TEMPERATURE_DEFAULT):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1294,7 +1295,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', n_spline=8, n_contam=2,
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
     M = Hybrid2(lam, d, lats, n_spline=n_spline, n_contam=n_contam, device=device, two_scale=True, kernel=kernel,
-                shape_model=shape_model)
+                shape_model=shape_model, smooth_model=smooth_model, masses=masses, temperature=temperature)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     if kernel_values is not None:                       # a calibrated kernel, held fixed
