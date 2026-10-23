@@ -638,11 +638,12 @@ def _small_fit_debye(monkeypatch, seed=0):
     monkeypatch.setattr(phonons, 'BETA_POINTS', 60); monkeypatch.setattr(phonons, '_TABLES', {})
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_contam=1, device='cpu',
-                two_scale=True, dtype=torch.float64, smooth_model='debye', masses=[55.845])
+                two_scale=True, dtype=torch.float64, smooth_model='debye',
+                cross_sections=[dict(mass=55.845, sigma_abs=2.56, sigma_inc=0.4, sigma_bound=11.62)])
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
-    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2; g[sl['c'][0] + 1] = 0.1
-    g[sl['s'][0]] = 1.0; g[sl['s'][0] + 1] = math.log(430.0)
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3
+    g[sl['s'][0]] = 0.05; g[sl['s'][0] + 1] = math.log(430.0)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     gen = torch.Generator().manual_seed(seed)
     P = 40
@@ -655,15 +656,16 @@ def _small_fit_debye(monkeypatch, seed=0):
 
 
 def test_debye_smooth_model(monkeypatch):
-    """smooth_model 'debye': the phonon term enters the spectrum, global_grad equals global_system's gradient for its
-    parameters, the starting fit runs, and rescaling a material leaves its Debye temperature alone."""
+    """smooth_model 'debye': the physical smooth part enters the spectrum, c0 and c1 are held at 0, global_grad equals
+    global_system's gradient for its parameters, the starting fit runs, and rescaling a material leaves its Debye
+    temperature alone."""
     from mbirtorch.hsnt.strain.model import ls_init_material
     fit = _small_fit_debye(monkeypatch)
     M = fit.M; sl = M.slices[0]
     g0 = fit.g.clone(); g0[sl['s'][0]] = 0.0
     assert float((M.spectra(fit.g) - M.spectra(g0)).abs().max()) > 1e-3                 # the term is not zero
     idx = [i for i in range(M.n_global) if not (M.res_sl[0] <= i < M.res_sl[1]) and float(M.ub[i]) > float(M.lb[i])]
-    assert sl['s'][0] + 1 in idx                                                         # the Debye temperature is free
+    assert sl['s'][0] + 1 in idx and sl['c'][0] not in idx and sl['c'][0] + 1 not in idx   # theta free, c0 and c1 held
     g1, _ = fit.global_system(idx)
     g2 = fit.global_grad(idx)
     assert torch.allclose(g1, g2, rtol=1e-6, atol=1e-8 * float(g1.abs().max()))
@@ -671,7 +673,7 @@ def test_debye_smooth_model(monkeypatch):
     theta = float(fit.g[sl['s'][0] + 1])
     fit.rescale_material(0, 2.0)
     assert abs(float(fit.g[sl['s'][0] + 1]) - theta) < 1e-12
-    g = g0.clone(); g[sl['s'][0]] = 1.0; g[sl['s'][0] + 1] = math.log(430.0)
+    g = g0.clone(); g[sl['s'][0]] = 0.05; g[sl['s'][0] + 1] = math.log(430.0)
     tgt = np.interp(M.lam.cpu().numpy(), M.lamf.cpu().numpy(), M.spectra(g)[0].cpu().numpy())
     g_init = g.clone(); g_init[sl['s'][0]] = 0.0
     rms = ls_init_material(M, g_init, 0, tgt, 2.8665)

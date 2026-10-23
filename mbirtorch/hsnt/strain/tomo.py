@@ -1221,7 +1221,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, eq_stencil='corner',
-           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, smooth_model='legendre', masses=None,
+           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, smooth_model='legendre', cross_sections=None,
            temperature=DEBYE_TEMPERATURE_DEFAULT):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
@@ -1248,7 +1248,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     coefficients, linear; model.harmonics4), also starting as a random powder. per_bin_dispersion=True divides the dose
     by each bin's measured dispersion (noise.noise_statistics' dispersion_per_bin) instead of the overall one; it needs
     noise='measure'. smooth_model='debye' uses the physical phonon term for each spectrum's smooth part instead of the Legendre polynomial (model.Hybrid2;
-    masses: each material's mean atomic mass in amu; temperature: the sample's, in K)."""
+    cross_sections: each material's mass and tabulated cross-sections, as model.Hybrid2 takes them; temperature: the
+    sample's, in K)."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -1290,13 +1291,13 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     assert all(np.isfinite(cost[i, j]) for i, j in enumerate(order)), (found, lattices)
     targets = []
     for (lt, ar), th in zip(found, thetas):
-        tgt = BraggSpectrum(lam, lattice=lt, a_range=ar, n_spline=8, resolution=resolution)(th.cpu()).detach().numpy()
+        tgt = BraggSpectrum(lam, lattice=lt, a_range=ar, resolution=resolution)(th.cpu()).detach().numpy()
         targets.append(tgt / max(np.abs(tgt).mean(), 1e-12) * float(np.abs(H0).mean()))
     targets = np.stack(targets)
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
     M = Hybrid2(lam, d, lats, smooth_degree=smooth_degree, n_contam=n_contam, device=device, two_scale=True, kernel=kernel,
-                shape_model=shape_model, smooth_model=smooth_model, masses=masses, temperature=temperature)
+                shape_model=shape_model, smooth_model=smooth_model, cross_sections=cross_sections, temperature=temperature)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     if kernel_values is not None:                       # a calibrated kernel, held fixed

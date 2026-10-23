@@ -4,8 +4,9 @@ A polycrystalline material's linear attenuation over wavelength is, for an ideal
 lattice-plane family hkl contributes lambda^2 * height below lambda = 2 d_hkl and nothing above), absorption linear in
 lambda, a near-constant incoherent term and a smooth inelastic term. This module parametrises a material by its
 lattice parameter (which fixes every edge position), free nonnegative edge heights (which absorb structure factors,
-multiplicity, Debye-Waller, texture and extinction), a linear absorption term, a constant, and a penalised B-spline
-residual for whatever is smooth and unmodelled. Edges are smoothed steps whose width stands for the instrument's
+multiplicity, Debye-Waller, texture and extinction), a linear absorption term, a constant, and a penalised polynomial
+residual (Legendre terms above the linear one, so it cannot trade with the constant and absorption terms) for whatever
+is smooth and unmodelled. Edges are smoothed steps whose width stands for the instrument's
 resolution (a Gaussian kernel applied to the attenuation, exact only when the kernel is narrow relative to the edge
 contrast; the polychromatic forward model that applies it to the transmission is a later stage).
 
@@ -102,32 +103,54 @@ def edge_profile(lam, edges, sigma, tau):
     return gauss
 
 
-def _bspline_basis(lam, n_knots, degree=3):
-    """Cubic B-spline design matrix (K x n_basis) with equally spaced interior knots over the wavelength range."""
-    from scipy.interpolate import BSpline
-    lo, hi = float(lam.min()), float(lam.max())
-    inner = np.linspace(lo, hi, n_knots)
-    t = np.concatenate([[lo] * degree, inner, [hi] * degree])
-    return np.asarray(BSpline.design_matrix(np.asarray(lam, dtype=float), t, degree).todense())
+SMOOTH_DEGREE = 8                    # the residual polynomial's degree (its terms above the linear one are free)
+SMOOTH_CURVATURE = (2 / 7) ** 3      # its curvature penalty: the B-spline penalty it replaces (8 knots, unit weight on
+                                     # second differences of the coefficients) for the same curve, per unit ridge
+SMOOTH_MAGNITUDE = 1e-2              # a small ridge on its coefficients, as the B-spline penalty had
+SMOOTH_PENALTY_POINTS = 2001         # points of the curvature integral
+
+
+def legendre_columns(x, degree):
+    """Legendre polynomials P2 .. P(degree) at x in [-1, 1], as columns (len(x), degree - 1). The constant and linear terms
+    are left out: the models carry them separately."""
+    P = [np.ones_like(x), x]
+    for k in range(1, degree):
+        P.append(((2 * k + 1) * x * P[k] - k * P[k - 1]) / (k + 1))
+    return np.stack(P[2:degree + 1], 1) if degree >= 2 else np.zeros((len(x), 0))
+
+
+def _smooth_basis(lam, degree):
+    """The residual's basis (K x (degree - 1)): Legendre P2 .. P(degree) over the wavelength range."""
+    lam = np.asarray(lam, dtype=float)
+    return legendre_columns(2 * (lam - lam.min()) / (lam.max() - lam.min()) - 1, degree)
+
+
+def _smooth_penalty(degree):
+    """The residual's penalty matrix ((degree - 1) x (degree - 1)): SMOOTH_CURVATURE x the integral over [-1, 1] of the
+    product of two terms' second derivatives, plus SMOOTH_MAGNITUDE x the identity."""
+    t = np.linspace(-1, 1, SMOOTH_PENALTY_POINTS); dt = t[1] - t[0]
+    B = legendre_columns(t, degree); d2 = (B[2:] - 2 * B[1:-1] + B[:-2]) / dt ** 2
+    return SMOOTH_CURVATURE * (d2.T @ d2) * dt + SMOOTH_MAGNITUDE * np.eye(B.shape[1])
 
 
 class BraggSpectrum:
     """One material's spectrum on a wavelength grid, as a differentiable function of its parameters.
 
-    theta = (a, heights[n_edges_max], c0, c_abs, spline[n_spline]) as one torch vector. The edge count follows from
+    theta = (a, heights[n_edges_max], c0, c_abs, smooth[n_smooth]) as one torch vector. The edge count follows from
     the lattice parameter, so `n_edges_max` slots are allocated for the largest a in the search range and slots
     whose edge falls outside the grid are inactive. Heights, c0 and c_abs are kept nonnegative by squaring the raw
-    parameters; the spline residual is free but ridge-penalised (see `penalty`).
+    parameters; the smooth residual (a polynomial above the linear term) is free but penalised (see `penalty`).
     """
 
-    def __init__(self, lam, lattice="fcc", a_range=(3.0, 4.6), n_spline=16, resolution=(0.0, 0.0), min_width=None):
+    def __init__(self, lam, lattice="fcc", a_range=(3.0, 4.6), smooth_degree=SMOOTH_DEGREE, resolution=(0.0, 0.0), min_width=None):
         self.lam = torch.as_tensor(np.asarray(lam, dtype=np.float64))
         self.lattice = lattice
         self.a_range = a_range
         self.ns_all, _ = reflections(lattice, a_range[1], float(self.lam.min()), float(self.lam.max()) * a_range[1] / a_range[0] + 1e-9)
         self.n_edges = len(self.ns_all)
-        self.S = torch.as_tensor(_bspline_basis(self.lam.numpy(), n_spline))           # (K, n_spline)
-        self.n_spline = self.S.shape[1]
+        self.S = torch.as_tensor(_smooth_basis(self.lam.numpy(), smooth_degree))       # (K, n_smooth)
+        self.n_smooth = self.S.shape[1]
+        self.Pen = torch.as_tensor(_smooth_penalty(smooth_degree))                     # (n_smooth, n_smooth)
         self.resolution = tuple(float(v) for v in resolution)                        # (sigma / lam, tau / lam) of the edge profile
         bin_w = float((self.lam[1:] - self.lam[:-1]).mean())
         self.min_width = 0.5 * bin_w if min_width is None else min_width
@@ -135,7 +158,7 @@ class BraggSpectrum:
 
     @property
     def n_params(self):
-        return 1 + self.n_edges + 2 + self.n_spline
+        return 1 + self.n_edges + 2 + self.n_smooth
 
     def split(self, theta):
         a = theta[0]
@@ -167,15 +190,14 @@ class BraggSpectrum:
         return coherent + smooth
 
     def penalty(self, theta, ridge):
-        """Ridge on the spline's second differences: keeps the residual smooth and small so it does not absorb the
-        lambda^2 rise that belongs to the Bragg term."""
+        """The smooth residual's penalty (curvature and a small ridge): keeps it smooth and small so it does not absorb
+        the lambda^2 rise that belongs to the Bragg term."""
         spl = self.split(theta)[4]
-        d2 = spl[2:] - 2 * spl[1:-1] + spl[:-2]
-        return ridge * ((d2 * d2).sum() + 1e-2 * (spl * spl).sum())
+        return ridge * (spl @ (self.Pen.to(spl.device, spl.dtype) @ spl))
 
     def design_t(self, a):
-        """For a fixed lattice parameter the spectrum is LINEAR in (heights, c0, c_abs, spline): that design matrix
-        (K x (n_edges + 2 + n_spline)) as a tensor on the model's device."""
+        """For a fixed lattice parameter the spectrum is LINEAR in (heights, c0, c_abs, smooth residual): that design matrix
+        (K x (n_edges + 2 + n_smooth)) as a tensor on the model's device."""
         with torch.no_grad():
             e = self.edges(torch.as_tensor(float(a), dtype=torch.float64))
             step = self.steps(e)
@@ -188,7 +210,7 @@ class BraggSpectrum:
         return self.design_t(a).cpu().numpy()
 
     def pack(self, a, lin):
-        """theta from a lattice parameter and the linear coefficients (heights, c0, c_abs, spline), inverting the squares."""
+        """theta from a lattice parameter and the linear coefficients (heights, c0, c_abs, smooth residual), inverting the squares."""
         lin = np.asarray(lin, dtype=np.float64)
         nn = 2 + self.n_edges
         return torch.as_tensor(np.concatenate([[a], np.sqrt(np.clip(lin[:nn], 0, None)), lin[nn:]]), dtype=torch.float64)
@@ -199,20 +221,19 @@ def fit_spectrum(model, target, weights=None, a_grid=None, ridge=1e-3, refine_st
 
     The lattice parameter enters non-convexly (an edge more than a resolution width off sees no gradient toward its
     place), so it is scanned on a grid; at each value the remaining parameters are linear and solved by bounded least
-    squares (heights, c0, c_abs >= 0; spline free with a ridge). The best grid point is refined by a golden-section
+    squares (heights, c0, c_abs >= 0; the smooth residual free with its penalty). The best grid point is refined by a golden-section
     search. Returns (theta, fit, a, residual_rms)."""
     from scipy.optimize import lsq_linear
     t = np.asarray(target, dtype=np.float64)
     w = np.ones_like(t) if weights is None else np.sqrt(np.asarray(weights, dtype=np.float64))
     nn = model.n_edges + 2
-    ridge_rows = np.sqrt(ridge) * np.eye(model.n_spline)
-    D2 = np.diff(np.eye(model.n_spline), 2, axis=0) * np.sqrt(ridge * 10)
+    pen_rows = np.sqrt(ridge) * np.linalg.cholesky(model.Pen.numpy()).T                  # |pen_rows s|^2 = penalty
 
     def solve(a):
         A = model.design(a)
-        Aw = np.vstack([w[:, None] * A, np.hstack([np.zeros((model.n_spline, nn)), ridge_rows]), np.hstack([np.zeros((D2.shape[0], nn)), D2])])
-        bw = np.concatenate([w * t, np.zeros(model.n_spline + D2.shape[0])])
-        lb = np.concatenate([np.zeros(nn), -np.inf * np.ones(model.n_spline)])
+        Aw = np.vstack([w[:, None] * A, np.hstack([np.zeros((model.n_smooth, nn)), pen_rows])])
+        bw = np.concatenate([w * t, np.zeros(model.n_smooth)])
+        lb = np.concatenate([np.zeros(nn), -np.inf * np.ones(model.n_smooth)])
         res = lsq_linear(Aw, bw, bounds=(lb, np.inf), lsmr_tol="auto", max_iter=200)
         fit = A @ res.x
         return float(np.sqrt(np.mean((w * (fit - t)) ** 2))), res.x, fit
@@ -240,10 +261,10 @@ def _h_statistics(W, H, T, prep):
     return W.T @ G, (W[:, rows] * W[:, cols]).T @ Z, rows, cols
 
 
-def _scan_correlation(Q, lam, lattice, a_values, n_spline, min_width, S_spline, device, chunk=192):
+def _scan_correlation(Q, lam, lattice, a_values, min_width, S_smooth, device, chunk=192):
     """Canonical correlation between the row space (orthonormal Q, K x R) and the Bragg model space of `lattice` at
     each parameter in a_values, batched on `device`. The model space for a fixed a is the span of the design matrix
-    (edge steps times lambda^2, 1, lambda, spline); its rank-revealing basis comes from a batched SVD so inactive edge
+    (edge steps times lambda^2, 1, lambda, the smooth residual's basis); its rank-revealing basis comes from a batched SVD so inactive edge
     slots do not inflate it. Returns (sigma_1 per a, the row-space direction per a as (G, K))."""
     lam_t = torch.as_tensor(lam, dtype=torch.float64, device=device); K = lam_t.numel()
     Qt = torch.as_tensor(Q, dtype=torch.float64, device=device)
@@ -253,7 +274,7 @@ def _scan_correlation(Q, lam, lattice, a_values, n_spline, min_width, S_spline, 
         return np.zeros(len(a_values)), np.zeros((len(a_values), K))
     ns_t = torch.as_tensor(ns_all, dtype=torch.float64, device=device)
     fixed = torch.cat([torch.ones(K, 1, dtype=torch.float64, device=device), lam_t[:, None] / lam_t[0],
-                       torch.as_tensor(S_spline, dtype=torch.float64, device=device)], 1)                 # (K, 2 + n_spline)
+                       torch.as_tensor(S_smooth, dtype=torch.float64, device=device)], 1)                 # (K, 2 + n_smooth)
     sig, dirs = [], []
     for c0 in range(0, len(a_values), chunk):
         a = torch.as_tensor(np.asarray(a_values[c0:c0 + chunk]), dtype=torch.float64, device=device)   # (G,)
@@ -275,7 +296,7 @@ def _scan_correlation(Q, lam, lattice, a_values, n_spline, min_width, S_spline, 
 
 
 def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"), a_range=(2.0, 7.0), lattices=None,
-               resolution=None, ridge=1.0, n_spline=8, polish=2, free_ratio=4.0, free_floor=5e-3, device=None, verbose=False):
+               resolution=None, ridge=1.0, smooth_degree=SMOOTH_DEGREE, polish=2, free_ratio=4.0, free_floor=5e-3, device=None, verbose=False):
     """Bragg parameters for the crystalline components, discovered from the row space of a bilinear factorization.
 
     Nothing is assumed about the materials: each component's lattice type and parameter are found from the data.
@@ -314,12 +335,12 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
     lam = np.asarray(lam, dtype=np.float64); K = lam.size; bin_w = float(np.median(np.diff(lam)))
     Q, _ = np.linalg.qr(Hr.T)                                                         # orthonormal basis of the row space
     n_bragg = Hr.shape[0] if n_bragg is None else int(n_bragg)
-    S_spline = _bspline_basis(lam, n_spline)
+    S_smooth = _smooth_basis(lam, smooth_degree)
     res0 = (0.0, 0.0) if resolution is None else tuple(float(v) for v in resolution)
     sharp_w = max(res0[0] * float(lam.mean()), 0.5 * bin_w)                         # Gaussian scan width (tail ignored in the scan)
     searches = [(lt, ar) for lt, ar in lattices] if lattices is not None else [(lt, tuple(a_range)) for lt in lattice_types]
     candidates = []
-    scan = lambda lt, a_values, width: _scan_correlation(Q, lam, lt, np.asarray(a_values, dtype=np.float64), n_spline, width, S_spline, "cpu")
+    scan = lambda lt, a_values, width: _scan_correlation(Q, lam, lt, np.asarray(a_values, dtype=np.float64), width, S_smooth, "cpu")
     for lt, (lo, hi) in searches:
         # coarse scan with edges smoothed to a few bins, so the correlation peaks are wider than the grid spacing
         grid = np.geomspace(lo, hi, int(np.log(hi / lo) / 0.001) + 2)
@@ -353,7 +374,7 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
     # bcc/fcc, a superset type) always correlates at least as well; with heights kept >= 0 the extra slots buy
     # almost nothing, and the edge-count penalty n ln K then favours the smaller edge set.
     for c in candidates[:4 * n_bragg + 4]:
-        m = BraggSpectrum(lam, lattice=c["type"], a_range=(c["a"] * 0.995, c["a"] * 1.005), n_spline=n_spline, resolution=res0)
+        m = BraggSpectrum(lam, lattice=c["type"], a_range=(c["a"] * 0.995, c["a"] * 1.005), smooth_degree=smooth_degree, resolution=res0)
         target = np.clip(c["y"], 0, None); target /= max(target.max(), 1e-12)
         theta, fit, a, e = fit_spectrum(m, target, a_grid=np.array([c["a"]]), ridge=ridge, refine_steps=0)   # a is already refined
         c["fit_rms"] = max(e, 1e-12)
@@ -412,7 +433,7 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
         for sig_rel in np.concatenate([[0.0], np.geomspace(2e-4, 2e-2, 10)]):
             tot = 0.0
             for c in chosen:
-                m = BraggSpectrum(lam, lattice=c["type"], a_range=(c["a"] * 0.995, c["a"] * 1.005), n_spline=n_spline, resolution=(sig_rel, 0.0))
+                m = BraggSpectrum(lam, lattice=c["type"], a_range=(c["a"] * 0.995, c["a"] * 1.005), smooth_degree=smooth_degree, resolution=(sig_rel, 0.0))
                 target = np.clip(c["y"], 0, None); target /= max(target.max(), 1e-12)
                 tot += fit_spectrum(m, target, a_grid=np.array([c["a"]]), ridge=ridge, refine_steps=0)[3] ** 2
             if best is None or tot < best[0]:
@@ -424,7 +445,7 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
     for c in chosen:
         a = c["a"]; lo, hi = c["search"]
         rng = (max(lo, a * 0.98), min(hi, a * 1.02))
-        m = BraggSpectrum(lam, lattice=c["type"], a_range=rng, n_spline=n_spline, resolution=res)
+        m = BraggSpectrum(lam, lattice=c["type"], a_range=rng, smooth_degree=smooth_degree, resolution=res)
         target = np.clip(c["y"], 0, None); target /= max(target.max(), 1e-12)
         theta, fit, a, e = fit_spectrum(m, target, a_grid=np.array([a]), ridge=ridge, refine_steps=0)
         for _ in range(polish):
@@ -450,15 +471,14 @@ def _quadratic_step(models, a_vals, g, Msym, H_old, Rb, ridge, P, dev):
         b[off[r]:off[r + 1]] = D[r].T @ c[r]
         for q in range(Rb):
             A[off[r]:off[r + 1], off[q]:off[q + 1]] = D[r].T @ (Mb[:, r, q, None] * D[q])
-    for r, m in enumerate(models):                                                    # spline ridge, as in `penalty`
-        ns = m.n_spline; i0 = off[r + 1] - ns; I = torch.eye(ns, dtype=torch.float64, device=dev)
-        D2 = torch.diff(I, n=2, dim=0)
-        A[i0:off[r + 1], i0:off[r + 1]] += 2.0 * P * ridge * (D2.T @ D2 + 1e-2 * I)
+    for r, m in enumerate(models):                                                    # the residual's penalty, as in `penalty`
+        ns = m.n_smooth; i0 = off[r + 1] - ns; Pen = m.Pen.to(dev)
+        A[i0:off[r + 1], i0:off[r + 1]] += 2.0 * P * ridge * Pen
     A = A.cpu().numpy(); b = b.cpu().numpy()
     d = np.sqrt(np.clip(np.diag(A), 1e-300, None))
     As = A / d[:, None] / d[None, :]; bs = b / d
     L = np.linalg.cholesky(As + 1e-9 * np.eye(n))
-    lb = np.concatenate([np.concatenate([np.zeros(m.n_edges + 2), -np.inf * np.ones(m.n_spline)]) for m in models])
+    lb = np.concatenate([np.concatenate([np.zeros(m.n_edges + 2), -np.inf * np.ones(m.n_smooth)]) for m in models])
     res = lsq_linear(L.T, -np.linalg.solve(L, bs), bounds=(lb, np.inf), method="bvls", tol=1e-12)
     x = res.x / d
     return [x[off[r]:off[r + 1]] for r in range(Rb)], float(0.5 * x @ A @ x + b @ x)
@@ -527,13 +547,12 @@ def _profiled_system(models, a_vals, W, H, G, Z, x_cur, Rb, ridge, dev, chunk=32
         S_red += torch.einsum('prs,pri,psj->ij', Ainv, C, C)
         g_red += torch.einsum('prs,ps,pri->i', Ainv, gW, C)
         Ainv_chunks.append(Ainv); C_chunks.append(C); gW_chunks.append(gW)
-    for r, m in enumerate(models):                                                    # spline ridge, as in `penalty`
-        ns = m.n_spline; i0 = off[r + 1] - ns; I = torch.eye(ns, dtype=torch.float64, device=dev)
-        D2 = torch.diff(I, n=2, dim=0)
-        A[i0:off[r + 1], i0:off[r + 1]] += 2.0 * P * ridge * (D2.T @ D2 + 1e-2 * I)
-        g[i0:off[r + 1]] += 2.0 * P * ridge * ((D2.T @ D2 + 1e-2 * I) @ x0[i0:off[r + 1]])
+    for r, m in enumerate(models):                                                    # the residual's penalty, as in `penalty`
+        ns = m.n_smooth; i0 = off[r + 1] - ns; Pen = m.Pen.to(dev)
+        A[i0:off[r + 1], i0:off[r + 1]] += 2.0 * P * ridge * Pen
+        g[i0:off[r + 1]] += 2.0 * P * ridge * (Pen @ x0[i0:off[r + 1]])
     S = (A - S_red).cpu().numpy(); S = 0.5 * (S + S.T)
-    lb = np.concatenate([np.concatenate([np.zeros(m.n_edges + 2), -np.inf * np.ones(m.n_spline)]) for m in models])
+    lb = np.concatenate([np.concatenate([np.zeros(m.n_edges + 2), -np.inf * np.ones(m.n_smooth)]) for m in models])
     return dict(S=S, g=(g - g_red).cpu().numpy(), x0=x0.cpu().numpy(), off=off, lb=lb, Rb=Rb, free=free, chunk=chunk,
                 Ainv=Ainv_chunks, C=C_chunks, gW=gW_chunks, dev=dev, P=P, R=R)
 
@@ -569,7 +588,7 @@ def _profiled_solve(sys, damping):
 
 def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_maps=None, lattice_types=("fcc", "bcc", "diamond"),
                          a_range=(2.0, 7.0), lattices=None, thetas=None, H_free_init=None, W_init=None, max_outer=30,
-                         rel_tol=1e-6, w_max_steps=100, w_rel_tol=1e-8, ridge=1.0, n_spline=8, resolution=None,
+                         rel_tol=1e-6, w_max_steps=100, w_rel_tol=1e-8, ridge=1.0, smooth_degree=SMOOTH_DEGREE, resolution=None,
                          fit_resolution=True, lattice_bracket=0.002, free_ratio=4.0, verbose=False):
     """Fit n_bragg parametric Bragg spectra plus n_free nonparametric rows to T under the NNAL, assuming nothing about
     the materials: lattice types and parameters are discovered from the data (see `warm_start`).
@@ -586,7 +605,7 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
         lattice_types, a_range: the search space of the discovery (cubic types; a in Angstrom).
         lattices, thetas: optional explicit [(type, (a_lo, a_hi))] and initial parameters, bypassing the discovery.
         W_init: initial maps (pixels, R); default: convex solve with the initial spectra.
-        ridge, n_spline: the spline residual's size and ridge (relative to the pixel count); the defaults were tuned on
+        ridge, smooth_degree: the smooth residual's ridge and degree (relative to the pixel count); the defaults were tuned on
             the three-metal phantom, where a looser residual trades map fidelity for a slightly lower loss.
         resolution, fit_resolution: the edge profile's (sigma / lam, tau / lam), an exponentially modified Gaussian
             shared by all components (an instrument property, see `edge_profile`); None starts from the warm start's
@@ -616,17 +635,17 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
         n_bragg = rows_np.shape[0] - n_free if n_bragg is None else int(n_bragg)
         thetas, lattices, discovered, extra_free, resolution = warm_start(rows_np, lam_np, n_bragg=n_bragg, lattice_types=lattice_types,
                                                                           a_range=a_range, resolution=resolution, ridge=ridge,
-                                                                          n_spline=n_spline, free_ratio=free_ratio, device=dev, verbose=verbose)
+                                                                          smooth_degree=smooth_degree, free_ratio=free_ratio, device=dev, verbose=verbose)
         n_free += extra_free
     resolution = (0.0, 0.0) if resolution is None else tuple(float(v) for v in resolution)
-    models = [BraggSpectrum(lam_t.cpu(), lattice=l, a_range=ar, n_spline=n_spline, resolution=resolution) for l, ar in lattices]
+    models = [BraggSpectrum(lam_t.cpu(), lattice=l, a_range=ar, smooth_degree=smooth_degree, resolution=resolution) for l, ar in lattices]
     for m in models:
         m.lam = lam_t; m.S = m.S.to(dev)
     Rb = len(models); R = Rb + n_free
     if thetas is None and init_rows is not None:
         rows_np = np.asarray(init_rows, dtype=np.float64)
         thetas, _, _, _, resolution = warm_start(rows_np, lam_np, lattices=lattices, resolution=resolution, ridge=ridge,
-                                                 n_spline=n_spline, device=dev, verbose=verbose)
+                                                 smooth_degree=smooth_degree, device=dev, verbose=verbose)
         for m in models:
             m.resolution = resolution
         if n_free and H_free_init is None:
@@ -636,7 +655,7 @@ def hybrid_factorization(T, lam, n_bragg=None, n_free=0, init_rows=None, init_ma
             worst = np.argsort(-np.linalg.norm(resid, axis=1) / np.linalg.norm(rows_np, axis=1))[:n_free]
             H_free_init = torch.as_tensor(rows_np[worst])
     if thetas is None:
-        thetas = [m.pack(0.5 * (m.a_range[0] + m.a_range[1]), np.concatenate([0.05 * np.ones(m.n_edges), [0.05, 0.05], np.zeros(m.n_spline)])) for m in models]
+        thetas = [m.pack(0.5 * (m.a_range[0] + m.a_range[1]), np.concatenate([0.05 * np.ones(m.n_edges), [0.05, 0.05], np.zeros(m.n_smooth)])) for m in models]
     thetas = [th.to(dev, torch.float64).clone() for th in thetas]
     prep = _nnal_prep(T)
     P, K = T.shape
