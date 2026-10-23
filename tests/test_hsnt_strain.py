@@ -64,7 +64,7 @@ def test_ikeda_carpenter_kernel():
     """The Ikeda-Carpenter kernel's rows are normalized and a sharp edge keeps its 50% point (median centring)."""
     from mbirtorch.hsnt.strain.model import Hybrid2
     lam = np.linspace(1.9, 4.41, 1400)
-    M = Hybrid2(lam, np.ones_like(lam), [('fcc', (3.52 * 0.99, 3.52 * 1.01))], n_spline=4, n_contam=1, device='cpu',
+    M = Hybrid2(lam, np.ones_like(lam), [('fcc', (3.52 * 0.99, 3.52 * 1.01))], smooth_degree=5, n_contam=1, device='cpu',
                 two_scale=True, kernel='ikeda_carpenter')
     g = torch.zeros(M.n_global, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[0] + 6] = torch.tensor([0.0, 0.0008, 0.001, 0.0004, 1.6, 0.004], dtype=torch.float64)
@@ -143,7 +143,7 @@ def _small_fit(seed=0):
     """A small FitB on the CPU: one bcc material, per-ray dilations, one contamination component, counts from the model."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     lam = np.linspace(2.0, 4.4, 300)
-    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
                 device='cpu', two_scale=True, dtype=torch.float64)
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
@@ -233,35 +233,6 @@ def test_traction_faces_bonded_interface():
     assert float(t[3, 5, 3, 1, 0].abs().max()) > 0.0                                # material 1's free face (x = 5)
 
 
-def test_spike_phantom_equilibrium():
-    """The spike phantom's press-fit strain gives a stress with zero divergence inside each part (finite differences,
-    away from the interfaces); the parts' volume fractions add to at most 1; the parts' largest strain is SPIKE_PEAK."""
-    from scipy import ndimage as nd
-    from mbirtorch.hsnt.strain.phantom import spike_tensor, spike_fields, SPIKE_ELASTIC, SPIKE_MATERIALS, SPIKE_PEAK
-    N = 96                                       # fine enough that finite differences of the 1/r^2 field near the hole
-    #                                              stay well under the tolerance (1.25% of a voxel's jump at 64)
-    mat, eps = spike_tensor(N)
-    assert all(int((mat == r).sum()) > 0 for r in range(3))
-    frac, eps_parts = spike_fields(32)
-    assert abs(float(np.abs(eps_parts).max()) - SPIKE_PEAK) < 1e-12                # the peak, on the parts' own fields
-    assert float(frac.sum(-1).max()) <= 1 + 1e-12 and 0 < float(frac[..., 1].sum()) < float(frac[..., 2].sum())
-    sig = np.zeros_like(eps)
-    for r, m in enumerate(SPIKE_MATERIALS):
-        E, nu = SPIKE_ELASTIC[m['name']]; lam_, mu_ = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
-        sel = mat == r; tr = eps[..., :3].sum(-1)
-        for k in range(3):
-            sig[..., k] = np.where(sel, lam_ * tr + 2 * mu_ * eps[..., k], sig[..., k])
-        for k in (3, 4, 5):
-            sig[..., k] = np.where(sel, 2 * mu_ * eps[..., k], sig[..., k])
-    D = lambda a, ax: np.gradient(a, 1.0 / N, axis=ax)                        # volume axes (y, x, z)
-    sxx, syy, szz, sxy, syz, sxz = (sig[..., k] for k in range(6))
-    f = np.sqrt((D(sxx, 1) + D(sxy, 0) + D(sxz, 2)) ** 2 + (D(sxy, 1) + D(syy, 0) + D(syz, 2)) ** 2 + (D(sxz, 1) + D(syz, 0) + D(szz, 2)) ** 2)
-    jump = float(np.abs(sig).max()) * N                                        # a full stress jump over one voxel
-    for r in range(3):
-        interior = nd.binary_erosion(mat == r, iterations=2)
-        assert float(np.percentile(f[interior], 99)) < 1e-2 * jump
-
-
 def test_equilibrium_corner_stencil():
     """The corner stencil sees a stress alternating along one axis (invisible to central differences), gives the exact
     derivative of a linear stress, and still misses a pattern alternating along two axes (an hourglass mode)."""
@@ -343,17 +314,6 @@ def test_measure_noise_per_bin():
     assert np.all(per[302:308] == out['dispersion'])
 
 
-def test_fe_cube_offset():
-    """fe_cube_tensor's offset moves the cube and its strain by whole voxels when it is a multiple of 1 / N."""
-    from mbirtorch.hsnt.strain.phantom import fe_cube_tensor
-    N = 32
-    c0, e0 = fe_cube_tensor(N)
-    c1, e1 = fe_cube_tensor(N, 1.0 / N)
-    roll = lambda a: np.roll(np.roll(np.roll(a, 1, 0), 1, 1), 1, 2)
-    assert np.array_equal(roll(c0), c1)
-    assert np.allclose(roll(e0), e1)
-
-
 def test_measure_noise_dose_gaps():
     """Bins with a dose of zero (shutter gaps) are left out of the noise measurement."""
     from mbirtorch.hsnt.strain.noise import measure_noise
@@ -421,7 +381,7 @@ def test_spectra_float32():
     do their derivatives with respect to the dilation (what the strain is fitted from)."""
     from mbirtorch.hsnt.strain.model import Hybrid2
     lam = np.linspace(2.0, 4.4, 300)
-    mk = lambda dt: Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4,
+    mk = lambda dt: Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5,
                             n_contam=1, device='cpu', two_scale=True, dtype=dt)
     M32, M64 = mk(torch.float32), mk(torch.float64)
     g = torch.zeros(M64.n_global, dtype=torch.float64)
@@ -461,7 +421,7 @@ def _small_fit_texture(seed=0, strength=0.7, noise=True):
     views with their own beam directions, per-ray dilations, counts from the model (their means when noise is False)."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     lam = np.linspace(2.0, 4.4, 300)
-    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
                 device='cpu', two_scale=True, dtype=torch.float64, shape_model='texture3d')
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
@@ -546,7 +506,7 @@ def _small_fit_cubic4(seed=0, coeffs=None):
     with coefficients coeffs (default: a fiber about a tilted axis) on eight views."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
     lam = np.linspace(2.0, 4.4, 300)
-    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], n_spline=4, n_contam=1,
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
                 device='cpu', two_scale=True, dtype=torch.float64, shape_model='cubic4')
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
@@ -621,29 +581,6 @@ def test_cubic4_global_grad():
     assert bool((torch.diagonal(F) > 0).all())
 
 
-def test_fiber_texture_degree4():
-    """A cubic fiber texture (phantom.fiber_texture_factor) is 1 for a random powder and averages to 1 over beam
-    directions. Its edge factors are mostly of degree 4, and each reflection's degree-4 part is k4(hkl) times one
-    common function of the beam direction, which is the form of the cubic4 model."""
-    from mbirtorch.hsnt.strain.phantom import fe_spectrum_model, fiber_texture_factor
-    from mbirtorch.hsnt.strain.model import harmonics4, cubic_k4, _sphere_quadrature
-    lam = np.linspace(1.9, 4.4, 600)
-    M, g = fe_spectrum_model(lam, np.full_like(lam, 1000.0), 16, 'cpu', texture={'fiber': (0.75, 0.9, 0.4)})
-    pts, w = _sphere_quadrature(); M.view_dirs = pts.numpy(); w = w.numpy()      # beam directions: an exact quadrature
-    assert float((fiber_texture_factor(M, 0, 1.0, 0.9, 0.4) - 1).abs().max()) < 1e-12
-    F = fiber_texture_factor(M, 0, 0.75, 0.9, 0.4).double().numpy()
-    ns = M.mats[0]['ns'].numpy(); e = 2 * 0.5 * sum(M.mats[0]['a_range']) / np.sqrt(ns)
-    at = np.array([F[:, i, int(np.argmin(np.abs(M.lamf.numpy() - 0.999 * ee)))] for i, ee in enumerate(e)])
-    mean = at @ w
-    assert np.allclose(mean, 1.0, atol=0.01)
-    Y = harmonics4(pts).numpy()
-    c = (at - mean[:, None]) @ (w[:, None] * Y)                            # each edge's degree-4 coefficients
-    share = (c ** 2).sum(1) / (((at - mean[:, None]) ** 2) @ w)
-    assert share.min() > 0.8
-    ratio = c / np.array(cubic_k4('bcc', ns))[:, None]                    # the common degree-4 function, per edge
-    assert np.allclose(ratio, ratio.mean(0), atol=0.03 * np.abs(ratio).max())
-
-
 def test_fine_projector_set_mount():
     """A FineProjector whose mount is changed in place projects like one built with that mount, series by series, and
     reports the mount in voxels of the detector grid."""
@@ -691,53 +628,6 @@ def test_set_view_angles():
         for k in range(2):
             assert torch.allclose(P.project_series(k, vol).cpu(), Q.project_series(k, vol).cpu(), atol=1e-6)
         assert np.allclose(P.with_q(2).view_angle_extra[1], extra)
-
-
-def test_skin_stress_field():
-    """The skin phantom's stress (phantom.fe_cube_skin_stress) is in equilibrium inside the cube; on the faces the
-    traction is near zero while the in-plane stresses are not, and they exceed the mid-plane's."""
-    from mbirtorch.hsnt.strain.phantom import fe_cube_skin_stress
-    from scipy import ndimage as nd
-    cube, sig = fe_cube_skin_stress(32)
-    g = lambda a, ax: np.gradient(a, axis=ax)                               # axes: rows y, cols x, slices z
-    xx, yy, zz, xy, yz, xz = [sig[..., k] for k in range(6)]
-    div = [g(xx, 1) + g(xy, 0) + g(xz, 2), g(xy, 1) + g(yy, 0) + g(yz, 2), g(xz, 1) + g(yz, 0) + g(zz, 2)]
-    deep = nd.binary_erosion(cube, iterations=2)
-    assert max(np.abs(d)[deep].max() for d in div) < 0.05 * np.abs(g(xx, 1))[deep].max()
-    c0 = np.where(cube.any((0, 2)))[0][0]; face = cube[:, c0, :]; peak = np.abs(sig[cube]).max()
-    traction = max(np.abs(sig[:, c0, :, k][face]).mean() for k in (0, 3, 5)) / peak
-    inplane = max(np.abs(sig[:, c0, :, k][face]).mean() for k in (1, 2)) / peak
-    mid = cube[:, 16, :]; inplane_mid = max(np.abs(sig[:, 16, :, k][mid]).mean() for k in (1, 2)) / peak
-    assert traction < 0.05 and inplane > 3 * traction and inplane > 1.5 * inplane_mid
-
-
-def test_diffraction_constants():
-    """For an isotropic crystal every reflection's diffraction constants are -nu/E and (1 + nu)/E. For Fe the Hill
-    moduli match the package's Fe values, and 200 responds about 35% more than 110 to a uniaxial stress."""
-    from mbirtorch.hsnt.strain.phantom import diffraction_constants, hill_moduli, FE_SINGLE_CRYSTAL, FE_ELASTIC
-    E, nu = FE_ELASTIC
-    iso = (E * (1 - nu) / ((1 + nu) * (1 - 2 * nu)), E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu)))
-    for gm in (0.0, 0.25, 1 / 3):
-        s1, hs2 = diffraction_constants(iso, gm)
-        assert np.isclose(s1, -nu / E) and np.isclose(hs2, (1 + nu) / E)
-    Eh, nuh = hill_moduli(FE_SINGLE_CRYSTAL)
-    assert abs(Eh / E - 1) < 0.01 and abs(nuh - nu) < 0.01
-    r200, r110 = [sum(diffraction_constants(FE_SINGLE_CRYSTAL, gm)) for gm in (0.0, 0.25)]
-    assert 1.25 < r200 / r110 < 1.45
-
-
-def test_anisotropic_phantom_isotropic_limit(monkeypatch):
-    """With isotropic single-crystal constants, the anisotropic phantom (one component per reflection group, the smooth
-    part added once) reproduces the standard phantom's data. The cube is shifted off the grid's symmetry, as in the
-    phantom runs: a symmetric cube puts many voxels' strains exactly between two levels, where rounding picks either."""
-    import mbirtorch.hsnt.strain.phantom as P
-    E, nu = P.FE_ELASTIC
-    monkeypatch.setattr(P, 'FE_SINGLE_CRYSTAL', (E * (1 - nu) / ((1 + nu) * (1 - 2 * nu)), E * nu / ((1 + nu) * (1 - 2 * nu)),
-                                                 E / (2 * (1 + nu))))
-    kw = dict(n=8, angles=np.linspace(0, np.pi, 4), fine=2, device='cpu', levels=7, kernel='ikeda_carpenter',
-              kernel_values=[0, 0.00118, 0.00039, 0.00059, 0, 0.0002, 0, 0], contamination=False, cube_shift=0.25)
-    a = P.make_fe_cube(**kw); b = P.make_fe_cube(**kw, elastic_anisotropy=True)
-    assert float((a['T'] == b['T']).double().mean()) > 0.9999
 
 
 def _small_fit_debye(monkeypatch, seed=0):

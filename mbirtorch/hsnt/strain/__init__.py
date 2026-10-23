@@ -8,5 +8,7 @@ may change.
 - ``model``: the hybrid spectral model (``Hybrid2``) and its per-ray fit (``FitB``).
 - ``geometry``: beam directions and strain-component weights of the views.
 - ``tomo``: projectors for one or several rotation series and the tomographic fit (``TomoFit``, ``warmup``).
-- ``phantom``: synthetic 3D phantoms with strain, for tests.
+- ``phonons``: the inelastic (phonon) cross-section of a Debye solid, for the physical smooth part of a spectrum.
+
+The package holds no simulation code: the strain phantoms live with the experiment drivers.
 """

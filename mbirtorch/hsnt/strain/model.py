@@ -119,6 +119,9 @@ CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the i
 CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvature)
 DEBYE_TEMPERATURE_DEFAULT = 293.15   # smooth_model 'debye': the sample temperature (K) unless given
 DEBYE_THETA_START = 400.0    # smooth_model 'debye': the Debye temperature (K) the starting fit uses
+LEGENDRE_DEGREE = 8          # smooth_model 'legendre': the polynomial's degree (the spline's effective degrees of freedom
+                             # on the real Fe cube, q79, were 8.9)
+LEGENDRE_CURVATURE = 1e-2    # smooth_model 'legendre': the curvature penalty's weight relative to FitB.ridge (q79 used 1.1e-2)
 
 
 def deviance_terms(m, T, d):
@@ -292,24 +295,29 @@ def _emg_cdf(x, sigma, tau):
     return 0.5 * torch.erfc(-z / math.sqrt(2.0)) - torch.exp(-x / tau + 0.5 * r * r + torch.special.log_ndtr(z - r))
 
 
-def bspline_basis(x, n_knots, lo, hi, degree=3):
-    from scipy.interpolate import BSpline
-    inner = np.linspace(lo, hi, n_knots)
-    t = np.concatenate([[lo] * degree, inner, [hi] * degree])
-    return np.asarray(BSpline.design_matrix(np.clip(np.asarray(x, dtype=float), lo, hi), t, degree).todense())
+def legendre_columns(x, degree):
+    """Legendre polynomials P2 .. P(degree) at x in [-1, 1], as columns (len(x), degree - 1). The constant and linear terms
+    are left out: c0 and c1 carry them."""
+    P = [np.ones_like(x), x]
+    for k in range(1, degree):
+        P.append(((2 * k + 1) * x * P[k] - k * P[k - 1]) / (k + 1))
+    return np.stack(P[2:degree + 1], 1) if degree >= 2 else np.zeros((len(x), 0))
 
 
 class Hybrid2:
     """Structure of the stage-B model: grids, the banded resolution operator, materials and the parameter layout.
-    Global parameter vector g: per material [a, h (n_e), c0, c1, spline (n_s)], then res (s0, s1, t0, t1), then
-    kappa (J x R). With smooth_model 'debye' the spline block is two numbers per material: the amplitude of the phonon
-    (inelastic) term and the log of its Debye temperature (phonons.py); masses (amu, one per material) and temperature
-    (K) are then required. The smooth part is c0 + c1 x + that term."""
+    Global parameter vector g: per material [a, h (n_e), c0, c1, smooth block (n_smooth)], then res (s0, s1, t0, t1),
+    then kappa (J x R). The smooth (non-Bragg) part of each spectrum is c0 + c1 x plus the smooth block's term:
+    - smooth_model 'debye' (the physical one): the inelastic (phonon) cross-section of a Debye solid, two numbers per
+      material, its amplitude and the log of its Debye temperature (phonons.py). masses (amu, one per material) and
+      temperature (K) are required.
+    - smooth_model 'legendre' (when the masses are not known): a polynomial of degree smooth_degree in the wavelength,
+      its terms above the linear one as Legendre polynomials, with a curvature penalty (FitB.spline_penalty)."""
     BAND = (-240, 220)                                   # fine-grid offsets of a bin's band: the tail is on the left
 
-    def __init__(self, lam, dose_per_bin, lattices, n_spline=16, n_contam=2, device="cuda", dtype=torch.float32, pad=0.1,
-                 edge_slope=False, two_scale=False, shape_model=None, kernel="two_scale", smooth_model="spline", masses=None,
-                 temperature=DEBYE_TEMPERATURE_DEFAULT):
+    def __init__(self, lam, dose_per_bin, lattices, smooth_degree=LEGENDRE_DEGREE, n_contam=2, device="cuda", dtype=torch.float32,
+                 pad=0.1, edge_slope=False, two_scale=False, shape_model=None, kernel="two_scale", smooth_model="legendre",
+                 masses=None, temperature=DEBYE_TEMPERATURE_DEFAULT):
         self.dev, self.dt = device, dtype
         lam = np.asarray(lam, dtype=np.float64)
         lo, hi = bin_intervals(lam)
@@ -333,11 +341,18 @@ class Hybrid2:
         if smooth_model == "debye":
             assert masses is not None and len(masses) == len(lattices), "smooth_model 'debye' needs one mass per material"
             self.debye = [DebyeTable(lamf, m_, temperature, device=device) for m_ in masses]
-            self.B = None; self.n_spline = 2                                           # amplitude, log Debye temperature
+            self.B = None; self.n_smooth = 2                                           # amplitude, log Debye temperature
         else:
-            assert smooth_model == "spline", smooth_model
-            self.B = torch.as_tensor(bspline_basis(lamf, n_spline, lamf[0], lamf[-1]), device=device, dtype=dtype)
-            self.n_spline = self.B.shape[1]
+            assert smooth_model == "legendre", smooth_model
+            t = 2 * (lamf - lamf[0]) / (lamf[-1] - lamf[0]) - 1
+            B = legendre_columns(t, smooth_degree)
+            self.B = torch.as_tensor(B, device=device, dtype=dtype); self.n_smooth = B.shape[1]
+            # the curvature penalty's matrix: second derivatives in x = lam / lam_ref over the measured range, times
+            # sqrt(dx), so that |B_curv b|^2 is the integral of the squared curvature
+            x = lamf / float(lam.mean()); dx = float(x[1] - x[0])
+            inner = ((lamf >= lo[0]) & (lamf <= hi[-1]))[1:-1]
+            d2 = (B[2:] - 2 * B[1:-1] + B[:-2]) / dx ** 2
+            self.B_curv = torch.as_tensor(d2[inner] * math.sqrt(dx), device=device, dtype=torch.float64)
         self.R = len(lattices); self.J = n_contam
         self.mats = []
         for lt, (a_lo, a_hi) in lattices:
@@ -352,7 +367,7 @@ class Hybrid2:
         for m in self.mats:
             ne = len(m["ns"]); o = off + 1 + 2 * ne
             sl = dict(a=off, h=(off + 1, off + 1 + ne), t=(off + 1 + ne, o), x=(o, o + nx), c=(o + nx, o + nx + 2),
-                      s=(o + nx + 2, o + nx + 2 + self.n_spline))
+                      s=(o + nx + 2, o + nx + 2 + self.n_smooth))
             self.slices.append(sl); off = sl["s"][1]
         self.view_dirs = None            # texture3d, cubic4: each view's beam direction in the sample frame (views, 3)
         self.res_sl = (off, off + 8); off += 8
@@ -766,12 +781,11 @@ class FitB:
         tot = 0.0
         scale = getattr(self, "spline_scale", None)
         for r, sl in enumerate(self.M.slices):
-            if self.M.smooth_model != "spline":                             # a physical term: no smoothness penalty
+            if self.M.smooth_model != "legendre":                           # a physical term: no penalty
                 break
-            sp = g[sl["s"][0]:sl["s"][1]]
-            d2 = sp[2:] - 2 * sp[1:-1] + sp[:-2]
-            w = self.ridge * (1.0 if scale is None else float(scale[r]))
-            tot = tot + w * ((d2 * d2).sum() + 1e-2 * (sp * sp).sum())
+            b = g[sl["s"][0]:sl["s"][1]]
+            w = self.ridge * LEGENDRE_CURVATURE * (1.0 if scale is None else float(scale[r]))
+            tot = tot + w * ((self.M.B_curv @ b.double()) ** 2).sum()
         kp = getattr(self, "kappa_prior", None)
         if kp is not None:
             # a weak Gaussian prior on the contamination's attenuation by the sample, centred on 0 (contamination
@@ -1443,10 +1457,10 @@ def _projected_newton_mixed(V, grad, F, row_loss, nonneg):
 
 
 # ================================================================================================ starting values
-def ls_init_material(M, g, r, target, a0, w_reg=None):
-    """Material r's linear coefficients (heights >= 0, c0, c1, spline) by bounded least squares of its
-    instrument-smoothed spectrum on `target` (a spectrum on the measured bins), at lattice parameter a0; second
-    differences and a small magnitude ridge on the spline (it spans constants and slopes, which c0 and c1 carry).
+def ls_init_material(M, g, r, target, a0):
+    """Material r's starting coefficients (heights >= 0, c0, c1 and the smooth block) by bounded least squares of its
+    instrument-smoothed spectrum on `target` (a spectrum on the measured bins), at lattice parameter a0. With
+    smooth_model 'debye' the Debye temperature is held at DEBYE_THETA_START and the term's amplitude (>= 0) is fitted.
     Writes into g (in place) and returns the residual rms."""
     from scipy.optimize import lsq_linear
     sl = M.slices[r]
@@ -1469,14 +1483,9 @@ def ls_init_material(M, g, r, target, a0, w_reg=None):
         else:
             Dfine = np.concatenate([(x * x)[:, None] * step, np.ones((M.Kf, 1)), x[:, None], M.B.double().cpu().numpy()], 1)
             A = Rt @ Dfine
-            nsp = M.n_spline
-            D2 = np.diff(np.eye(nsp), 2, axis=0); w_reg = 1e-1 * np.sqrt(M.K) * float(np.abs(target).mean()) if w_reg is None else w_reg
-            reg = np.vstack([np.hstack([np.zeros((D2.shape[0], ne + 2)), w_reg * D2]),
-                             np.hstack([np.zeros((nsp, ne + 2)), w_reg * np.eye(nsp)])])
-            sol = lsq_linear(np.vstack([A, reg]), np.concatenate([np.asarray(target, dtype=np.float64), np.zeros(reg.shape[0])]),
-                             bounds=(np.concatenate([np.zeros(ne), -np.inf * np.ones(2 + nsp)]), np.inf))
+            sol = lsq_linear(A, np.asarray(target, dtype=np.float64),
+                             bounds=(np.concatenate([np.zeros(ne), -np.inf * np.ones(2 + M.n_smooth)]), np.inf))
             g[sl['s'][0]:sl['s'][1]] = torch.as_tensor(sol.x[ne + 2:])
-            sol.x = sol.x[:ne + 2 + nsp]
         g[sl['h'][0]:sl['h'][1]] = torch.as_tensor(sol.x[:ne])
         g[sl['c'][0]:sl['c'][1]] = torch.as_tensor(sol.x[ne:ne + 2])
         return float(np.sqrt(np.mean((A @ sol.x - target) ** 2)))

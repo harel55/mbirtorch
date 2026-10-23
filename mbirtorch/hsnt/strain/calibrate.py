@@ -22,6 +22,7 @@ FD_KERNEL = 1e-6                        # central-difference step for the kernel
 FD_REL = 1e-6                           # relative central-difference step for the other parameters
 FD_FLOOR = 1e-3                         # the relative step's floor on |parameter|
 BASELINE_DEGREE = 3                     # the per-window baseline: exp(polynomial of this degree in wavelength)
+CALIBRATION_SMOOTH_DEGREE = 5           # the model's smooth polynomial (model.Hybrid2 smooth_degree; the 4-knot spline it replaces had about 6 free terms)
 TEXTURE_START = (1.0, 0.5)              # March-Dollase r (1 = random powder) and axis angle (radians) to start from
 
 
@@ -41,7 +42,7 @@ def fit_open_beam_kernel(counts, lam, material=AL, exclude=(), gaps=(), window_h
     chi-square per window, and the model and data in the windows."""
     lam = np.asarray(lam, dtype=np.float64); counts = np.asarray(counts, dtype=np.float64)
     lt, a0 = material
-    M = Hybrid2(lam, np.ones_like(lam), [(lt, (a0 * (1 - A_RANGE), a0 * (1 + A_RANGE)))], n_spline=4, n_contam=1,
+    M = Hybrid2(lam, np.ones_like(lam), [(lt, (a0 * (1 - A_RANGE), a0 * (1 + A_RANGE)))], smooth_degree=CALIBRATION_SMOOTH_DEGREE, n_contam=1,
                 device=device, two_scale=True, edge_slope=edge_slope, shape_model='texture' if texture else None)
     sl = M.slices[0]
     edges = (2 * a0 / torch.sqrt(M.mats[0]['ns'])).cpu().numpy()
