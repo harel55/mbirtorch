@@ -44,6 +44,7 @@ QGGMRF_P, QGGMRF_Q, QGGMRF_T = 2.0, 1.2, 1.0   # the edge-preserving density pri
 DENSITY_SMOOTH_REL = 0.2        # the density smoothness prior's standard deviation per neighbour difference, as a
                                 # fraction of the material's typical density inside the sample (warm-up volume)
 CG_ITERS = 30                   # conjugate-gradient iterations per volume step
+LINE_ALPHA_RANGE = (0.05, 2.0)  # the volume step's line search: the step lengths its parabola's minimizer is clamped to
 INIT_CG_ITERS = 40              # conjugate-gradient iterations of the warm-up reconstruction
 EPS_W_MIN = 1e-8                # rays with less projected density carry no strain
 INIT_PIXEL_STEPS = 3            # per-ray map fits in the warm-up
@@ -501,6 +502,7 @@ class TomoFit:
         self.cg_iters = cg_iters
         self.damp = 1e-3
         self.last_step_se = float('inf')     # the last volume step's RMS in standard errors (_step_se), for a stopping rule
+        self.last_line = None                # the last volume step's line search: step length and curvature ratio
         self.sync()
 
     # ---- projections
@@ -779,15 +781,33 @@ class TomoFit:
                 dV, dE = zV + (rz_new / rz) * dV, zE + (rz_new / rz) * dE; rz = rz_new
             dec = float(-(gV * free * xV).sum() - (gE * fE * xE).sum())            # Newton decrement^2 (deviance)
             l0 = self.loss(mask=mask)
-            for alpha in (1.0, 0.5, 0.25):
+
+            def at(alpha):
                 Vn = (V + alpha * xV).clamp(0, self.v_max); En = E + alpha * xE
                 d1 = self.data_loss(Vn, En)
-                l1 = d1 + self.prior(Vn, En, mask)
-                if l1 < l0:
-                    self.last_step_se = self._step_se(alpha * alpha * dec)
-                    self.V, self.E = Vn, En; self.sync(); fit.remember_data_loss(d1)
-                    self.damp = max(self.damp / 3, 1e-6)
-                    return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l1
+                return d1 + self.prior(Vn, En, mask), d1, Vn, En
+            # line search: the objective at step lengths 1 and 1/2, the parabola through them and l0, and its minimizer.
+            # The Gauss-Newton model predicts the parabola l0 - alpha dec + alpha^2 dec / 2; where the true curvature
+            # along the step is larger (strain enters through the edges, not log-linearly), the full step overshoots
+            # and the iterates zig-zag (2026-10-23: successive strain steps had cosine -0.94)
+            tried = {1.0: at(1.0), 0.5: at(0.5)}
+            l1, lh = tried[1.0][0], tried[0.5][0]
+            c = 2.0 * (l1 - 2.0 * lh + l0); b = (l1 - l0) - c
+            self.last_line = dict(curvature_ratio=(2.0 * c / dec) if dec > 0 else None)
+            if c > 0:
+                a_star = min(max(-b / (2.0 * c), LINE_ALPHA_RANGE[0]), LINE_ALPHA_RANGE[1])
+                if all(abs(a_star - k) > 1e-3 for k in tried):
+                    tried[a_star] = at(a_star)
+            for alpha in (0.25,):                                                    # the old fallback
+                if min(v[0] for v in tried.values()) >= l0:
+                    tried[alpha] = at(alpha)
+            alpha, (l_best, d1, Vn, En) = min(tried.items(), key=lambda kv: kv[1][0])
+            if l_best < l0:
+                self.last_line['alpha'] = alpha
+                self.last_step_se = self._step_se(alpha * alpha * dec)
+                self.V, self.E = Vn, En; self.sync(); fit.remember_data_loss(d1)
+                self.damp = max(self.damp / 3, 1e-6)
+                return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l_best
             self.damp *= 10
         self.last_step_se = 0.0
         return float('nan'), 0.0
