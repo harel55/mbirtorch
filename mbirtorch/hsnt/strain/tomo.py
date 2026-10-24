@@ -45,6 +45,10 @@ DENSITY_SMOOTH_REL = 0.2        # the density smoothness prior's standard deviat
                                 # fraction of the material's typical density inside the sample (warm-up volume)
 CG_ITERS = 30                   # conjugate-gradient iterations per volume step
 LINE_ALPHA_RANGE = (0.05, 2.0)  # the volume step's line search: the step lengths its parabola's minimizer is clamped to
+MOMENTUM_RANGE = (-1.0, 3.0)    # with momentum=True: the multiples of the previous step the volume step may add
+RAY_SYMBOL_REFRESH = 5          # precond='fft_ray': the data's strain symbol is recomputed every this many volume steps
+ANDERSON_DEPTH = 5              # AndersonMixing: the past iterations it combines
+ANDERSON_RIDGE = 1e-8           # AndersonMixing: the least-squares ridge, relative to the mean squared residual change
 INIT_CG_ITERS = 40              # conjugate-gradient iterations of the warm-up reconstruction
 EPS_W_MIN = 1e-8                # rays with less projected density carry no strain
 INIT_PIXEL_STEPS = 3            # per-ray map fits in the warm-up
@@ -466,8 +470,10 @@ class TomoFit:
         # the volume solves' preconditioner: 'jacobi' (each unknown's diagonal), 'block' (per voxel and material, the
         # inverse of the (1 + C) x (1 + C) block coupling its density and strain components), or 'fft' (Jacobi on the
         # densities; for the strain, the exact inverse of a translation-invariant stand-in for its Hessian block, applied
-        # by FFT: use it with the equilibrium prior, whose stiff coupling of neighbouring voxels slows the others)
-        assert precond in ('jacobi', 'block', 'fft'), precond
+        # by FFT: use it with the equilibrium prior, whose stiff coupling of neighbouring voxels slows the others), or
+        # 'fft_ray' ('fft' with the data's strain block as a function of spatial frequency, from the ray transform's
+        # response to an impulse, in place of its average: the data constrain smooth strain far more than fine detail)
+        assert precond in ('jacobi', 'block', 'fft', 'fft_ray'), precond
         self.precond = precond
         # support=True: MONSTR's support prior in place of the weak strain ridge (strain held at 0 outside the sample)
         self.support = support
@@ -504,6 +510,15 @@ class TomoFit:
         self.damp = 1e-3
         self.last_step_se = float('inf')     # the last volume step's RMS in standard errors (_step_se), for a stopping rule
         self.last_line = None                # the last volume step's line search: step length and curvature ratio
+        # momentum=True: each volume step searches the plane of its Gauss-Newton step and the previous volume step, with
+        # the loss's curvature measured in that plane (use it when successive steps keep one direction, so that the
+        # Gauss-Newton step alone converges slowly)
+        self.momentum = False
+        self._prev_step = None
+        # cg_warm=True: each volume step's conjugate-gradient solve starts from the previous volume step (where that
+        # lowers the quadratic model) instead of from zero, so a solve cut short is continued by the next one
+        self.cg_warm = False
+        self._ray_sym, self._ray_sym_age = None, 0
         self.sync()
 
     # ---- projections
@@ -749,6 +764,7 @@ class TomoFit:
         eq_diag = 12.0 * self.eq_w if self.elastic is not None else 0.0          # rough scale of the equilibrium curvature
         dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + self.dens_diag(wts)
         dE_ = V[..., None] ** 2 * bUU + 2 * self.lam_E + 6 * self.smooth_E + eq_diag
+        self.last_diagonal = (dV_, dE_)                                            # for AndersonMixing's scale
 
         def H(xV, xE):
             zW, zU = self._fwd(xV, E * xV[..., None] + V[..., None] * xE)
@@ -762,7 +778,7 @@ class TomoFit:
             pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
             if self.precond == 'block':
                 prec = self._block_preconditioner(F, lam_, dV_, dE_, free, fE, mask)
-            elif self.precond == 'fft':
+            elif self.precond in ('fft', 'fft_ray'):
                 prec = self._fft_preconditioner(F, lam_, pV, dE_, free, fE)
             else:
                 prec = lambda rV, rE: (rV / pV, rE / pE)
@@ -770,6 +786,15 @@ class TomoFit:
             xV, xE = torch.zeros_like(V), torch.zeros_like(E)
             rV, rE = bV.clone(), bE.clone()
             zV, zE = prec(rV, rE)
+            rz0 = float((rV * zV).sum() + (rE * zE).sum())
+            warm = self._prev_step if (self.cg_warm and self._prev_step is not None and self._prev_step[0].shape == V.shape) else None
+            if warm is not None:
+                x0V, x0E = warm[0] * free, warm[1] * fE
+                hV, hE = H(x0V, x0E)
+                hV = hV + lam_ * dV_ * x0V; hE = hE + lam_ * dE_ * x0E
+                if float(-(bV * x0V).sum() - (bE * x0E).sum() + 0.5 * ((x0V * hV).sum() + (x0E * hE).sum())) < 0:
+                    xV, xE, rV, rE = x0V.clone(), x0E.clone(), bV - hV, bE - hE
+                    zV, zE = prec(rV, rE)
             dV, dE = zV.clone(), zE.clone()
             rz = float((rV * zV).sum() + (rE * zE).sum())
             for _ in range(self.cg_iters):
@@ -783,8 +808,11 @@ class TomoFit:
             dec = float(-(gV * free * xV).sum() - (gE * fE * xE).sum())            # Newton decrement^2 (deviance)
             l0 = self.loss(mask=mask)
 
-            def at(alpha):
-                Vn = (V + alpha * xV).clamp(0, self.v_max); En = E + alpha * xE
+            def at(alpha, beta=0.0):
+                Vn, En = V + alpha * xV, E + alpha * xE
+                if beta:
+                    Vn, En = Vn + beta * pV, En + beta * pE
+                Vn = Vn.clamp(0, self.v_max)
                 d1 = self.data_loss(Vn, En)
                 return d1 + self.prior(Vn, En, mask), d1, Vn, En
             # line search: the objective at step lengths 1 and 1/2, the parabola through them and l0, and its minimizer.
@@ -794,18 +822,42 @@ class TomoFit:
             tried = {1.0: at(1.0), 0.5: at(0.5)}
             l1, lh = tried[1.0][0], tried[0.5][0]
             c = 2.0 * (l1 - 2.0 * lh + l0); b = (l1 - l0) - c
-            self.last_line = dict(curvature_ratio=(2.0 * c / dec) if dec > 0 else None)
+            self.last_line = dict(curvature_ratio=(2.0 * c / dec) if dec > 0 else None,
+                                  cg_residual=math.sqrt(max(rz, 0.0) / rz0) if rz0 > 0 else None,
+                                  cg_plain_residual=math.sqrt(float((rV ** 2).sum() + (rE ** 2).sum())
+                                                              / max(float((bV ** 2).sum() + (bE ** 2).sum()), 1e-300)))
             if c > 0:
                 a_star = min(max(-b / (2.0 * c), LINE_ALPHA_RANGE[0]), LINE_ALPHA_RANGE[1])
                 if all(abs(a_star - k) > 1e-3 for k in tried):
                     tried[a_star] = at(a_star)
+            tried = {(k, 0.0): v for k, v in tried.items()}
+            prev = self._prev_step if (self.momentum and self._prev_step is not None and self._prev_step[0].shape == V.shape) else None
+            if prev is not None and c > 0:
+                # the plane of the Gauss-Newton step x and the previous step p: the loss at p, p/2 and x + p gives the
+                # quadratic's slope and curvature along p and its cross term; its minimizer is tried as well
+                pV, pE = prev[0] * free, prev[1] * fE
+                tried[(0.0, 1.0)] = at(0.0, 1.0); tried[(0.0, 0.5)] = at(0.0, 0.5); tried[(1.0, 1.0)] = at(1.0, 1.0)
+                lp, lph, lxp = tried[(0.0, 1.0)][0], tried[(0.0, 0.5)][0], tried[(1.0, 1.0)][0]
+                cp = 2.0 * (lp - 2.0 * lph + l0); bp = (lp - l0) - cp                # along p: l0 + bp t + cp t^2
+                cxp = lxp - l0 - (b + c) - (bp + cp)                                  # the cross term's coefficient
+                hpV, hpE = H(pV, pE)                                                   # the Gauss-Newton curvature along p
+                gn_pp = float((pV * hpV).sum() + (pE * hpE).sum())
+                self.last_line['previous_curvature_ratio'] = 2.0 * cp / gn_pp if gn_pp > 0 else None
+                A = np.array([[2.0 * c, cxp], [cxp, 2.0 * cp]])
+                if cp > 0 and np.linalg.det(A) > 0:
+                    ab = np.linalg.solve(A, -np.array([b, bp]))
+                    ab = (min(max(float(ab[0]), LINE_ALPHA_RANGE[0]), LINE_ALPHA_RANGE[1]),
+                          min(max(float(ab[1]), MOMENTUM_RANGE[0]), MOMENTUM_RANGE[1]))
+                    if all(abs(ab[0] - k[0]) + abs(ab[1] - k[1]) > 1e-3 for k in tried):
+                        tried[ab] = at(*ab)
             for alpha in (0.25,):                                                    # the old fallback
                 if min(v[0] for v in tried.values()) >= l0:
-                    tried[alpha] = at(alpha)
-            alpha, (l_best, d1, Vn, En) = min(tried.items(), key=lambda kv: kv[1][0])
+                    tried[(alpha, 0.0)] = at(alpha)
+            (alpha, beta), (l_best, d1, Vn, En) = min(tried.items(), key=lambda kv: kv[1][0])
             if l_best < l0:
-                self.last_line['alpha'] = alpha
+                self.last_line['alpha'] = alpha; self.last_line['beta'] = beta
                 self.last_step_se = self._step_se(alpha * alpha * dec)
+                self._prev_step = (Vn - V, En - E)
                 self.V, self.E = Vn, En; self.sync(); fit.remember_data_loss(d1)
                 self.damp = max(self.damp / 3, 1e-6)
                 return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l_best
@@ -877,11 +929,15 @@ class TomoFit:
                            [..., R:].reshape(n, n, n, R, C) for k in range(C)], -2)              # (n, n, n, R, C, C)
         sym = self._prior_symbol()
         own = self.material_voxels()
+        ray = self._ray_symbol(F) if self.precond == 'fft_ray' else None
         for r in range(R):
             ins = own[..., r]
             if not bool(ins.any()):
                 continue
-            B = (V[..., r, None, None] ** 2 * bUU[..., r, :, :])[ins].double().mean(0)
+            if ray is None:
+                B = (V[..., r, None, None] ** 2 * bUU[..., r, :, :])[ins].double().mean(0)
+            else:
+                B = (V[..., r] ** 2)[ins].double().mean() * ray[..., r, :, :]
             dmp = lam_ * dE_[..., r, :][ins].double().mean(0)
             sym[..., r, :, :] += (B + torch.diag(dmp)).to(sym.dtype)
         inv = torch.linalg.inv(sym)
@@ -890,6 +946,30 @@ class TomoFit:
             z = torch.fft.ifftn(torch.einsum('xyzrab,xyzrb->xyzra', inv, torch.fft.fftn(rE.double(), dim=(0, 1, 2))), dim=(0, 1, 2))
             return rV / pV * fV, z.real.to(rE.dtype) * fE
         return apply
+
+    def _ray_symbol(self, F):
+        """(n, n, n, R, C, C) complex: the data's strain Hessian block at unit volume fraction as a function of spatial
+        frequency, from its response to unit impulses at the volume's centre (one forward and back projection per
+        material and component). Kept for RAY_SYMBOL_REFRESH volume steps: the ray Fisher information changes slowly."""
+        R, C, V = self.R, self.C, self.V
+        n = V.shape[0]
+        if self._ray_sym is not None and self._ray_sym.shape[0] == n and self._ray_sym_age < RAY_SYMBOL_REFRESH:
+            self._ray_sym_age += 1
+            return self._ray_sym
+        c = (n // 2,) * 3
+        out = torch.zeros(n, n, n, R, C, C, dtype=torch.complex128, device=V.device)
+        with torch.no_grad():
+            for r in range(R):
+                for k in range(C):
+                    X = torch.zeros_like(self.E); X[c + (r, k)] = 1.0
+                    zW, zU = self._fwd(torch.zeros_like(V), X)
+                    y = torch.einsum('pab,pb->pa', F, torch.cat([zW, zU], 1))
+                    resp = self._back(y[:, :R], y[:, R:])[1][..., r, :]
+                    resp = torch.roll(resp, shifts=tuple(-x for x in c), dims=(0, 1, 2))
+                    out[..., r, :, k] = torch.fft.fftn(resp.double(), dim=(0, 1, 2))
+        out = 0.5 * (out + out.conj().transpose(-1, -2))
+        self._ray_sym, self._ray_sym_age = out, 1
+        return out
 
     def _block_preconditioner(self, F, lam_, dV_, dE_, fV, fE, mask):
         """The 'block' preconditioner: per voxel and material, the zero-lag block of the volume Hessian over (V, E_1..C)
@@ -1198,7 +1278,7 @@ class TomoFit:
             Ag = Fg + lam_ * torch.diag(torch.diagonal(Fg))
             Ag_inv = torch.linalg.inv(Ag)
             pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
-            if self.precond in ('block', 'fft'):
+            if self.precond in ('block', 'fft', 'fft_ray'):
                 pvol = self._block_preconditioner(Fw, lam_, dV_, dE_, fV, fE, mask) if self.precond == 'block' \
                     else self._fft_preconditioner(Fw, lam_, pV, dE_, fV, fE)
                 prec = lambda rV, rE, rg: (*pvol(rV, rE), Ag_inv @ rg)
@@ -1401,3 +1481,80 @@ def newton_step(F, g, rcond=1e-8):
     lam, Q = torch.linalg.eigh(s[:, None] * F * s[None, :])
     keep = lam > rcond * lam.max()
     return s * (Q[:, keep] @ ((Q[:, keep].T @ (s * g)) / lam[keep]))
+
+
+class AndersonMixing:
+    """Anderson acceleration of a fit's outer iteration (the volume step and the other steps together). After each
+    iteration, it combines the last ANDERSON_DEPTH iterations so that their changes cancel as far as possible, with each
+    unknown's change measured in standard errors (times the square root of its Fisher information diagonal). The
+    combination is kept only if it lowers the objective, and otherwise the history restarts. Use it when the iterates
+    oscillate or drift slowly in one direction. It mixes the volume fractions, the strains and the global parameters of
+    the global step; the contamination and the mounts keep the iteration's values.
+    Use: acc = AndersonMixing(tf); in each iteration, acc.begin() before the steps and acc.end(objective) after them,
+    where objective() returns the fit's objective at its current state. end returns a summary for the log."""
+
+    def __init__(self, tf, depth=ANDERSON_DEPTH):
+        self.tf, self.depth = tf, depth
+        self.dF, self.dG, self.prev, self.x0, self.w, self.idx = [], [], None, None, None, []
+
+    def _idx(self):
+        return self.idx
+
+    def _state(self):
+        tf, idx = self.tf, self._idx()
+        return torch.cat([tf.V.reshape(-1).double(), tf.E.reshape(-1).double(), tf.fit.g[idx].double()])
+
+    def _scale(self):
+        tf, idx = self.tf, self._idx()
+        dV_, dE_ = tf.last_diagonal
+        lag = getattr(tf.fit, "_fisher", None)
+        dg = torch.diagonal(lag[1]).double() if (idx and lag is not None and list(lag[0]) == idx) else torch.ones(len(idx), device=tf.V.device, dtype=torch.float64)
+        return torch.cat([dV_.reshape(-1).double(), dE_.reshape(-1).double(), dg]).clamp_min(0).sqrt()
+
+    def _set(self, x):
+        tf, idx = self.tf, self._idx()
+        nV, nE = tf.V.numel(), tf.E.numel()
+        with torch.no_grad():
+            tf.V = x[:nV].reshape(tf.V.shape).to(tf.V.dtype).clamp(0, tf.v_max)
+            tf.E = x[nV:nV + nE].reshape(tf.E.shape).to(tf.E.dtype)
+            if idx:
+                M, g = tf.fit.M, tf.fit.g.clone()
+                it = torch.as_tensor(idx, device=g.device)
+                g[it] = torch.maximum(torch.minimum(x[nV + nE:].to(g.dtype), M.ub[it]), M.lb[it])
+                tf.fit.g = g
+        tf.sync()
+
+    def begin(self):
+        lag = getattr(self.tf.fit, "_fisher", None)
+        idx = [] if lag is None else list(lag[0])                          # the global step's parameters (once it ran)
+        if idx != self.idx:
+            self.idx, self.dF, self.dG, self.prev, self.w = idx, [], [], None, None
+        self.x0 = self._state()
+
+    def end(self, objective):
+        G = self._state()
+        if self.prev is not None and self.prev[1].shape != G.shape:
+            self.dF, self.dG, self.prev = [], [], None                     # the unknowns changed: restart
+        if self.w is None or not self.dF:
+            self.w = self._scale()
+        f = self.w * (G - self.x0)
+        if self.prev is not None:
+            self.dF.append(f - self.prev[0]); self.dG.append(G - self.prev[1])
+            self.dF, self.dG = self.dF[-self.depth:], self.dG[-self.depth:]
+        self.prev = (f, G)
+        if not self.dF:
+            return dict(used=0)
+        A = torch.stack(self.dF, 1)
+        Mtx = A.T @ A
+        ridge = ANDERSON_RIDGE * float(torch.trace(Mtx)) / len(self.dF)
+        gamma = torch.linalg.solve(Mtx + ridge * torch.eye(len(self.dF), device=A.device, dtype=A.dtype), A.T @ f)
+        x = G - torch.stack(self.dG, 1) @ gamma
+        l_G = objective()
+        self._set(x)
+        l_x = objective()
+        if l_x < l_G:
+            return dict(used=len(self.dF), gamma=gamma.tolist(), gain=l_G - l_x)
+        self._set(G)
+        self.dF, self.dG, self.prev, self.w = [], [], None, None
+        return dict(used=0, rejected=True, loss=l_x - l_G)
+
