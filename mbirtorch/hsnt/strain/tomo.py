@@ -518,6 +518,11 @@ class TomoFit:
         # cg_warm=True: each volume step's conjugate-gradient solve starts from the previous volume step (where that
         # lowers the quadratic model) instead of from zero, so a solve cut short is continued by the next one
         self.cg_warm = False
+        # zero_mean_step=True: each volume step's strain step keeps every material's volume-fraction-weighted mean strain
+        # where it is (zero after recenter_strain(full=True)), so the step and the zero-mean-stress constraint agree;
+        # without it, a step that adds a mean strain is undone by the next recentring (2026-10-23, the real cube)
+        self.zero_mean_step = False
+        self.last_recenter = None            # recenter_strain's removed means: isotropic and per component (strain units)
         self._ray_sym, self._ray_sym_age = None, 0
         self.sync()
 
@@ -782,14 +787,19 @@ class TomoFit:
                 prec = self._fft_preconditioner(F, lam_, pV, dE_, free, fE)
             else:
                 prec = lambda rV, rE: (rV / pV, rE / pE)
-            bV, bE = -gV * free, -gE * fE
+            proj_E = self._mean_projector(V, fE) if self.zero_mean_step else (lambda X: X)
+            if self.zero_mean_step:                                                  # CG within the constraint's subspace
+                prec0, H0 = prec, H
+                prec = lambda rV, rE: (lambda z: (z[0], proj_E(z[1])))(prec0(rV, rE))
+                H = lambda xV, xE: (lambda h: (h[0], proj_E(h[1])))(H0(xV, xE))
+            bV, bE = -gV * free, proj_E(-gE * fE)
             xV, xE = torch.zeros_like(V), torch.zeros_like(E)
             rV, rE = bV.clone(), bE.clone()
             zV, zE = prec(rV, rE)
             rz0 = float((rV * zV).sum() + (rE * zE).sum())
             warm = self._prev_step if (self.cg_warm and self._prev_step is not None and self._prev_step[0].shape == V.shape) else None
             if warm is not None:
-                x0V, x0E = warm[0] * free, warm[1] * fE
+                x0V, x0E = warm[0] * free, proj_E(warm[1] * fE)
                 hV, hE = H(x0V, x0E)
                 hV = hV + lam_ * dV_ * x0V; hE = hE + lam_ * dE_ * x0E
                 if float(-(bV * x0V).sum() - (bE * x0E).sum() + 0.5 * ((x0V * hV).sum() + (x0E * hE).sum())) < 0:
@@ -835,7 +845,7 @@ class TomoFit:
             if prev is not None and c > 0:
                 # the plane of the Gauss-Newton step x and the previous step p: the loss at p, p/2 and x + p gives the
                 # quadratic's slope and curvature along p and its cross term; its minimizer is tried as well
-                pV, pE = prev[0] * free, prev[1] * fE
+                pV, pE = prev[0] * free, proj_E(prev[1] * fE)
                 tried[(0.0, 1.0)] = at(0.0, 1.0); tried[(0.0, 0.5)] = at(0.0, 0.5); tried[(1.0, 1.0)] = at(1.0, 1.0)
                 lp, lph, lxp = tried[(0.0, 1.0)][0], tried[(0.0, 0.5)][0], tried[(1.0, 1.0)][0]
                 cp = 2.0 * (lp - 2.0 * lph + l0); bp = (lp - l0) - cp                # along p: l0 + bp t + cp t^2
@@ -1155,6 +1165,18 @@ class TomoFit:
         apply(0.0); self.sync()
         return dict(alpha=0.0, loss_decrease=0.0, **result())
 
+    def _mean_projector(self, V, fE):
+        """The orthogonal projection of a strain-like field (n, n, n, R, C) onto the fields whose volume-fraction-weighted
+        mean over each material's own voxels is zero, per component (the weights of recenter_strain), restricted to the
+        free strain fE."""
+        own = self.material_voxels()
+        w = (own.to(V.dtype) * V)[..., None] * fE.to(V.dtype)                    # (n, n, n, R, C)
+        ww = (w * w).sum((0, 1, 2)).clamp_min(1e-30)
+
+        def apply(X):
+            return X - w * ((w * X).sum((0, 1, 2)) / ww)
+        return apply
+
     def recenter_strain(self, full=False):
         """Move each material's mean isotropic strain into its lattice parameter, so the strain is measured from the
         sample's mean lattice and carries no uniform offset. Use it after a volume step. The predicted data are unchanged
@@ -1165,15 +1187,18 @@ class TomoFit:
         isotropic part, the deviatoric mean changes the predicted data, so this is a constraint, not a choice of gauge."""
         M, R, C = self.fit.M, self.R, self.C
         moved = []
+        self.last_recenter = dict(isotropic=[], mean=[])
         with torch.no_grad():
             own = self.material_voxels()
             for r in range(R):
                 V = self.V[..., r]
                 w = own[..., r].to(V.dtype) * V                                 # the material's own voxels, density weighted
                 if float(w.sum()) <= 0:
-                    moved.append(0.0); continue
+                    moved.append(0.0); self.last_recenter["isotropic"].append(0.0); self.last_recenter["mean"].append([0.0] * C); continue
                 iso = self.E[..., r, :3].mean(-1) if C == 6 else self.E[..., r, 0]
                 d = float((w * iso).sum() / w.sum())
+                self.last_recenter['isotropic'].append(d)
+                self.last_recenter['mean'].append(((w[..., None] * self.E[..., r, :]).sum((0, 1, 2)) / w.sum()).tolist())
                 if C == 6:
                     self.E[..., r, :3] -= d
                     if full:                                                   # the deviatoric mean, per component

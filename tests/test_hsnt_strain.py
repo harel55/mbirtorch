@@ -119,6 +119,25 @@ def test_recenter_full_zero_mean():
     assert float(tf.E.mean((0, 1, 2)).abs().max()) < 1e-12
 
 
+def test_mean_projector():
+    """TomoFit._mean_projector removes each component's volume-fraction-weighted mean over the material (the mean that
+    recenter_strain(full=True) removes), and applying it twice changes nothing."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 5
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C = 1, 6
+    g = torch.Generator().manual_seed(1)
+    tf.V = 0.5 + torch.rand(n, n, n, 1, generator=g, dtype=torch.float64)
+    X = torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64)
+    P = tf._mean_projector(tf.V, torch.ones_like(X, dtype=torch.bool))
+    Y = P(X)
+    w = tf.V[..., 0][..., None] * tf.material_voxels()[..., 0][..., None].to(tf.V.dtype)
+    assert float((w * Y[..., 0, :]).sum((0, 1, 2)).abs().max()) < 1e-10
+    assert float((P(Y) - Y).abs().max()) < 1e-12
+
+
 def test_fft_preconditioner_symbol():
     """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
