@@ -534,7 +534,8 @@ class TomoFit:
         self.cg_warm = False
         # zero_mean_step=True: each volume step's strain step keeps every material's volume-fraction-weighted mean
         # deviatoric strain where it is (zero after recenter_strain(full=True)), so the step and the zero-mean-stress
-        # constraint agree (the isotropic mean stays free, for recentring to move into the lattice parameter);
+        # constraint agree (the isotropic mean stays free, for recentring to move into the lattice parameter; 'full' holds
+        # it too, for a fit whose global step fits the lattice parameter);
         # without it, a step that adds a mean strain is undone by the next recentring (2026-10-23, the real cube)
         self.zero_mean_step = False
         self.last_recenter = None            # recenter_strain's removed means: isotropic and per component (strain units)
@@ -849,7 +850,7 @@ class TomoFit:
                 prec = self._fft_preconditioner(F, lam_, pV, dE_, free, fE)
             else:
                 prec = lambda rV, rE: (rV / pV, rE / pE)
-            proj_E = self._mean_projector(V, fE) if self.zero_mean_step else (lambda X: X)
+            proj_E = self._mean_projector(V, fE, full=self.zero_mean_step == 'full') if self.zero_mean_step else (lambda X: X)
             if self.zero_mean_step:                                                  # CG within the constraint's subspace
                 prec0, H0 = prec, H
                 prec = lambda rV, rE: (lambda z: (z[0], proj_E(z[1])))(prec0(rV, rE))
@@ -1238,13 +1239,13 @@ class TomoFit:
         apply(0.0); self.sync()
         return dict(alpha=0.0, loss_decrease=0.0, **result())
 
-    def _mean_projector(self, V, fE):
+    def _mean_projector(self, V, fE, full=False):
         """The orthogonal projection of a strain-like field (n, n, n, R, C) onto the fields whose volume-fraction-weighted
         mean deviatoric strain over each material's own voxels is zero (the weights of recenter_strain), restricted to
         the free strain fE. The mean isotropic strain stays free: recenter_strain moves it into the lattice parameter,
         and holding it would hold the lattice parameter at its starting value. With a scalar strain (C = 1) nothing is
-        held."""
-        if self.C != 6:
+        held. full=True holds the isotropic mean as well (then fit the lattice parameter in the global step)."""
+        if self.C != 6 and not full:
             return lambda X: X
         own = self.material_voxels()
         w = (own.to(V.dtype) * V)[..., None] * fE.to(V.dtype)                    # (n, n, n, R, C)
@@ -1252,7 +1253,8 @@ class TomoFit:
 
         def apply(X):
             m = (w * X).sum((0, 1, 2)) / ww                                       # (R, C)
-            m = torch.cat([m[..., :3] - m[..., :3].mean(-1, keepdim=True), m[..., 3:]], -1)   # its deviatoric part
+            if not full and self.C == 6:
+                m = torch.cat([m[..., :3] - m[..., :3].mean(-1, keepdim=True), m[..., 3:]], -1)   # its deviatoric part
             return X - w * m
         return apply
 
