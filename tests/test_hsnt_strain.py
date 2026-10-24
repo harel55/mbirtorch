@@ -162,6 +162,24 @@ def test_traction_normal_flat_face():
     assert float(tf._traction(E)[3, 3, 3, 0].abs().max()) > 0.1
 
 
+def test_refresh_mask():
+    """TomoFit.refresh_mask replaces a frozen material mask that overlaps the current volume fractions' mask poorly, and
+    keeps one that agrees."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 8
+    tf = object.__new__(TomoFit)
+    tf.mask_method, tf.mask_freeze, tf._mask = 'max', True, None
+    V = torch.zeros(n, n, n, 2); V[2:6, 2:6, 2:6, 0] = 1.0; V[1:4, 1:4, 1:4, 1] = 1.0
+    tf.V = V
+    tf.material_voxels()                                                     # freezes the masks
+    tf._mask[..., 1] = True                                                  # material 1's mask now reaches everywhere
+    out = tf.refresh_mask()
+    assert [r for r, _ in out] == [1]
+    assert bool((tf._mask[..., 1] == (V[..., 1] > 0.5)).all()) and bool((tf._mask[..., 0] == (V[..., 0] > 0.5)).all())
+
+
 def test_fft_preconditioner_symbol():
     """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
     from mbirtorch.hsnt.strain.tomo import TomoFit

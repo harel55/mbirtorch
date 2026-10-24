@@ -49,6 +49,10 @@ MOMENTUM_RANGE = (-1.0, 3.0)    # with momentum=True: the multiples of the previ
 RAY_SYMBOL_REFRESH = 5          # precond='fft_ray': the data's strain symbol is recomputed every this many volume steps
 FULL_QUANTILE, FULL_REL = 0.99, 0.5  # normalize: a material's full level is the median volume fraction of the voxels above
                                     # FULL_REL of its FULL_QUANTILE quantile (the voxels that clearly hold it)
+FREE_LATTICE_RANGE = 0.01       # free_lattice: each lattice parameter may move this fraction either way in the global step
+MASK_CHECK_EVERY = 5            # with mask_freeze, the frozen material masks are checked every this many volume steps ...
+MASK_IOU_MIN = 0.9              # ... and a material's is recomputed when it overlaps the current one (intersection over
+                                # union) less than this: the warm-up's mask of a weak material can reach far beyond it
 TRACTION_OFFSET = 0.5           # traction_sd='grid': the traction's standard deviation is this many voxels (a face's
                                 # distance from the true surface) times the strain smoothness prior's standard deviation
 ANDERSON_DEPTH = 5              # AndersonMixing: the past iterations it combines
@@ -532,12 +536,13 @@ class TomoFit:
         # cg_warm=True: each volume step's conjugate-gradient solve starts from the previous volume step (where that
         # lowers the quadratic model) instead of from zero, so a solve cut short is continued by the next one
         self.cg_warm = False
-        # zero_mean_step=True: each volume step's strain step keeps every material's volume-fraction-weighted mean
+        # zero_mean_step ('full', the default; True or 'deviatoric'; False): each volume step's strain step keeps every material's volume-fraction-weighted mean
         # deviatoric strain where it is (zero after recenter_strain(full=True)), so the step and the zero-mean-stress
         # constraint agree (the isotropic mean stays free, for recentring to move into the lattice parameter; 'full' holds
         # it too, for a fit whose global step fits the lattice parameter);
         # without it, a step that adds a mean strain is undone by the next recentring (2026-10-23, the real cube)
-        self.zero_mean_step = False
+        self.zero_mean_step = 'full'
+        self._volume_steps = 0
         self.last_recenter = None            # recenter_strain's removed means: isotropic and per component (strain units)
         self._ray_sym, self._ray_sym_age = None, 0
         self.sync()
@@ -935,10 +940,43 @@ class TomoFit:
                 self.damp = max(self.damp / 3, 1e-6)
                 if getattr(self, 'normalize', False):
                     self.normalize_fractions()
+                self._volume_steps = getattr(self, '_volume_steps', 0) + 1
+                if getattr(self, 'mask_freeze', False) and self._volume_steps % MASK_CHECK_EVERY == 0:
+                    self.last_line['remask'] = self.refresh_mask()
                 return math.sqrt(max(dec, 0.0) / (V.numel() + E.numel())), l0 - l_best
             self.damp *= 10
         self.last_step_se = 0.0
         return float('nan'), 0.0
+
+    def free_lattice(self, rel=FREE_LATTICE_RANGE):
+        """Let the global step fit each material's lattice parameter, within rel of its current value either way. Use
+        it with zero_mean_step='full': the volume step then cannot move the mean isotropic strain, and the lattice
+        parameter carries it (the sample's mean lattice)."""
+        M = self.fit.M
+        with torch.no_grad():
+            for sl in M.slices:
+                ia = sl['a']; a_ = float(self.fit.g[ia])
+                M.lb[ia] = a_ * (1 - rel); M.ub[ia] = a_ * (1 + rel)
+
+    def refresh_mask(self):
+        """With mask_freeze: recompute each material's mask from the current volume fractions, and replace the frozen
+        one where the two overlap (intersection over union) less than MASK_IOU_MIN. Returns [(material, overlap)] for
+        the masks replaced. volume_step calls it every MASK_CHECK_EVERY steps."""
+        frozen = getattr(self, '_mask', None)
+        if not getattr(self, 'mask_freeze', False) or frozen is None:
+            return []
+        self.mask_freeze = False
+        try:
+            now = self.material_voxels()
+        finally:
+            self.mask_freeze = True
+        out = []
+        for r in range(now.shape[-1]):
+            inter = float((frozen[..., r] & now[..., r]).sum()); union = float((frozen[..., r] | now[..., r]).sum())
+            iou = inter / union if union > 0 else 1.0
+            if iou < MASK_IOU_MIN:
+                frozen[..., r] = now[..., r]; out.append((r, iou))
+        return out
 
     @staticmethod
     def full_level(v):
@@ -1427,15 +1465,17 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='quadratic', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=True,
-           smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, normalize=False, eq_stencil='corner',
+           smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, normalize=True, free_lattice=True,
+           eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
     spectrum is pinned at one wavelength to its warm-up value, which removes the density-spectrum scale trade-off.
-    normalize=True removes it instead by the volume fractions: each material's median volume fraction over its own voxels
-    is set to 1 at the start and after every volume step (normalize_fractions), without fraction's bound at 1; use it
-    without anchor_scale.
+    normalize=True (the default) removes it instead by the volume fractions: each material's full level (full_level) is
+    set to 1 at the start and after every volume step (normalize_fractions), without fraction's bound at 1; use it
+    without anchor_scale. free_lattice=True (the default) lets the global step fit the lattice parameters
+    (TomoFit.free_lattice), as the default zero_mean_step='full' needs.
     inflation is the variance inflation of the counts (count correlation; it scales the contamination thresholds);
     density_smooth adds the density smoothness prior. weights (views, C) select the strain model (None: a scalar
     dilation; beam_geometry tensor weights: the strain tensor) and elastic the equilibrium prior (see TomoFit).
@@ -1569,10 +1609,13 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
             V = V.clamp(0, VOLUME_FRACTION_MAX if fraction else float('inf'))
     C = 1 if weights is None else np.asarray(weights).shape[1]
     E0 = torch.zeros(*V.shape, C, device=device, dtype=V.dtype)
-    return TomoFit(fit, proj, V, E0, weights=weights, density_smooth=density_smooth, elastic=elastic, eq_sd=eq_sd,
-                   cg_iters=cg_iters, support=support, precond=precond, density_prior=density_prior,
-                   voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd, mask_method=mask_method,
-                   mask_freeze=mask_freeze, fraction=fraction, eq_stencil=eq_stencil, normalize=normalize), dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
+    tf = TomoFit(fit, proj, V, E0, weights=weights, density_smooth=density_smooth, elastic=elastic, eq_sd=eq_sd,
+                 cg_iters=cg_iters, support=support, precond=precond, density_prior=density_prior,
+                 voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd, mask_method=mask_method,
+                 mask_freeze=mask_freeze, fraction=fraction, eq_stencil=eq_stencil, normalize=normalize)
+    if free_lattice:
+        tf.free_lattice()
+    return tf, dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
                                                            resolution=[float(v) for v in resolution], traction=traction, smooth_sd=smooth_sd,
                                                            noise=noise_info)
 
