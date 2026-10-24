@@ -138,6 +138,27 @@ def test_mean_projector():
     assert float((P(Y) - Y).abs().max()) < 1e-12
 
 
+def test_traction_normal_flat_face():
+    """traction_model='normal' carries the traction to the surface: on a flat free face half a voxel beyond the boundary
+    voxels' centres, a stress falling linearly to zero at that surface gives zero traction (the axis model does not)."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n, nu = 8, 0.3
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.elastic = 1, 6, [(1.0, nu)]
+    ins = torch.zeros(n, n, n, 1, dtype=torch.bool); ins[1:4, 1:7, 1:7] = True          # volume axes (y, x, z)
+    tf._eq_inside = ins
+    tf.V = ins.to(torch.float64)
+    y = torch.arange(n, dtype=torch.float64)[:, None, None].expand(n, n, n)
+    sig = 3.5 - y                                                                      # sigma_yy, zero at y = 3.5
+    E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
+    E[..., 0, 0] = -nu * sig; E[..., 0, 1] = sig; E[..., 0, 2] = -nu * sig            # uniaxial stress along y
+    t = tf._traction_normal(E)[3, 3, 3, 0]                                             # a voxel on the face y = 3
+    assert float(t.abs().max()) < 1e-9
+    assert float(tf._traction(E)[3, 3, 3, 0].abs().max()) > 0.1
+
+
 def test_fft_preconditioner_symbol():
     """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
