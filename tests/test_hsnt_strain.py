@@ -180,6 +180,30 @@ def test_refresh_mask():
     assert bool((tf._mask[..., 1] == (V[..., 1] > 0.5)).all()) and bool((tf._mask[..., 0] == (V[..., 0] > 0.5)).all())
 
 
+def test_qggmrf_strain_prior_gradient():
+    """The q-GGMRF strain prior's gradient (strain_lap with its weights at E) matches finite differences of its value,
+    and it is far weaker than the quadratic prior across a jump."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 6
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.voxel_scale, tf.smooth_sd = 1, 6, 1.0, 8e-4
+    tf.smooth_E = 1.0 / tf.smooth_sd ** 2
+    g = torch.Generator().manual_seed(2)
+    E = 3e-4 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64)
+    E[3:] += 2e-3                                                            # a jump across the first axis
+    tf.E = E
+    tf.strain_prior = 'qggmrf'
+    grad = tf.strain_lap(E, tf._strain_wts(E))
+    i = (2, 1, 3, 0, 4); h = 1e-9
+    Ep, Em = E.clone(), E.clone(); Ep[i] += h; Em[i] -= h
+    fd = (tf._strain_prior_value(Ep) - tf._strain_prior_value(Em)) / (2 * h)
+    assert abs(fd - float(grad[i])) < 1e-4 * max(abs(fd), 1.0)
+    q = tf._strain_prior_value(E); tf.strain_prior = 'quadratic'
+    assert q < 0.5 * tf._strain_prior_value(E)
+
+
 def test_fft_preconditioner_symbol():
     """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
