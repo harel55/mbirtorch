@@ -204,6 +204,37 @@ def test_qggmrf_strain_prior_gradient():
     assert q < 0.5 * tf._strain_prior_value(E)
 
 
+def test_prior_scale_per_material():
+    """With a per-material prior scale, the strain smoothness prior's value is each material's, scaled, and its gradient
+    (strain_lap) still matches finite differences of the value (quadratic and q-GGMRF)."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 5
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.voxel_scale, tf.smooth_sd = 2, 6, 1.0, 8e-4
+    tf.smooth_E = 1.0 / tf.smooth_sd ** 2
+    g = torch.Generator().manual_seed(3)
+    E = 5e-4 * torch.randn(n, n, n, 2, 6, generator=g, dtype=torch.float64); tf.E = E
+    for prior in ('quadratic', 'qggmrf'):
+        tf.strain_prior, tf.prior_scale = prior, None
+        tf.prior_scale = torch.tensor([1.0, 0.25], dtype=torch.float64)
+        grad = tf.strain_lap(E, tf._strain_wts(E))
+        for i in ((2, 1, 3, 0, 4), (1, 3, 2, 1, 0)):
+            h = 1e-10; Ep, Em = E.clone(), E.clone(); Ep[i] += h; Em[i] -= h
+            fd = (tf._strain_prior_value(Ep) - tf._strain_prior_value(Em)) / (2 * h)
+            assert abs(fd - float(grad[i])) < 1e-4 * max(abs(fd), 1.0), (prior, i, fd, float(grad[i]))
+    tf.strain_prior, tf.prior_scale = 'quadratic', None
+    a = tf._strain_prior_value(E)
+    tf.prior_scale = torch.tensor([1.0, 0.25], dtype=torch.float64)
+    E0 = E.clone(); E0[..., 1, :] = 0
+    E1 = E.clone(); E1[..., 0, :] = 0
+    tf.prior_scale = None
+    v0, v1 = tf._strain_prior_value(E0), tf._strain_prior_value(E1)
+    tf.prior_scale = torch.tensor([1.0, 0.25], dtype=torch.float64)
+    assert abs(tf._strain_prior_value(E) - (v0 + 0.25 * v1)) < 1e-9 * a
+
+
 def test_fft_preconditioner_symbol():
     """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
