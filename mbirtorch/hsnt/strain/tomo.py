@@ -532,8 +532,9 @@ class TomoFit:
         # cg_warm=True: each volume step's conjugate-gradient solve starts from the previous volume step (where that
         # lowers the quadratic model) instead of from zero, so a solve cut short is continued by the next one
         self.cg_warm = False
-        # zero_mean_step=True: each volume step's strain step keeps every material's volume-fraction-weighted mean strain
-        # where it is (zero after recenter_strain(full=True)), so the step and the zero-mean-stress constraint agree;
+        # zero_mean_step=True: each volume step's strain step keeps every material's volume-fraction-weighted mean
+        # deviatoric strain where it is (zero after recenter_strain(full=True)), so the step and the zero-mean-stress
+        # constraint agree (the isotropic mean stays free, for recentring to move into the lattice parameter);
         # without it, a step that adds a mean strain is undone by the next recentring (2026-10-23, the real cube)
         self.zero_mean_step = False
         self.last_recenter = None            # recenter_strain's removed means: isotropic and per component (strain units)
@@ -1239,14 +1240,20 @@ class TomoFit:
 
     def _mean_projector(self, V, fE):
         """The orthogonal projection of a strain-like field (n, n, n, R, C) onto the fields whose volume-fraction-weighted
-        mean over each material's own voxels is zero, per component (the weights of recenter_strain), restricted to the
-        free strain fE."""
+        mean deviatoric strain over each material's own voxels is zero (the weights of recenter_strain), restricted to
+        the free strain fE. The mean isotropic strain stays free: recenter_strain moves it into the lattice parameter,
+        and holding it would hold the lattice parameter at its starting value. With a scalar strain (C = 1) nothing is
+        held."""
+        if self.C != 6:
+            return lambda X: X
         own = self.material_voxels()
         w = (own.to(V.dtype) * V)[..., None] * fE.to(V.dtype)                    # (n, n, n, R, C)
         ww = (w * w).sum((0, 1, 2)).clamp_min(1e-30)
 
         def apply(X):
-            return X - w * ((w * X).sum((0, 1, 2)) / ww)
+            m = (w * X).sum((0, 1, 2)) / ww                                       # (R, C)
+            m = torch.cat([m[..., :3] - m[..., :3].mean(-1, keepdim=True), m[..., 3:]], -1)   # its deviatoric part
+            return X - w * m
         return apply
 
     def recenter_strain(self, full=False):

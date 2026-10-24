@@ -120,8 +120,8 @@ def test_recenter_full_zero_mean():
 
 
 def test_mean_projector():
-    """TomoFit._mean_projector removes each component's volume-fraction-weighted mean over the material (the mean that
-    recenter_strain(full=True) removes), and applying it twice changes nothing."""
+    """TomoFit._mean_projector removes the volume-fraction-weighted mean deviatoric strain over the material, keeps the
+    mean isotropic strain, and applying it twice changes nothing."""
     import torch
     from mbirtorch.hsnt.strain.tomo import TomoFit
 
@@ -134,7 +134,10 @@ def test_mean_projector():
     P = tf._mean_projector(tf.V, torch.ones_like(X, dtype=torch.bool))
     Y = P(X)
     w = tf.V[..., 0][..., None] * tf.material_voxels()[..., 0][..., None].to(tf.V.dtype)
-    assert float((w * Y[..., 0, :]).sum((0, 1, 2)).abs().max()) < 1e-10
+    m = (w * Y[..., 0, :]).sum((0, 1, 2))
+    assert float((m[:3] - m[:3].mean()).abs().max()) < 1e-10 and float(m[3:].abs().max()) < 1e-10   # no deviatoric mean
+    mX = (w * X[..., 0, :]).sum((0, 1, 2))
+    assert abs(float(m[:3].mean() - mX[:3].mean())) < 1e-10                                            # isotropic mean kept
     assert float((P(Y) - Y).abs().max()) < 1e-12
 
 
