@@ -229,6 +229,44 @@ def test_qggmrf_strain_prior_curvature():
             assert torch.allclose(s_, c_, rtol=1e-2)
 
 
+@pytest.mark.parametrize("prior", ["quadratic", "qggmrf"])
+def test_second_order_strain_prior(prior):
+    """With smooth_order=2 the strain smoothness prior costs nothing for a linear strain field, its gradient
+    (strain_lap with its weights at E) matches finite differences of its value, the curvature weights give its Hessian,
+    and strain_diag is the diagonal of strain_lap."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 6
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.voxel_scale, tf.smooth_sd, tf.smooth_order = 1, 6, 0.5, 8e-4, 2
+    tf.smooth_E = tf._smooth_vs() / tf.smooth_sd ** 2
+    tf.strain_prior = prior
+    z, y, x = torch.meshgrid(*[torch.arange(n, dtype=torch.float64)] * 3, indexing='ij')
+    lin = (1e-4 * (z + 2 * y - x) + 3e-4)[..., None, None].expand(n, n, n, 1, 6).clone()
+    tf.E = lin
+    assert abs(tf._strain_prior_value(lin)) < 1e-8 * tf._strain_prior_value(lin + 1e-4 * torch.rand(lin.shape, dtype=torch.float64))
+    g = torch.Generator().manual_seed(4)
+    E = lin + 3e-4 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64)
+    E[3:] += 2e-3                                                            # a jump across the first axis
+    tf.E = E
+    grad = tf.strain_lap(E, tf._strain_wts(E))
+    i = (2, 1, 3, 0, 4); h = 1e-9
+    Ep, Em = E.clone(), E.clone(); Ep[i] += h; Em[i] -= h
+    fd = (tf._strain_prior_value(Ep) - tf._strain_prior_value(Em)) / (2 * h)
+    assert abs(fd - float(grad[i])) < 1e-4 * max(abs(fd), 1.0)
+    v = torch.randn(E.shape, generator=g, dtype=torch.float64)
+    gradf = lambda X: tf.strain_lap(X, tf._strain_wts(X))
+    fdh = (gradf(E + 1e-9 * v) - gradf(E - 1e-9 * v)) / 2e-9
+    cw = tf._strain_wts(E, curvature=True)
+    hv = tf.strain_lap(v, cw)
+    assert float((fdh - hv).norm()) < 1e-4 * float(hv.norm())
+    diag = tf.strain_diag(cw) if prior == 'qggmrf' else torch.as_tensor(tf.strain_diag(None)).expand_as(E)
+    k = (2, 3, 2, 0, 1)                                                      # an interior unknown
+    unit = torch.zeros_like(E); unit[k] = 1.0
+    assert abs(float(tf.strain_lap(unit, cw)[k]) - float(diag[k])) < 1e-6 * abs(float(diag[k]))
+
+
 def test_prior_scale_per_material():
     """With a per-material prior scale, the strain smoothness prior's value is each material's, scaled, and its gradient
     (strain_lap) still matches finite differences of the value (quadratic and q-GGMRF)."""
@@ -315,21 +353,23 @@ def test_uncertainty_sampling_and_posterior():
     assert tf.strain_sd.shape == (1, 1, 1, 2, 6) and torch.allclose(tf.strain_sd ** 2, want, rtol=1e-8)
 
 
-def test_fft_preconditioner_symbol():
-    """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
+@pytest.mark.parametrize("order", [1, 2])
+def test_fft_preconditioner_symbol(order):
+    """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces,
+    for the first- and second-order smoothness priors."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
     n = 12
     tf = object.__new__(TomoFit)
     tf.R, tf.C = 1, 6
     tf.V = torch.ones(n, n, n, 1, dtype=torch.float64)
     tf.elastic = [(211e9, 0.29)]
-    tf.lam_E, tf.smooth_E, tf.eq_w = 0.3, 2.0, 5.0
+    tf.lam_E, tf.smooth_E, tf.eq_w, tf.smooth_order = 0.3, 2.0, 5.0, order
     g = torch.Generator().manual_seed(0)
     X = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
     X[4:8, 4:8, 4:8] = torch.randn(4, 4, 4, 1, 6, generator=g, dtype=torch.float64)
     full = torch.ones(n, n, n, 1, dtype=torch.bool)
     div = lambda Y: tf._divergence(Y, full).reshape(*Y.shape[:3], -1)
-    direct = 2 * tf.lam_E * X + tf.smooth_E * tf.laplacian(X) + tf.eq_w * torch.func.vjp(div, X)[1](div(X))[0]
+    direct = 2 * tf.lam_E * X + tf.smooth_E * tf._smooth_apply(X) + tf.eq_w * torch.func.vjp(div, X)[1](div(X))[0]
     sym = tf._prior_symbol()
     via = torch.fft.ifftn(torch.einsum('xyzrab,xyzrb->xyzra', sym, torch.fft.fftn(X, dim=(0, 1, 2))), dim=(0, 1, 2)).real
     assert torch.allclose(via, direct, atol=1e-10 * float(direct.abs().max()))

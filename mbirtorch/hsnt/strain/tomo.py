@@ -31,6 +31,7 @@ from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
 STRAIN_PRIOR_SD = 1e-2          # standard deviation of the weak strain prior
 STRAIN_SMOOTH_SD = 3e-4         # standard deviation of the strain difference between neighbouring voxels
+DIFFERENCE_STENCILS = {1: (-1.0, 1.0), 2: (1.0, -2.0, 1.0)}   # the smoothness prior's differences along an axis, by order
 JOINT_CG_ITERS = 60             # conjugate-gradient iterations of the joint (volumes + global) step
 MASK_FLOOR_REL = 0.1            # the material mask ('median'): the typical density is the median over the voxels whose
                                 # density exceeds this fraction of the maximum
@@ -454,7 +455,7 @@ class TomoFit:
     def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
                  eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi', density_prior='qggmrf',
                  voxel_scale=1.0, traction=False, mask_method='max', mask_freeze=False, fraction=False,
-                 eq_stencil='corner', normalize=False, strain_prior='qggmrf'):
+                 eq_stencil='corner', normalize=False, strain_prior='qggmrf', smooth_order=1):
         """traction=True adds traction-free faces to the equilibrium prior: on the voxels at the sample's
         free faces, the traction sigma . n / Young's modulus (n the outward normal) has the equilibrium prior's standard
         deviation; a face against another material is bonded and carries no condition. It is off by default: on curved,
@@ -510,7 +511,13 @@ class TomoFit:
         self.proj = proj.with_q(self.R * (1 + self.C))
         vs = self.voxel_scale
         self.lam_E = 0.0 if support else vs ** 3 * 0.5 / STRAIN_PRIOR_SD ** 2    # negative log-likelihood scale
-        self.smooth_E = 0.0 if smooth_sd is None else vs / smooth_sd ** 2
+        # smooth_order: the strain smoothness prior acts on first differences (1, the default: it costs nothing only for a
+        # constant strain) or second differences (2: nothing for a strain that varies linearly, so it flattens smooth
+        # gradients much less at the same noise). smooth_sd is the standard deviation of that difference; the weight
+        # scales with voxel_scale^(3 - 2 smooth_order), as the continuum prior's on a finer grid.
+        assert smooth_order in DIFFERENCE_STENCILS, smooth_order
+        self.smooth_order = smooth_order
+        self.smooth_E = 0.0 if smooth_sd is None else self._smooth_vs() / smooth_sd ** 2
         # strain_prior: 'quadratic' (a Gaussian prior on neighbour differences) or 'qggmrf' (edge-preserving: the same for
         # differences well below smooth_sd, much weaker for larger jumps, so the strain may jump at material boundaries
         # and inclusion edges; as density_prior='qggmrf' for the volume fractions; the default)
@@ -617,6 +624,27 @@ class TomoFit:
             df = E.diff(dim=d)                                                      # E_(k+1) - E_k
             n = E.shape[d]
             out.narrow(d, 0, n - 1).sub_(df); out.narrow(d, 1, n - 1).add_(df)
+        return out
+
+    def _smooth_vs(self):
+        """The strain smoothness prior's voxel-size factor, voxel_scale^(3 - 2 smooth_order)."""
+        return self.voxel_scale ** (3 - 2 * getattr(self, 'smooth_order', 1))
+
+    def _sdiff(self, x, d):
+        """The strain smoothness prior's differences of x along axis d (first or second, by smooth_order)."""
+        return x.diff(dim=d, n=getattr(self, 'smooth_order', 1))
+
+    def _smooth_apply(self, x, wts=None):
+        """Sum over the axes of D^T W D x, with D the smoothness prior's differences and W its weights (None: 1)."""
+        st = DIFFERENCE_STENCILS[getattr(self, 'smooth_order', 1)]
+        out = torch.zeros_like(x)
+        for d in range(3):
+            df = self._sdiff(x, d)
+            if wts is not None:
+                df = df * wts[d]
+            m = df.shape[d]
+            for j, c in enumerate(st):
+                out.narrow(d, j, m).add_(c * df)
         return out
 
     def _scale_E(self):
@@ -742,36 +770,35 @@ class TomoFit:
         sx = float(self.smooth_sd)
         if not curvature:
             from mbirtorch.qggmrf import b_tilde_by_definition
-            return [self.voxel_scale * 2 * b_tilde_by_definition(E.diff(dim=d), sx, QGGMRF_P, QGGMRF_Q, QGGMRF_T)
+            return [self._smooth_vs() * 2 * b_tilde_by_definition(self._sdiff(E, d), sx, QGGMRF_P, QGGMRF_Q, QGGMRF_T)
                     for d in range(3)]
         out = []
         for d in range(3):
             with torch.enable_grad():
                 # rho is even, so rho''(d) = rho''(|d|); the floor keeps zero differences at the quadratic curvature
-                x = E.diff(dim=d).detach().double().abs().clamp_min(QGGMRF_T * sx * 1e-7).requires_grad_(True)
+                x = self._sdiff(E, d).detach().double().abs().clamp_min(QGGMRF_T * sx * 1e-7).requires_grad_(True)
                 g = torch.autograd.grad(self._qggmrf_rho(x, sx).sum(), x, create_graph=True)[0]
                 h = torch.autograd.grad(g.sum(), x)[0]
-            out.append(self.voxel_scale * h.clamp_min(0).to(E.dtype))
+            out.append(self._smooth_vs() * h.clamp_min(0).to(E.dtype))
         return out
 
     def strain_lap(self, x, wts):
         """The strain smoothness prior's curvature (or, at x = E, its gradient) applied to x."""
         if wts is None:
-            return self.smooth_E * self.laplacian(x) * self._scale_E()
-        out = torch.zeros_like(x)
-        for d in range(3):
-            df = x.diff(dim=d) * wts[d]; k = x.shape[d]
-            out.narrow(d, 0, k - 1).sub_(df); out.narrow(d, 1, k - 1).add_(df)
-        return out * self._scale_E()
+            return self.smooth_E * self._smooth_apply(x) * self._scale_E()
+        return self._smooth_apply(x, wts) * self._scale_E()
 
     def strain_diag(self, wts):
-        """The diagonal of strain_lap: per unknown, the sum of its pairs' weights."""
+        """The diagonal of strain_lap: per unknown, the sum over its differences of the weight times its stencil
+        coefficient squared (for the quadratic prior, the interior value)."""
+        st = DIFFERENCE_STENCILS[getattr(self, 'smooth_order', 1)]
         if wts is None:
-            return 6 * self.smooth_E * self._scale_E()
+            return 3 * sum(c * c for c in st) * self.smooth_E * self._scale_E()
         out = torch.zeros_like(self.E)
         for d in range(3):
-            k = self.E.shape[d]
-            out.narrow(d, 0, k - 1).add_(wts[d]); out.narrow(d, 1, k - 1).add_(wts[d])
+            m = wts[d].shape[d]
+            for j, c in enumerate(st):
+                out.narrow(d, j, m).add_(c * c * wts[d])
         return out * self._scale_E()
 
     def _strain_prior_value(self, E):
@@ -779,12 +806,12 @@ class TomoFit:
         s = getattr(self, 'prior_scale', None)
         per = lambda t: (t.sum((0, 1, 2, 4)) * s.double()).sum() if s is not None else t.sum()   # per material, scaled
         if getattr(self, 'strain_prior', 'quadratic') == 'quadratic' or self.smooth_sd is None:
-            tot = sum(per(d.double() ** 2) for d in (E.diff(dim=0), E.diff(dim=1), E.diff(dim=2)))
+            tot = sum(per(self._sdiff(E, d).double() ** 2) for d in range(3))
             return 0.5 * self.smooth_E * float(tot)
         sx = float(self.smooth_sd); tot = 0.0
         for d in range(3):
-            tot += float(per(self._qggmrf_rho(E.diff(dim=d).double(), sx)))
-        return self.voxel_scale * tot
+            tot += float(per(self._qggmrf_rho(self._sdiff(E, d).double(), sx)))
+        return self._smooth_vs() * tot
 
     def _dens_wts(self, V):
         """Per-axis neighbour weights of the q-GGMRF density prior at V (its surrogate curvature rho'(d) / d per
@@ -1247,7 +1274,7 @@ class TomoFit:
             for k in range(C):
                 X = torch.zeros(n, n, n, R, C, device=V.device, dtype=V.dtype); X[c + (r, k)] = 1.0
                 s_r = 1.0 if getattr(self, 'prior_scale', None) is None else float(self.prior_scale[r])
-                resp = s_r * (2 * self.lam_E * X + self.smooth_E * self.laplacian(X))
+                resp = s_r * (2 * self.lam_E * X + self.smooth_E * self._smooth_apply(X))
                 if self.elastic is not None:
                     resp = resp + self.eq_w * torch.func.vjp(div, X)[1](div(X))[0]
                 resp = torch.roll(resp[..., r, :], shifts=tuple(-v for v in c), dims=(0, 1, 2)).double()
@@ -1325,7 +1352,8 @@ class TomoFit:
         EbUU = torch.einsum('xyzrk,xyzrkl->xyzrl', E, bUU)
         B[..., 0, 0] = bWW + 2 * (E * bWU).sum(-1) + (EbUU * E).sum(-1) + self.dens_diag(self._wts)
         B[..., 0, 1:] = V[..., None] * (bWU + EbUU); B[..., 1:, 0] = B[..., 0, 1:]
-        B[..., 1:, 1:] = V[..., None, None] ** 2 * bUU + (2 * self.lam_E + 6 * self.smooth_E) * torch.eye(C, device=V.device)
+        st = DIFFERENCE_STENCILS[getattr(self, 'smooth_order', 1)]
+        B[..., 1:, 1:] = V[..., None, None] ** 2 * bUU + (2 * self.lam_E + 3 * sum(c * c for c in st) * self.smooth_E) * torch.eye(C, device=V.device)
         if self.elastic is not None:
             # the equilibrium prior's zero-lag block, from its response to unit impulses at an interior voxel
             for r in range(R):
@@ -1683,7 +1711,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
            density_prior='qggmrf', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, normalize=True, free_lattice=True,
-           strain_prior='qggmrf',
+           strain_prior='qggmrf', smooth_order=1,
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
@@ -1692,7 +1720,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     spectrum is pinned at one wavelength to its warm-up value, which removes the density-spectrum scale trade-off.
     normalize=True (the default) removes it instead by the volume fractions: each material's full level (full_level) is
     set to 1 at the start and after every volume step (normalize_fractions), without fraction's bound at 1; use it
-    without anchor_scale. strain_prior: 'qggmrf' (the default) or 'quadratic' (TomoFit). free_lattice=True (the default) lets the global step fit the lattice parameters
+    without anchor_scale. strain_prior: 'qggmrf' (the default) or 'quadratic' (TomoFit); smooth_order: its differences, first (1) or second (2) (TomoFit). free_lattice=True (the default) lets the global step fit the lattice parameters
     (TomoFit.free_lattice), as the default zero_mean_step='full' needs.
     inflation is the variance inflation of the counts (count correlation; it scales the contamination thresholds);
     density_smooth adds the density smoothness prior. weights (views, C) select the strain model (None: a scalar
@@ -1831,7 +1859,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
                  cg_iters=cg_iters, support=support, precond=precond, density_prior=density_prior,
                  voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd, mask_method=mask_method,
                  mask_freeze=mask_freeze, fraction=fraction, eq_stencil=eq_stencil, normalize=normalize,
-                 strain_prior=strain_prior)
+                 strain_prior=strain_prior, smooth_order=smooth_order)
     if free_lattice:
         tf.free_lattice()
     return tf, dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
