@@ -650,7 +650,7 @@ class TomoFit:
             dV, dE = zV + (rz_new / rz) * dV, zE + (rz_new / rz) * dE; rz = rz_new
         return xV, xE
 
-    def _run_probes(self, H, prec, proj_E, fE, swts, evidence):
+    def _run_probes(self, H, prec, proj_E, fE, wts, evidence):
         """Random sign probes z of the strain block of the volume step's curvature H, each solved H y = z. With evidence,
         each material's trace of L H^-1 (L: the smoothness prior's curvature at unit scale) for evidence_update; with an
         uncertainty request, the diagonal of H^-1 (strain_sd)."""
@@ -661,7 +661,7 @@ class TomoFit:
         tr = torch.zeros(self.R, dtype=torch.float64, device=E.device)
         var = torch.zeros_like(E) if n_un else None
         s = self._scale_E()
-        L = lambda X: self.strain_lap(X, swts) / s
+        L = lambda X: self.strain_lap(X, wts) / s
         zeroV = torch.zeros_like(V)
         for p in range(k):
             z = proj_E((torch.randint(0, 2, E.shape, generator=gen, device=E.device) * 2 - 1).to(E.dtype) * fE)
@@ -1034,7 +1034,7 @@ class TomoFit:
                 prec = lambda rV, rE: (lambda z: (z[0], proj_E(z[1])))(prec0(rV, rE))
                 H = lambda xV, xE: (lambda h: (h[0], proj_E(h[1])))(H0(xV, xE))
             if probes_due:                         # with this step's curvature, before the step moves the state
-                self._run_probes(H, prec, proj_E, fE, swts, evidence_due); probes_due = False
+                self._run_probes(H, prec, proj_E, fE, cwts, evidence_due); probes_due = False
             bV, bE = -gV * free, proj_E(-gE * fE)
             xV, xE = torch.zeros_like(V), torch.zeros_like(E)
             rV, rE = bV.clone(), bE.clone()
