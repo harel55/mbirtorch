@@ -204,6 +204,31 @@ def test_qggmrf_strain_prior_gradient():
     assert q < 0.5 * tf._strain_prior_value(E)
 
 
+def test_qggmrf_strain_prior_curvature():
+    """The curvature weights give the q-GGMRF strain prior's exact Hessian (finite differences of its gradient), and they
+    equal the surrogate weights where the differences are small."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 6
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.voxel_scale, tf.smooth_sd = 1, 6, 1.0, 8e-4
+    tf.smooth_E = 1.0 / tf.smooth_sd ** 2
+    tf.strain_prior = 'qggmrf'
+    g = torch.Generator().manual_seed(3)
+    E = 3e-4 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64)
+    E[3:] += 2e-3                                                            # a jump across the first axis
+    v = torch.randn(E.shape, generator=g, dtype=torch.float64)
+    grad = lambda x: tf.strain_lap(x, tf._strain_wts(x))
+    h = 1e-9
+    fd = (grad(E + h * v) - grad(E - h * v)) / (2 * h)
+    hv = tf.strain_lap(v, tf._strain_wts(E, curvature=True))
+    assert float((fd - hv).norm()) < 1e-4 * float(hv.norm())
+    for small in (1e-4 * E, torch.zeros_like(E)):
+        for s_, c_ in zip(tf._strain_wts(small), tf._strain_wts(small, curvature=True)):
+            assert torch.allclose(s_, c_, rtol=1e-2)
+
+
 def test_prior_scale_per_material():
     """With a per-material prior scale, the strain smoothness prior's value is each material's, scaled, and its gradient
     (strain_lap) still matches finite differences of the value (quadratic and q-GGMRF)."""
