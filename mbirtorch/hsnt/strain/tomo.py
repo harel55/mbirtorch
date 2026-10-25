@@ -553,6 +553,9 @@ class TomoFit:
         # hold_strain=True keeps the strain where it is (the volume steps move the density only), e.g. for the first
         # iterations, so the spectrum and the density settle before the strain is fitted
         self.hold_strain = False
+        # hold_volume=True keeps the volume fractions where they are (the volume steps move the strain only), e.g. to
+        # test how much of a strain error comes from errors in the volume fractions
+        self.hold_volume = False
         self.cg_iters = cg_iters
         self.damp = 1e-3
         self.last_step_se = float('inf')     # the last volume step's RMS in standard errors (_step_se), for a stopping rule
@@ -1021,7 +1024,7 @@ class TomoFit:
         gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         swts = self._strain_wts(E); cwts = self._strain_wts(E, curvature=True)          # gradient; curvature
         gE = V[..., None] * bGU + 2 * self.lam_E * E * self._scale_E() + self.strain_lap(E, swts) + eq(E)
-        free = self._free_density(V, gV)                                            # V's active bounds held
+        free = self._free_density(V, gV) & (not getattr(self, 'hold_volume', False))  # V's active bounds held
         fE = self.support_mask().expand_as(E) & (not self.hold_strain)              # strain free inside the support
         # Jacobi preconditioner from the ray Fisher diagonals (for the strain parts, each view's weight squared)
         dWW = torch.diagonal(F[:, :R, :R], dim1=1, dim2=2); dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
@@ -1580,7 +1583,7 @@ class TomoFit:
         gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         swts = self._strain_wts(E); cwts = self._strain_wts(E, curvature=True)          # gradient; curvature
         gE = V[..., None] * bGU + 2 * self.lam_E * E * self._scale_E() + self.strain_lap(E, swts) + eq(E)
-        fV = self._free_density(V, gV); fE = self.support_mask().expand_as(E) & (not self.hold_strain)
+        fV = self._free_density(V, gV) & (not getattr(self, 'hold_volume', False)); fE = self.support_mask().expand_as(E) & (not self.hold_strain)
         # the global parameters that move: informative and not held at a bound
         gi = fit.g[idx]; lb, ub = M.lb[idx], M.ub[idx]
         d = torch.diagonal(Fg)
