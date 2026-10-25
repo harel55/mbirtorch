@@ -283,6 +283,38 @@ def test_cg_solve_and_evidence_update():
     assert torch.allclose(tf.prior_scale, want.to(tf.prior_scale.dtype))
 
 
+def test_uncertainty_sampling_and_posterior():
+    """The uncertainty probes give the diagonal of H^-1 F H^-1 (kind 'sampling') or of H^-1 (kind 'posterior'); with
+    a diagonal H = F + P one probe gives either exactly."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C = 2, 6
+    tf.V = torch.ones(2, 2, 2, 2, dtype=torch.float64)
+    tf.E = torch.zeros(2, 2, 2, 2, 6, dtype=torch.float64)
+    tf.prior_scale = None; tf.voxel_scale = 1.0; tf.lam_E = 0.0
+    fd = torch.linspace(1.0, 5.0, 2 * 6 * 8, dtype=torch.float64).reshape(tf.E.shape)    # the data's curvature
+    pd = torch.linspace(3.0, 0.5, 2 * 6 * 8, dtype=torch.float64).reshape(tf.E.shape)    # the prior's
+    H = lambda xV, xE: (xV, (fd + pd) * xE)
+    H_data = lambda xV, xE: (torch.zeros_like(xV), fd * xE)
+    prec = lambda rV, rE: (rV, rE)
+    fE = torch.ones_like(tf.E, dtype=torch.bool)
+    for kind, want in (('sampling', fd / (fd + pd) ** 2), ('posterior', 1 / (fd + pd))):
+        tf.request_uncertainty(1, kind)
+        tf._run_probes(H, prec, lambda X: X, fE, None, False, H_data)
+        assert torch.allclose(tf.strain_sd ** 2, want, rtol=1e-8)
+        assert tf.last_probe_cost['solves'] == (2 if kind == 'sampling' else 1)
+    # block averages of 2 x 2 x 2 voxels: with a constant diagonal in each block, the average's variance is diag / 8
+    fd = fd.reshape(2 * 2 * 2 * 2, 6)[:2].repeat(8, 1).reshape(tf.E.shape)                  # one value per block
+    pd = torch.full_like(fd, 0.5)
+    H = lambda xV, xE: (xV, (fd + pd) * xE)
+    tf.request_uncertainty(1, 'sampling', block=2)
+    tf._run_probes(H, prec, lambda X: X, fE, None, False, lambda xV, xE: (torch.zeros_like(xV), fd * xE))
+    want = (fd / (fd + pd) ** 2)[:1, :1, :1] / 8
+    assert tf.strain_sd.shape == (1, 1, 1, 2, 6) and torch.allclose(tf.strain_sd ** 2, want, rtol=1e-8)
+
+
 def test_fft_preconditioner_symbol():
     """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
