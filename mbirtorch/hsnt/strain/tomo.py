@@ -53,6 +53,13 @@ FREE_LATTICE_RANGE = 0.01       # free_lattice: each lattice parameter may move 
 MASK_CHECK_EVERY = 5            # with mask_freeze, the frozen material masks are checked every this many volume steps ...
 MASK_IOU_MIN = 0.9              # ... and a material's is recomputed when it overlaps the current one (intersection over
                                 # union) less than this: the warm-up's mask of a weak material can reach far beyond it
+EVIDENCE_EVERY = 5              # prior_scaling='evidence': the strain-prior scales are re-estimated at most every this many
+                                # volume steps, and only once the strain has settled for the current scales (its last
+EVIDENCE_SETTLE = 0.05          # step below this fraction of its RMS): the update holds only at the strain's mode; ...
+EVIDENCE_PROBES = 2             # ... from this many random probes of the curvature (Hutchinson's trace estimate), ...
+EVIDENCE_CG_ITERS = 60          # ... each solved by this many conjugate-gradient iterations ...
+EVIDENCE_MAX_STEP = 3.0         # ... and each scale moves at most this factor per update
+PROBE_SEED = 20261024           # the probes' random signs (reproducible runs)
 TRACTION_OFFSET = 0.5           # traction_sd='grid': the traction's standard deviation is this many voxels (a face's
                                 # distance from the true surface) times the strain smoothness prior's standard deviation
 ANDERSON_DEPTH = 5              # AndersonMixing: the past iterations it combines
@@ -510,6 +517,13 @@ class TomoFit:
         # measured material is not overruled by the priors; measured at the first volume step, then held). The
         # equilibrium and traction priors are not scaled: they state physics.
         self.prior_scaling, self.prior_scale = 'fixed', None
+        # 'evidence' estimates the scales from the data instead (evidence_update); request_uncertainty(n) has the next
+        # volume step estimate each strain unknown's posterior standard deviation (strain_sd)
+        self._uncertainty_probes, self.strain_sd, self.last_evidence = 0, None, None
+        # prior_scaling_power: with 'fisher', each scale is the information ratio to this power (1: proportional; between
+        # 0 and 1 a partial correction). probe_cg_iters and evidence_every: the probes' solve length and the evidence
+        # update's interval (the trace in the evidence needs near-exact solves; see EVIDENCE_CG_ITERS)
+        self.prior_scaling_power, self.probe_cg_iters, self.evidence_every = 1.0, EVIDENCE_CG_ITERS, EVIDENCE_EVERY
         # density smoothness, per material: 1 / sd^2 with sd = DENSITY_SMOOTH_REL x the median density over the
         # voxels above half the material's maximum
         self.smooth_V = torch.zeros(self.R, device=V.device, dtype=V.dtype)
@@ -608,8 +622,74 @@ class TomoFit:
         own = self.material_voxels()
         typ = torch.stack([data_diag[..., r, :].mean(-1)[own[..., r]].median() if bool(own[..., r].any())
                            else data_diag.new_zeros(()) for r in range(self.R)])
-        self.prior_scale = (typ / typ.max().clamp_min(torch.finfo(typ.dtype).tiny)).clamp_min(1e-6).to(self.E.dtype)
+        ratio = (typ / typ.max().clamp_min(torch.finfo(typ.dtype).tiny)).clamp_min(1e-6)
+        self.prior_scale = (ratio ** float(getattr(self, 'prior_scaling_power', 1.0))).to(self.E.dtype)
         return self.prior_scale
+
+    def request_uncertainty(self, n_probes):
+        """Have the next volume step estimate each strain unknown's posterior standard deviation (strain_sd, shaped as
+        E) from n_probes random probes of its curvature: the diagonal of its inverse by Hutchinson's estimator. Use it
+        for the last iteration of a fit; a few dozen probes, averaged over neighbouring voxels, give a usable map."""
+        self._uncertainty_probes = int(n_probes)
+
+    def _cg_solve(self, H, prec, bV, bE, iters):
+        """Preconditioned conjugate gradients for H x = b (the volume step's operator), from zero."""
+        xV, xE = torch.zeros_like(bV), torch.zeros_like(bE)
+        rV, rE = bV.clone(), bE.clone()
+        zV, zE = prec(rV, rE); dV, dE = zV.clone(), zE.clone()
+        rz = float((rV * zV).sum() + (rE * zE).sum())
+        for _ in range(iters):
+            if rz <= 0:
+                break
+            hV, hE = H(dV, dE)
+            a = rz / max(float((dV * hV).sum() + (dE * hE).sum()), 1e-300)
+            xV += a * dV; xE += a * dE; rV -= a * hV; rE -= a * hE
+            zV, zE = prec(rV, rE)
+            rz_new = float((rV * zV).sum() + (rE * zE).sum())
+            dV, dE = zV + (rz_new / rz) * dV, zE + (rz_new / rz) * dE; rz = rz_new
+        return xV, xE
+
+    def _run_probes(self, H, prec, proj_E, fE, swts, evidence):
+        """Random sign probes z of the strain block of the volume step's curvature H, each solved H y = z. With evidence,
+        each material's trace of L H^-1 (L: the smoothness prior's curvature at unit scale) for evidence_update; with an
+        uncertainty request, the diagonal of H^-1 (strain_sd)."""
+        V, E = self.V, self.E
+        n_un = self._uncertainty_probes
+        k = max(EVIDENCE_PROBES if evidence else 0, n_un)
+        gen = torch.Generator(device=E.device).manual_seed(PROBE_SEED + getattr(self, '_volume_steps', 0))
+        tr = torch.zeros(self.R, dtype=torch.float64, device=E.device)
+        var = torch.zeros_like(E) if n_un else None
+        s = self._scale_E()
+        L = lambda X: self.strain_lap(X, swts) / s
+        zeroV = torch.zeros_like(V)
+        for p in range(k):
+            z = proj_E((torch.randint(0, 2, E.shape, generator=gen, device=E.device) * 2 - 1).to(E.dtype) * fE)
+            _, yE = self._cg_solve(H, prec, zeroV, z, int(getattr(self, 'probe_cg_iters', EVIDENCE_CG_ITERS)))
+            if evidence and p < EVIDENCE_PROBES:
+                tr += (z * L(yE)).double().sum((0, 1, 2, 4))
+            if n_un:
+                var += z * yE
+        if evidence:
+            self.evidence_update(tr / EVIDENCE_PROBES, L, fE); self._last_evidence_step = getattr(self, '_volume_steps', 0)
+        if n_un:
+            self.strain_sd = (var / n_un).clamp_min(0).sqrt(); self._uncertainty_probes = 0
+
+    def evidence_update(self, trace, L, fE):
+        """Re-estimate each material's strain-prior scale by the evidence (type-II maximum likelihood, MacKay): the scale
+        is gamma / (E^T L E), where gamma = M - scale tr(L H^-1) counts the strain unknowns the data determine (M: the
+        material's free strain unknowns) and L is the smoothness prior's curvature at unit scale. A weakly measured
+        material gets the prior its data support, neither the common strength nor a strength proportional to its
+        information."""
+        E = self.E
+        s = (self.prior_scale if self.prior_scale is not None else torch.ones(self.R, device=E.device, dtype=E.dtype)).double()
+        energy = (E * L(E)).double().sum((0, 1, 2, 4))
+        M = fE.expand_as(E).double().sum((0, 1, 2, 4)) - self.C
+        gamma = (M - s * trace).clamp_min(1.0)
+        raw = gamma / energy.clamp_min(1e-300)
+        new = torch.minimum(torch.maximum(raw, s / EVIDENCE_MAX_STEP), s * EVIDENCE_MAX_STEP)
+        self.last_evidence = dict(scale=new.tolist(), unclamped=raw.tolist(), gamma=gamma.tolist(), unknowns=M.tolist(),
+                                  trace=trace.tolist())
+        self.prior_scale = new.to(E.dtype)
 
     def _strain_wts(self, E):
         """Per-axis neighbour weights of the q-GGMRF strain prior at E (its surrogate curvature per neighbour pair, per
@@ -916,6 +996,10 @@ class TomoFit:
             return ((bW + (E * bU).sum(-1) + self.dens_lap(xV, wts)) * free,
                     (V[..., None] * bU + 2 * self.lam_E * xE * self._scale_E() + self.strain_lap(xE, swts) + eq(xE)) * fE)
 
+        evidence_due = (getattr(self, 'prior_scaling', 'fixed') == 'evidence'
+                        and getattr(self, '_volume_steps', 0) - getattr(self, '_last_evidence_step', 0) >= getattr(self, 'evidence_every', EVIDENCE_EVERY)
+                        and getattr(self, '_last_rel_step', 1.0) < EVIDENCE_SETTLE)
+        probes_due = evidence_due or bool(getattr(self, '_uncertainty_probes', 0))
         for _ in range(6):
             lam_ = self.damp
             pV, pE = dV_ * (1 + lam_) + 1e-12, dE_ * (1 + lam_)
@@ -930,6 +1014,8 @@ class TomoFit:
                 prec0, H0 = prec, H
                 prec = lambda rV, rE: (lambda z: (z[0], proj_E(z[1])))(prec0(rV, rE))
                 H = lambda xV, xE: (lambda h: (h[0], proj_E(h[1])))(H0(xV, xE))
+            if probes_due:                         # with this step's curvature, before the step moves the state
+                self._run_probes(H, prec, proj_E, fE, swts, evidence_due); probes_due = False
             bV, bE = -gV * free, proj_E(-gE * fE)
             xV, xE = torch.zeros_like(V), torch.zeros_like(E)
             rV, rE = bV.clone(), bE.clone()
@@ -1006,6 +1092,7 @@ class TomoFit:
                 self.last_line['alpha'] = alpha; self.last_line['beta'] = beta
                 self.last_step_se = self._step_se(alpha * alpha * dec)
                 self._prev_step = (Vn - V, En - E)
+                self._last_rel_step = float((En - E).norm() / E.norm().clamp_min(1e-30))   # the strain's relative move
                 self.V, self.E = Vn, En; self.sync(); fit.remember_data_loss(d1)
                 self.damp = max(self.damp / 3, 1e-6)
                 if getattr(self, 'normalize', False):

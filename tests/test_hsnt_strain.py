@@ -235,6 +235,29 @@ def test_prior_scale_per_material():
     assert abs(tf._strain_prior_value(E) - (v0 + 0.25 * v1)) < 1e-9 * a
 
 
+def test_cg_solve_and_evidence_update():
+    """TomoFit._cg_solve solves a positive diagonal system, and evidence_update sets each material's scale to
+    gamma / (E^T L E) with gamma = M - scale tr(L H^-1), clamped to EVIDENCE_MAX_STEP per update."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit, EVIDENCE_MAX_STEP
+
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C = 2, 6
+    d = torch.linspace(1.0, 5.0, 2 * 6 * 8, dtype=torch.float64).reshape(2, 2, 2, 2, 6)
+    H = lambda xV, xE: (xV, d * xE)
+    prec = lambda rV, rE: (rV, rE)
+    b = torch.ones_like(d)
+    _, x = tf._cg_solve(H, prec, torch.zeros(2, 2, 2, 2, dtype=torch.float64), b, 60)
+    assert float((x - 1 / d).abs().max()) < 1e-10
+    tf.E = 1e-3 * torch.ones(2, 2, 2, 2, 6, dtype=torch.float64); tf.prior_scale = None
+    L = lambda X: X                                                           # unit-scale curvature: identity
+    fE = torch.ones_like(tf.E, dtype=torch.bool)
+    tf.evidence_update(torch.tensor([40.0, 10.0], dtype=torch.float64), L, fE)
+    M = 8 * 6 - 6; energy = 8 * 6 * 1e-6
+    want = torch.tensor([(M - 40.0) / energy, (M - 10.0) / energy]).clamp(max=EVIDENCE_MAX_STEP)
+    assert torch.allclose(tf.prior_scale, want.to(tf.prior_scale.dtype))
+
+
 def test_fft_preconditioner_symbol():
     """The strain priors' Fourier symbol (TomoFit._prior_symbol) reproduces their Hessian on a field away from the faces."""
     from mbirtorch.hsnt.strain.tomo import TomoFit
