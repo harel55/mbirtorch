@@ -449,6 +449,29 @@ def test_material_mask_face_overshoot(method):
     assert int(tf._eq_mask().sum()) >= 0.5 * 8 ** 3
 
 
+def test_traction_aligned_faces():
+    """traction_model='aligned' keeps the axis model's conditions on a cube's flat faces (all but its edges) and drops
+    most of them on a sphere, whose staircase faces have oblique normals."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 24
+    c = (n - 1) / 2
+    y, x, z = torch.meshgrid(*[torch.arange(n, dtype=torch.float64) - c] * 3, indexing='ij')
+    g = torch.Generator().manual_seed(5)
+    E = 1e-3 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64)
+    kept = {}
+    for name, occ in (('cube', (x.abs() < 7) & (y.abs() < 7) & (z.abs() < 7)), ('sphere', x ** 2 + y ** 2 + z ** 2 < 8.5 ** 2)):
+        tf = object.__new__(TomoFit)
+        tf.V = occ.to(torch.float64)[..., None]; tf._eq_inside = occ[..., None]; tf.elastic = [(211e9, 0.29)]
+        counts = []
+        for model in ('axis', 'aligned'):
+            tf.traction_model = model
+            counts.append(int((tf._traction(E) != 0).any(-1).sum()))
+        kept[name] = counts[1] / counts[0]
+    assert kept['cube'] > 0.7 and kept['sphere'] < 0.3, kept          # the cube loses its edge rows (diagonal normal)
+
+
 def test_traction_faces_bonded_interface():
     """Two materials side by side: the faces they share are bonded and get no traction condition; their faces against
     empty space do."""

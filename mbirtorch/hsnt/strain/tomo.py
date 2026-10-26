@@ -66,6 +66,8 @@ PROBE_SEED = 20261024           # the probes' random signs (reproducible runs)
 PRIOR_SCALING_POWER = 0.25      # prior_scaling='fisher': each material's strain-prior scale is its information ratio to
                                 # this power (on the Ni-Cu-Al spheres, Al's error as low as with fixed priors, with
                                 # less bias and more noise; 0.5 and 1 let too much noise through; 2026-10-25)
+TRACTION_ALIGN_COS = 0.97        # traction_model='aligned': a face keeps its traction condition where the surface normal
+                                # lies within this cosine (about 14 degrees) of the face's axis
 TRACTION_OFFSET = 0.5           # traction_sd='grid': the traction's standard deviation is this many voxels (a face's
                                 # distance from the true surface) times the strain smoothness prior's standard deviation
 ANDERSON_DEPTH = 5              # AndersonMixing: the past iterations it combines
@@ -556,7 +558,8 @@ class TomoFit:
         self.eq_sd, self.smooth_sd = eq_sd, smooth_sd
         # the traction-free faces' model: traction_model 'axis' (the stress times the axis normal at the centre of each
         # voxel with an empty neighbour) or 'normal' (the normal from the volume fraction's gradient, and the traction
-        # carried from the voxel centre to the surface, placed by the voxel's fill fraction); traction_sd None (the
+        # carried from the voxel centre to the surface, placed by the voxel's fill fraction) or 'aligned' ('axis' on the
+        # faces whose surface normal is within TRACTION_ALIGN_COS of their axis, none elsewhere); traction_sd None (the
         # equilibrium prior's), 'grid' (TRACTION_OFFSET x smooth_sd: the error of a face off the true surface) or a
         # number. Use 'grid' or 'normal' when the surfaces are not on the voxel faces (curved or oblique faces).
         self.traction_model, self.traction_sd = 'axis', None
@@ -922,16 +925,23 @@ class TomoFit:
     def _traction(self, E):
         """Traction / Young's modulus on the sample's free faces, (n, n, n, R, 3 normals, 3): for each volume axis, at a
         material's voxels with an empty neighbour along it (no material at all), the stress times that axis' unit
-        normal. A face against another material is bonded, not free, so it carries no traction condition."""
+        normal. A face against another material is bonded, not free, so it carries no traction condition. With
+        traction_model='aligned', a face keeps its condition only where the surface normal (_fill_normal) lies within
+        TRACTION_ALIGN_COS of its axis: flat, grid-aligned faces get it, curved and oblique faces do not (there the
+        staircase normal would add false stress)."""
         out = []
         inside = self._eq_inside
         occupied = inside.any(-1)
+        aligned = getattr(self, 'traction_model', 'axis') == 'aligned'
         for r, (Em, nu) in enumerate(self.elastic):
             sxx, syy, szz, sxy, syz, sxz = self._stress(E[..., r, :], nu)
             ins = inside[..., r]
+            nrm = self._fill_normal(r, ins)[0] if aligned else None
             faces = []
-            for ax, t in ((1, (sxx, sxy, sxz)), (0, (sxy, syy, syz)), (2, (sxz, syz, szz))):   # volume axes (y, x, z)
+            for j, (ax, t) in enumerate(((1, (sxx, sxy, sxz)), (0, (sxy, syy, syz)), (2, (sxz, syz, szz)))):   # volume axes (y, x, z)
                 face = ins & ~(torch.roll(occupied, 1, ax) & torch.roll(occupied, -1, ax))
+                if aligned:
+                    face = face & (nrm[..., j].abs() >= TRACTION_ALIGN_COS)
                 faces.append(torch.stack(t, -1) * face[..., None])
             out.append(torch.stack(faces, -2))
         return torch.stack(out, -3)
@@ -955,6 +965,16 @@ class TomoFit:
             sd = TRACTION_OFFSET * self.smooth_sd
         return self.eq_sd / float(sd)
 
+    def _fill_normal(self, r, ins):
+        """(n, n, n, 3): material r's outward surface normal (x, y, z), minus the gradient of its fill fraction (its
+        volume fraction over its median on the mask's voxels that hold it, clipped to [0, 1]); and the fill fraction."""
+        v = self.V.detach()[..., r]
+        held = ins & (v > 0)
+        typ = v[held].median() if bool(held.any()) else torch.ones((), device=v.device, dtype=v.dtype)
+        fill = (v / typ.clamp_min(torch.finfo(v.dtype).tiny)).clamp(0, 1)
+        g = torch.stack([0.5 * (torch.roll(fill, -1, ax) - torch.roll(fill, 1, ax)) for ax in (1, 0, 2)], -1)
+        return -g / g.norm(dim=-1, keepdim=True).clamp_min(1e-12), fill
+
     def _traction_normal(self, E):
         """Traction / Young's modulus on the free surface, (n, n, n, R, 3), at the voxels of _traction's faces: the
         outward normal n is minus the gradient of the material's fill fraction (its volume fraction over its median on
@@ -963,20 +983,14 @@ class TomoFit:
         derivative of sigma . n, by differences toward the material's interior."""
         inside = self._eq_inside
         occupied = inside.any(-1)
-        V = self.V.detach()
         out = []
         for r, (Em, nu) in enumerate(self.elastic):
             ins = inside[..., r]
             bnd = torch.zeros_like(ins)
             for ax in range(3):
                 bnd |= ins & ~(torch.roll(occupied, 1, ax) & torch.roll(occupied, -1, ax))
-            v = V[..., r]
-            held = ins & (v > 0)                                                  # the mask's voxels that hold the material
-            typ = v[held].median() if bool(held.any()) else torch.ones((), device=v.device, dtype=v.dtype)
-            fill = (v / typ.clamp_min(torch.finfo(v.dtype).tiny)).clamp(0, 1)
+            nrm, fill = self._fill_normal(r, ins)
             axes = (1, 0, 2)                                                      # volume axes of x, y, z
-            g = torch.stack([0.5 * (torch.roll(fill, -1, ax) - torch.roll(fill, 1, ax)) for ax in axes], -1)
-            nrm = -g / g.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             d = (fill - 0.5) * nrm.abs().sum(-1)
             s = self._stress(E[..., r, :], nu)                                    # xx, yy, zz, xy, yz, xz
             idx = ((0, 3, 5), (3, 1, 4), (5, 4, 2))
