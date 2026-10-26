@@ -536,6 +536,8 @@ class TomoFit:
         # 0 and 1 a partial correction). probe_cg_iters and evidence_every: the probes' solve length and the evidence
         # update's interval (the trace in the evidence needs near-exact solves; see EVIDENCE_CG_ITERS)
         self.prior_scaling_power, self.probe_cg_iters, self.evidence_every = PRIOR_SCALING_POWER, EVIDENCE_CG_ITERS, EVIDENCE_EVERY
+        # probe_cg_iters may be a list: the uncertainty map is then made at each solve length, with the same probes
+        # (strain_sd_by_iters, probe_cost_by_iters; strain_sd is the last)
         # density smoothness, per material: 1 / sd^2 with sd = DENSITY_SMOOTH_REL x the median density over the
         # voxels above half the material's maximum
         self.smooth_V = torch.zeros(self.R, device=V.device, dtype=V.dtype)
@@ -675,11 +677,12 @@ class TomoFit:
         self._uncertainty_probes = int(n_probes); self.uncertainty_kind = kind; self.uncertainty_block = int(block)
 
     def _cg_solve(self, H, prec, bV, bE, iters):
-        """Preconditioned conjugate gradients for H x = b (the volume step's operator), from zero."""
+        """Preconditioned conjugate gradients for H x = b (the volume step's operator), from zero. last_cg_residual
+        records the final preconditioned residual relative to the first."""
         xV, xE = torch.zeros_like(bV), torch.zeros_like(bE)
         rV, rE = bV.clone(), bE.clone()
         zV, zE = prec(rV, rE); dV, dE = zV.clone(), zE.clone()
-        rz = float((rV * zV).sum() + (rE * zE).sum())
+        rz = float((rV * zV).sum() + (rE * zE).sum()); rz0 = max(rz, 1e-300)
         for _ in range(iters):
             if rz <= 0:
                 break
@@ -689,6 +692,7 @@ class TomoFit:
             zV, zE = prec(rV, rE)
             rz_new = float((rV * zV).sum() + (rE * zE).sum())
             dV, dE = zV + (rz_new / rz) * dV, zE + (rz_new / rz) * dE; rz = rz_new
+        self.last_cg_residual = math.sqrt(max(rz, 0.0) / rz0)
         return xV, xE
 
     def _run_probes(self, H, prec, proj_E, fE, wts, evidence, H_data=None):
@@ -717,6 +721,7 @@ class TomoFit:
         if E.is_cuda:
             torch.cuda.reset_peak_memory_stats(E.device)
         sign = lambda shape: (torch.randint(0, 2, shape, generator=gen, device=E.device) * 2 - 1).to(E.dtype)
+        res = []
         for p in range(k):
             ev, un = evidence and p < EVIDENCE_PROBES, bool(n_un) and p < n_un
             if ev:
@@ -726,14 +731,16 @@ class TomoFit:
             if un:
                 zc = sign(var.shape)                          # on the block grid, spread evenly over each block
                 yV, yE = self._cg_solve(H, prec, zeroV, proj_E(spread(zc) * fE), iters); solves += 1
+                res.append(self.last_cg_residual)
                 if sampling:
                     _, yE = self._cg_solve(H, prec, *H_data(yV, yE), iters); solves += 1
+                    res.append(self.last_cg_residual)
                 var += zc * coarse(yE)
         if evidence:
             self.evidence_update(tr / EVIDENCE_PROBES, L, fE); self._last_evidence_step = getattr(self, '_volume_steps', 0)
         if n_un:
             self.strain_sd = (var / n_un).clamp_min(0).sqrt(); self._uncertainty_probes = 0
-        self.last_probe_cost = dict(seconds=time.time() - t0, solves=solves, cg_iters=iters,
+        self.last_probe_cost = dict(seconds=time.time() - t0, solves=solves, cg_iters=iters, residual=float(np.mean(res)) if res else None,
                                     peak_gpu_gb=torch.cuda.max_memory_allocated(E.device) / 1e9 if E.is_cuda else None)
 
     def evidence_update(self, trace, L, fE):
@@ -1098,8 +1105,18 @@ class TomoFit:
                 prec = lambda rV, rE: (lambda z: (z[0], proj_E(z[1])))(prec0(rV, rE))
                 H = lambda xV, xE: (lambda h: (h[0], proj_E(h[1])))(H0(xV, xE))
             if probes_due:                         # with this step's curvature, before the step moves the state
-                self._run_probes(H, prec, proj_E, fE, cwts, evidence_due,
-                                 lambda xV, xE: (lambda h: (h[0] * free, proj_E(h[1] * fE)))(H_data(xV, xE)))
+                Hd = lambda xV, xE: (lambda h: (h[0] * free, proj_E(h[1] * fE)))(H_data(xV, xE))
+                counts = getattr(self, 'probe_cg_iters', EVIDENCE_CG_ITERS)
+                if isinstance(counts, (list, tuple)):      # the map at several solve lengths, with the same probes
+                    n_un, self.strain_sd_by_iters, self.probe_cost_by_iters = self._uncertainty_probes, {}, {}
+                    for j, it_ in enumerate(counts):
+                        self.probe_cg_iters, self._uncertainty_probes = int(it_), n_un
+                        self._run_probes(H, prec, proj_E, fE, cwts, evidence_due and j == 0, Hd)
+                        self.strain_sd_by_iters[int(it_)] = self.strain_sd
+                        self.probe_cost_by_iters[int(it_)] = self.last_probe_cost
+                    self.probe_cg_iters = list(counts)
+                else:
+                    self._run_probes(H, prec, proj_E, fE, cwts, evidence_due, Hd)
                 probes_due = False
             bV, bE = -gV * free, proj_E(-gE * fE)
             xV, xE = torch.zeros_like(V), torch.zeros_like(E)
