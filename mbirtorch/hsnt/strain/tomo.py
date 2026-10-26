@@ -1097,7 +1097,7 @@ class TomoFit:
             bW, bU = self._back(y[:, :R], y[:, R:])
             return bW + (E * bU).sum(-1), V[..., None] * bU
 
-        def H(xV, xE):
+        def H_full(xV, xE):
             hV, hE = H_data(xV, xE)
             return ((hV + self.dens_lap(xV, wts)) * free,
                     (hE + 2 * self.lam_E * xE * self._scale_E() + self.strain_lap(xE, cwts) + eq(xE)) * fE)
@@ -1116,10 +1116,12 @@ class TomoFit:
             else:
                 prec = lambda rV, rE: (rV / pV, rE / pE)
             proj_E = self._mean_projector(V, fE, full=self.zero_mean_step == 'full') if self.zero_mean_step else (lambda X: X)
+            H = H_full
             if self.zero_mean_step:                                                  # CG within the constraint's subspace
-                prec0, H0 = prec, H
-                prec = lambda rV, rE: (lambda z: (z[0], proj_E(z[1])))(prec0(rV, rE))
-                H = lambda xV, xE: (lambda h: (h[0], proj_E(h[1])))(H0(xV, xE))
+                # Each pass wraps H_full and this pass's preconditioner, bound when the wrapper is made.  A wrapper
+                # that looked them up when called would, on a retry, call itself (a RecursionError in q363 and q368).
+                prec = lambda rV, rE, p0=prec, pj=proj_E: (lambda z: (z[0], pj(z[1])))(p0(rV, rE))
+                H = lambda xV, xE, pj=proj_E: (lambda h: (h[0], pj(h[1])))(H_full(xV, xE))
             if probes_due:                         # with this step's curvature, before the step moves the state
                 Hd = lambda xV, xE: (lambda h: (h[0] * free, proj_E(h[1] * fE)))(H_data(xV, xE))
                 counts = getattr(self, 'probe_cg_iters', EVIDENCE_CG_ITERS)

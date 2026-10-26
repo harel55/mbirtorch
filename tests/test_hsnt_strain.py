@@ -887,3 +887,28 @@ def test_set_view_angles():
         for k in range(2):
             assert torch.allclose(P.project_series(k, vol).cpu(), Q.project_series(k, vol).cpu(), atol=1e-6)
         assert np.allclose(P.with_q(2).view_angle_extra[1], extra)
+
+
+def test_volume_step_retries_with_zero_mean_step():
+    """A volume step that finds no decrease retries with more damping. With zero_mean_step, each retry's curvature
+    product must still be finite (q363 and q368: a RecursionError on the first retry)."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    dev = pr.fwd(torch.zeros(N, N, N, 2)).device                 # the device the projector runs on
+    lam = np.linspace(2.0, 4.4, 60)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
+                device=dev, two_scale=True)
+    g = torch.zeros(M.n_global, dtype=torch.float64, device=dev)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    P = sum(pr.counts)
+    kw = dict(device=dev)
+    fit = FitB(M, torch.ones(P, M.K, **kw), g, torch.ones(P, 1, **kw), torch.zeros(1, M.K, **kw),
+               eps=torch.zeros(P, 1, **kw), chunk=512)
+    V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
+    tf = TomoFit(fit, pr, V, torch.zeros(N, N, N, 1, 1, device=dev))
+    assert tf.zero_mean_step
+    tf.loss = lambda mask=None: -math.inf                     # no step can lower this: every pass is a retry
+    tf.volume_step()
