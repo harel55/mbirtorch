@@ -60,6 +60,7 @@ class Dataset:
     checks: list = field(default_factory=list)
     info: dict = field(default_factory=dict)
     dose_per_bin: np.ndarray | None = None      # Median open beam count in each bin, if measured.
+    bin_weights: np.ndarray | None = None       # Given open beam count of each bin over its mean, or None.
     open_beam_observations: float = 0           # Effective number of open beam observations, or 0 if none.
     metadata: dict = field(default_factory=dict)    # hsnt metadata of an HDF5 input, cut to the selection.
 
@@ -378,6 +379,7 @@ class _TiffBlocks:
         if not self.files:
             raise InputError(f"the wave range selects no files of the {counts[0]} in {directory}")
         self.first_index = per_view[0].index(self.files[0])
+        self.columns = counts[0]                    # The number of bins in the input, before wave_range.
         with tifffile.TiffFile(self.files[0]) as t:
             page = t.pages[0]
             self.full_shape, self.source_dtype = tuple(page.shape), str(page.dtype)
@@ -442,6 +444,7 @@ class _Hdf5Blocks:
         source = _file_source_bins(g, d.shape[-1])
         ks = _columns_in_range(source, wave_range)
         self.first_index, self.bins = (ks.start, len(ks)) if len(ks) else (0, 0)
+        self.columns = len(source)                  # The number of bins in the input, before wave_range.
         self.source_bins = source[ks.start:ks.stop]
         attrs = dict(self.f.attrs, **g.attrs)
         per_bin = g["open_beam_dose"][()] if "open_beam_dose" in g and g["open_beam_dose"].shape == source.shape \
@@ -936,6 +939,24 @@ def _merge_dose(dose, estimate, src, wave_bin):
     return dose
 
 
+def _split_dose(dose, src, wave_bin):
+    """This function splits a given dose into a scalar dose and the weight of each grouped bin.  A
+    scalar or None is returned unchanged with no weights.  An array must hold the open beam count
+    per pixel of each bin of the input, before wave_range.  The function returns the mean of the
+    selected bins as the dose and the grouped counts divided by their mean as the weights."""
+    if dose is None or np.ndim(dose) == 0:
+        return dose, None
+    d = np.asarray(dose, dtype=np.float64)
+    if d.ndim != 1 or d.shape[0] != src.columns:
+        raise InputError(f"a per-bin dose must hold one open-beam count per bin of the input ({src.columns}), got "
+                         f"shape {d.shape}")
+    if not (np.isfinite(d).all() and (d > 0).all()):
+        raise InputError("a per-bin dose must be finite and positive in every bin")
+    selected = d[src.first_index:src.first_index + src.bins // wave_bin * wave_bin]
+    grouped = _bin_spectral(selected, wave_bin, "sum")
+    return float(selected.mean()), grouped / grouped.mean()
+
+
 def _check_given_dose(dose, src):
     """This function warns if a given dose differs by more than 50% from the open beam dose recorded
     in an HDF5 input."""
@@ -1052,10 +1073,12 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
             the values.  Defaults to 'auto'.
         dataset (str, optional): The HDF5 group that holds 'data'.  None means the root, or the
             only group that holds 'data'.  Defaults to None.
-        dose (float, optional): The open beam counts per pixel and source bin.  This value
-            replaces the estimate.  The function multiplies it by the number of source bins per
-            group.  With a background calibration, the function also scales it to the exposure
-            of the sample run.  Defaults to None.
+        dose (float or numpy.ndarray, optional): The open beam counts per pixel and source bin.
+            This value replaces the estimate.  The function multiplies it by the number of source
+            bins per group.  With a background calibration, the function also scales it to the
+            exposure of the sample run.  A 1-D array gives the count of each bin of the input,
+            before wave_range.  The dose is then the mean of the selected bins, and the result
+            holds the weight of each grouped bin in ``bin_weights``.  Defaults to None.
         views (tuple, optional): The (start, stop) range of the views.  None means all views.
             Defaults to None.
         wave_range (tuple, optional): The (start, stop) range of the source bins.  None means all
@@ -1092,6 +1115,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         K = nb // wave_bin
         if K == 0:
             raise InputError(f"a wave bin of {wave_bin} exceeds the {nb} selected bins")
+        dose, bin_weights = _split_dose(dose, src, wave_bin)
         itype = _probe_type(input_type, src, open_beam)
         obs = _open_beam_blocks(open_beam, wave_range, downsample, workers, src) if itype == "counts" else []
         smoothing = _check_smoothing(open_beam_smoothing, obs)
@@ -1140,6 +1164,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         bin_indices = src.source_bins[:K * wave_bin:wave_bin]
         ds = Dataset(T=T, dataset_type=itype, spatial_shape=(V, rows, cols), bin_indices=bin_indices, dose=merged,
                      source=path if isinstance(src, _TiffBlocks) else src.desc, info=info, dose_per_bin=per_bin,
+                     bin_weights=bin_weights,
                      open_beam_observations=n_eff if itype == "counts" else src.file_observations,
                      metadata=_selected_metadata(src.file_metadata, views, range(src.first_index,
                                                  src.first_index + nb), wave_bin, downsample))
@@ -1207,6 +1232,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
     """
     import h5py
     from tqdm import tqdm
+    if dose is not None and np.ndim(dose) > 0:
+        raise InputError("the converted file records a scalar dose only; give a per-bin dose when the data are fitted")
     t0 = time.perf_counter()
     workers = workers or min(8, os.cpu_count() or 1)
     src = _open_source(path, dataset, views, wave_range, downsample, workers, open_beam)

@@ -1,14 +1,19 @@
 """Tests for a per-bin open beam in mbirtorch.hsnt: dehydrate with an array dose, in full and streamed solves, with
-the spectra held fixed and with support selection.
+the spectra held fixed and with support selection, and the command line's per-bin --dose file.
 
 Self-contained: a small random two-material factorization whose counts are drawn with an open beam that rises a
 hundredfold across the bins.  The Poisson negative log-likelihood of those counts is the measure of a better fit.
 """
+import json
+import os
+
 import numpy as np
 import pytest
 import torch
 
 import mbirtorch.hsnt as hsnt
+from mbirtorch.hsnt.cli import main
+from mbirtorch.hsnt.loading import load_dataset
 from mbirtorch.hsnt.rank import _estimate_rank
 
 N, K, R = 24, 60, 2
@@ -106,3 +111,36 @@ def test_a_bad_array_dose_is_refused(data):
                        (np.r_[OPEN_BEAM[:-1], 0.0], "positive"), (np.r_[OPEN_BEAM[:-1], np.nan], "finite")):
         with pytest.raises(ValueError, match=match):
             hsnt.dehydrate(T, "transmission", R, dose=bad, verbose=0)
+
+
+def test_the_command_line_takes_a_per_bin_dose_file(data, tmp_path, capsys):
+    """--dose takes a .npy or text file of the open beam of each bin of the input.  The loader selects --wave-range
+    and sums each --wave-bin group, and the fit matches dehydrate with the same array dose."""
+    T, _ = data
+    path = str(tmp_path / "t.h5")
+    hsnt.export_hsnt_data_hdf5(path, T[None], hsnt.create_hsnt_metadata(dataset_type="transmission"))
+    npy, txt = str(tmp_path / "dose.npy"), str(tmp_path / "dose.txt")
+    np.save(npy, OPEN_BEAM)
+    np.savetxt(txt, OPEN_BEAM)
+    ds = load_dataset(path, dose=OPEN_BEAM, wave_range=(4, 24), wave_bin=2)
+    grouped = OPEN_BEAM[4:24].reshape(-1, 2).sum(1)
+    assert ds.dose == pytest.approx(2 * OPEN_BEAM[4:24].mean()) and np.allclose(ds.bin_weights,
+                                                                                grouped / grouped.mean())
+    lib = hsnt.dehydrate(T, "transmission", R, dose=OPEN_BEAM, verbose=0)
+    for name, f in (("npy", npy), ("txt", txt)):
+        out = str(tmp_path / name)
+        assert main(["dehydrate", path, "-o", out, "--dose", f, "--rank", str(R), "--no-plots", "-q"]) == 0
+        stem = os.path.splitext(os.path.basename(path))[0]
+        (W, H, _), _ = hsnt.import_hsnt_data_hdf5(os.path.join(out, stem + "_dehydrated.h5"))
+        assert np.allclose(W.reshape(N, N, R), lib[0], rtol=1e-4, atol=1e-5) and np.allclose(H, lib[1], rtol=1e-4,
+                                                                                            atol=1e-5)
+        with open(os.path.join(out, stem + "_report.json")) as fh:
+            assert 0.5 < json.load(fh)["result"]["fit"]["reduced_chi2"] < 2.0     # at the Poisson noise level
+    np.save(npy, OPEN_BEAM[:-1])
+    with pytest.raises(SystemExit, match="one open-beam count per bin"):
+        main(["dehydrate", path, "-o", str(tmp_path / "short"), "--dose", npy, "--rank", str(R), "--no-plots", "-q"])
+    with pytest.raises(SystemExit):
+        main(["dehydrate", path, "--dose", str(tmp_path / "missing.npy"), "-q"])
+    assert "a positive number or a file" in capsys.readouterr().err
+    with pytest.raises(SystemExit, match="scalar dose"):
+        main(["convert", path, "-o", str(tmp_path / "c.h5"), "--dose", txt, "-q"])

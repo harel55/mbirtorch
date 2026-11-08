@@ -104,6 +104,31 @@ _positive_float = _number_arg(float, 0.0, inclusive=False)
 _nonneg_float = _number_arg(float, 0.0, inclusive=True)
 
 
+def _dose_arg(text):
+    """This function parses --dose.  It returns a positive number, or the path of a file that
+    holds the open-beam count of each bin."""
+    try:
+        float(text)
+    except ValueError:
+        if not os.path.isfile(text):
+            raise argparse.ArgumentTypeError(f"expected a positive number or a file of per-bin counts, got {text!r}")
+        return text
+    return _positive_float(text)
+
+
+def _read_dose_file(path):
+    """This function reads the open-beam count of each bin from a .npy file or a text file.  It
+    returns a 1-D float64 array."""
+    try:
+        d = np.load(path, allow_pickle=False) if path.lower().endswith(".npy") else np.loadtxt(path, ndmin=1)
+    except (OSError, ValueError) as e:
+        raise InputError(f"--dose {path}: cannot read a per-bin dose ({e})") from None
+    d = np.asarray(d, dtype=np.float64)
+    if d.ndim != 1:
+        raise InputError(f"--dose {path}: expected one value per bin, got an array of shape {d.shape}")
+    return d
+
+
 def _pool_arg(text):
     if text.lower() == "auto":
         return "auto"
@@ -115,8 +140,9 @@ def _pool_arg(text):
 def _load(args, log_checks=True):
     """This function runs load_dataset with the options of the command.  If ``log_checks`` is
     True, the function logs the results of the data checks."""
+    dose = _read_dose_file(args.dose) if isinstance(args.dose, str) else args.dose
     ds = load_dataset(args.input, open_beam=args.open_beam, input_type=args.input_type, dataset=args.dataset,
-                      dose=args.dose, views=_parse_slice(args.views, "views"),
+                      dose=dose, views=_parse_slice(args.views, "views"),
                       wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
                       downsample=args.downsample,
                       background_boxes=_background_spec(args.background_boxes),
@@ -208,7 +234,7 @@ def solve(ds, args, device):
     if args.basis:
         W, H, rep = _fit_fixed_basis(ds.T, args.basis_H, device=device, mode=args.mode, chunk_pixels=args.chunk_pixels,
                                      max_steps=args.max_steps, rel_tol=args.rel_tol, compile_mode=args.compile,
-                                     report=args.fit_report)
+                                     report=args.fit_report, weights=ds.bin_weights)
         rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=None, basis=os.path.abspath(args.basis))
         args.fit_report = {"solved": True}
         return W, H, rep
@@ -220,7 +246,8 @@ def solve(ds, args, device):
     W, H, rep = _fit(ds.T, args.rank_value, spectra=args.spectra, dose=ds.dose, penalty=args.support_penalty,
                      wald_screen=args.wald_screen, device=device, mode=args.mode,
                      chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
-                     max_passes=args.max_passes, compile_mode=args.compile, report=args.fit_report)
+                     max_passes=args.max_passes, compile_mode=args.compile, report=args.fit_report,
+                     weights=ds.bin_weights)
     rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=args.rank_detail)
     args.fit_report = {"solved": True}                  # a later device failure happens after the solve
     return W, H, rep
@@ -321,12 +348,13 @@ def cmd_inspect(args):
           f"bins {ds.bin_indices[0]}..{ds.bin_indices[-1]}); {ds.T.nbytes / 2**30:.2f} GiB as float32")
     print(f"  T: min {st['min']:.4g}  median {st['median']:.4g}  mean {st['mean']:.4g}  max {st['max']:.4g}"
           + (" (sampled)" if st["sampled"] else "") + f"; zeros {st['zero']:.2%}, above 1: {ds.info['above_one']:.2%}")
-    print(f"  dose: {'unknown' if ds.dose is None else f'{ds.dose:.4g} counts per pixel and bin'}")
+    print(f"  dose: {'unknown' if ds.dose is None else f'{ds.dose:.4g} counts per pixel and bin'}"
+          + ("" if ds.bin_weights is None else f" (the mean of the per-bin dose of --dose {args.dose})"))
     for c in ds.checks:
         print(f"  [{c.level:5s}] {c.message}")
     if args.estimate_rank:
         _, note, d = _estimate_rank(ds.T, ds.spatial_shape, _device(args.device), max_rank=args.max_rank,
-                                    pool=args.rank_pool)
+                                    pool=args.rank_pool, weights=ds.bin_weights)
         gains = ", ".join(f"{r}: {g:,.0f}" for r, g in zip(range(2, d["max_rank"] + 1), d["gains"]))
         print(f"  {note}; effective dose {d['effective_dose']:.3g}; gains by component (deciding test): {gains}; "
               f"threshold {d['threshold']:,.0f}")
@@ -337,6 +365,9 @@ def cmd_inspect(args):
 
 
 def cmd_convert(args):
+    if isinstance(args.dose, str):
+        raise InputError(f"--dose {args.dose}: convert records a scalar dose only; give the per-bin dose to "
+                         "dehydrate or denoise")
     out = args.output or _converted_path(args.input)
     _check_outputs([out], [args.input, *(args.open_beam or [])], args.overwrite)
     out, checks, _ = convert_to_hdf5(args.input, output=out, open_beam=args.open_beam,
@@ -369,7 +400,8 @@ def _resolve_rank(ds, args, device):
         args.rank_value, args.rank_note, args.rank_detail = R, f"rank {R} from the basis in {args.basis}", None
     elif args.rank == "auto":
         args.rank_value, args.rank_note, args.rank_detail = _estimate_rank(ds.T, ds.spatial_shape, device,
-                                                                           max_rank=args.max_rank, pool=args.rank_pool)
+                                                                           max_rank=args.max_rank, pool=args.rank_pool,
+                                                                           weights=ds.bin_weights)
         log.info("%s; pass --rank N to override", args.rank_note)
     else:
         args.rank_value, args.rank_note, args.rank_detail = args.rank, f"rank {args.rank} given", None
@@ -396,7 +428,8 @@ def _pipeline(args, denoise):
         outputs.append(write_dehydrated(base + "_dehydrated.h5", W.reshape(*ds.spatial_shape, R), H, out_type,
                                         ds.bin_indices, _run_attrs(ds, rep, args, rank=R, loss=rep["loss_final"]),
                                         ds.metadata))
-    rep["fit"] = fit_quality(ds.T, W, H, ds.dose, device, ds.dose_per_bin, ds.open_beam_observations)
+    per_bin = ds.dose_per_bin if ds.bin_weights is None else ds.dose * ds.bin_weights
+    rep["fit"] = fit_quality(ds.T, W, H, ds.dose, device, per_bin, ds.open_beam_observations)
     rep["components"] = component_check(W, H)
     _log_fit(rep, args)
     if denoise:
@@ -513,8 +546,10 @@ class _Options:
         self.add(g, "--open-beam", nargs="+", metavar="DIR", help="open-beam TIFF stack(s), needed when the TIFFs "
                  "hold counts, and shared by all views; a directory of observation subdirectories is averaged over "
                  "them")
-        self.add(g, "--dose", type=_positive_float, metavar="D",
-                 help="open-beam counts per pixel and source bin, when no open beam or converted file gives it")
+        self.add(g, "--dose", type=_dose_arg, metavar="D|FILE",
+                 help="open-beam counts per pixel and source bin, when no open beam or converted file gives it; or "
+                      "a .npy or text file with one count per bin of the input (before --wave-range), when the open "
+                      "beam differs between bins: the fit then weights each bin by its count")
         self.add(g, "--input-type", choices=("auto",) + INPUT_TYPES, default="auto",
                  help="what the values are (default: inferred)")
         self.add(g, "--dataset", metavar="GROUP", help="HDF5 group holding 'data' (default: found automatically)")
