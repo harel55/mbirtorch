@@ -283,3 +283,35 @@ def test_streaming_matches_the_full_solve(dev):
     W_chunks, H, passes = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev)
     W = torch.cat([w.to(dev) for w in W_chunks])
     assert passes >= 1 and W.min() >= 0 and _loss(W, H, T) <= 1.01 * _loss(Wm, Hm, T)
+
+
+def test_open_beam_weights(dev):
+    """Weights of 1 change nothing.  Per-bin weights give the derivatives of the weighted loss, and a weighted fit of
+    counts drawn with a varying open beam has a lower Poisson negative log-likelihood than the unweighted fit."""
+    T, _, _ = _problem(dev, P=1024, K=120, dose=20.0, seed=3, dtype=torch.float64)
+    ones = torch.ones(1, T.shape[1], dtype=T.dtype, device=dev)
+    W, H, _ = _nnal_factorization(T, 3, compile_mode="off")
+    W1, H1, _ = _nnal_factorization(T, 3, compile_mode="off", weights=ones)
+    assert torch.equal(W, W1) and torch.equal(H, H1)
+    support, _, _ = _select_supports(T, W, H, 20.0)
+    support1, _, _ = _select_supports(T, W, H, 20.0, weights=ones)
+    assert torch.equal(support, support1)
+
+    # The derivatives of the weighted loss match autograd.
+    w = torch.linspace(0.3, 1.7, T.shape[1], dtype=T.dtype, device=dev)[None, :]
+    X = (W @ H).detach().requires_grad_(True)
+    stable_nnal(X, T, _nnal_prep(T, w)).backward()
+    G, _ = stable_nnal_derivatives(X.detach(), T, _nnal_prep(T, w))
+    assert torch.allclose(X.grad, G, rtol=1e-10, atol=1e-12)
+
+    # Counts drawn with the open beam 20 * w: the weighted fit is the better fit of their likelihood.
+    _, Wt, Ht = _problem(dev, P=1024, K=120, dose=20.0, seed=3, dtype=torch.float64, noisy=False)
+    g = torch.Generator(device=dev).manual_seed(5)
+    I0 = 20.0 * w
+    Tw = torch.poisson(I0 * torch.exp(-(Wt @ Ht)), generator=g) / I0
+    nll = lambda W_, H_: float((I0 * (torch.exp(-(W_ @ H_)) + Tw * (W_ @ H_))).sum())
+    Wu, Hu, _ = _nnal_factorization(Tw, 3, compile_mode="off")
+    Ww, Hw, _ = _nnal_factorization(Tw, 3, compile_mode="off", weights=w)
+    assert nll(Ww, Hw) < nll(Wu, Hu)
+    Ws, Hs, _, _ = _support_selected_spectra(Tw, Ww, Hw, 20.0, compile_mode="off", weights=w)
+    assert torch.isfinite(Hs).all()

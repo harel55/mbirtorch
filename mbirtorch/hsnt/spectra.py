@@ -22,49 +22,58 @@ _REFIT_MAX_STEPS, _REFIT_REL_TOL, _W_MAX_STEPS, _CG_MAX = 300, 1e-10, 100, 10
 _K_TOP, _M_MAX = 6, 6
 
 
-def _unconstrained_spectra(T, W, H, compile_mode='auto'):
+def _unconstrained_spectra(T, W, H, compile_mode='auto', weights=None):
     """This function re-estimates the spectra without the bound W >= 0.  It then solves for
-    W >= 0 with the new spectra held fixed.  It returns (W, H, steps).
+    W >= 0 with the new spectra held fixed.  It returns (W, H, steps).  ``weights`` multiplies
+    each entry's loss (see ``_nnal_prep``).
 
     Removing the bound removes the bias of the spectra, but it adds variance.  For this reason,
     the method helps only when there are many pixels.
     """
     compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T, weights)
     _, Hu, steps, _ = _joint_newton_pcg(T, W, H, max_steps=_UNC_MAX_STEPS, cg_max=_CG_MAX, rel_tol=_UNC_REL_TOL,
                                         prep=prep, nnal=nnal_fn, deriv=deriv, nonneg_W=False)
-    Wc = solve_W(T, Hu, W, _W_MAX_STEPS, 1e-12, compile_mode=compile_mode)
+    Wc = solve_W(T, Hu, W, _W_MAX_STEPS, 1e-12, compile_mode=compile_mode, weights=weights)
     return Wc, Hu, steps
 
 
 _FREE_SET_ELEMS = 2 ** 27       # This is the number of elements in one (pixels, m, bins) block.
 
 
-def _fit_free_sets(T, H, idx, valid, w0, steps=8, rows=None):
+def _weight_rows(weights, rows):
+    """This function returns the weights of the pixels ``rows`` (a slice or an index tensor).  Weights
+    with one row, such as one weight per bin, apply to every pixel and are returned unchanged."""
+    return weights if weights is None or weights.dim() < 2 or weights.shape[0] == 1 else weights[rows]
+
+
+def _fit_free_sets(T, H, idx, valid, w0, steps=8, rows=None, weights=None):
     """This function fits the coefficients w >= 0 of each pixel on its own small set of materials.
     It uses projected Newton steps on chunks of pixels.  The array ``idx`` (P, m) holds material
     indices, ``valid`` marks the entries of ``idx`` that are real, and ``w0`` is the starting value.
-    The function returns (w, f), where f is the loss of each pixel."""
+    ``weights`` multiplies each entry's loss (see ``_nnal_prep``).  The function returns (w, f),
+    where f is the loss of each pixel."""
     P, m = idx.shape
     chunk = max(1, _FREE_SET_ELEMS // (m * H.shape[1]))
     if P <= chunk and rows is None:
-        return _fit_free_sets_block(T, H, idx, valid, w0, steps)
+        return _fit_free_sets_block(T, H, idx, valid, w0, steps, weights)
     ws, fs = [], []
     for s in range(0, P, chunk):
         e = min(P, s + chunk)
         Tc = T[s:e] if rows is None else T[rows[s:e]]
-        w, f = _fit_free_sets_block(Tc, H, idx[s:e], valid[s:e], w0[s:e], steps)
+        wc = _weight_rows(weights, slice(s, e) if rows is None else rows[s:e])
+        w, f = _fit_free_sets_block(Tc, H, idx[s:e], valid[s:e], w0[s:e], steps, wc)
         ws.append(w)
         fs.append(f)
         del Tc
     return torch.cat(ws), torch.cat(fs)
 
 
-def _fit_free_sets_block(T, H, idx, valid, w0, steps):
+def _fit_free_sets_block(T, H, idx, valid, w0, steps, weights=None):
     m = idx.shape[1]
     dev = T.device
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T, weights)
     Hf = H[idx.clamp(min=0)] * valid[:, :, None]                                       # (P, m, K)
     w = (w0 * valid).clone()
     X = torch.einsum('pm,pmk->pk', w, Hf)
@@ -123,12 +132,12 @@ def _scatter_support(idx, valid, w, R):
 def _empty_fit_loss(T, prep):
     """This function computes the loss f_p(0) of each pixel when the pixel has no materials.  It
     processes the pixels in chunks."""
-    log_T, positive, all_positive = prep
+    log_T, positive, all_positive, weights = prep
     chunk = max(1, 2 ** 23 // T.shape[1])
     out = []
     for s in range(0, T.shape[0], chunk):
         Tc = T[s:s + chunk]
-        prep_c = (log_T[s:s + chunk], positive[s:s + chunk], all_positive)
+        prep_c = (log_T[s:s + chunk], positive[s:s + chunk], all_positive, _weight_rows(weights, slice(s, s + chunk)))
         out.append(_nnal_rowwise(torch.zeros_like(Tc), Tc, prep_c, 1, dtype=torch.float64))
     return torch.cat(out)
 
@@ -140,11 +149,11 @@ def _support_sets(support, W):
     return idx, valid, W.gather(1, idx)
 
 
-def _solve_W_on_support(T, H, W, support, steps=30):
+def _solve_W_on_support(T, H, W, support, steps=30, weights=None):
     """This function solves for W >= 0 with H fixed.  It solves each pixel by Newton steps on the
-    support of that pixel."""
+    support of that pixel.  ``weights`` multiplies each entry's loss (see ``_nnal_prep``)."""
     idx, valid, w0 = _support_sets(support, W.clamp(min=0))
-    w, _ = _fit_free_sets(T, H, idx, valid, w0, steps=steps)
+    w, _ = _fit_free_sets(T, H, idx, valid, w0, steps=steps, weights=weights)
     return _scatter_support(idx, valid, w, W.shape[1])[1]
 
 
@@ -197,7 +206,7 @@ def _select_branch_bound(T, W, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX,
         idx1 = torch.full((rows.numel(), 1), r, dtype=torch.long, device=dev)
         valid1 = torch.ones_like(idx1, dtype=torch.bool)
         w_start = torch.full((rows.numel(), 1), 0.5, device=dev, dtype=T.dtype)
-        w1, f1 = _fit_free_sets(T, H, idx1, valid1, w_start, rows=rows)
+        w1, f1 = _fit_free_sets(T, H, idx1, valid1, w_start, rows=rows, weights=prep[3])
         F1[rows, r] = f1
         W1[rows, r] = w1[:, 0]
     best_f1, r1 = F1.min(1)
@@ -224,7 +233,8 @@ def _select_branch_bound(T, W, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX,
             cq = cp[ok]
             idx_c = idx_c[ok]
             valid_c = torch.ones(cq.numel(), size, dtype=torch.bool, device=dev)
-            w_c, f_c = _fit_free_sets(T, H, idx_c, valid_c, (W1[cq[:, None], idx_c] / size).clamp(min=1e-3), rows=cq)
+            w_c, f_c = _fit_free_sets(T, H, idx_c, valid_c, (W1[cq[:, None], idx_c] / size).clamp(min=1e-3), rows=cq,
+                                      weights=prep[3])
             better = f_c * dose + lam * size < best_f[cq] * dose + lam * best_valid[cq].sum(1).double()
             bp = cq[better]
             best_idx[bp] = -1
@@ -272,17 +282,19 @@ def _penalty_nats(penalty, T, dose):
     return float(penalty) * math.log(K)
 
 
-def _select_supports(T, W, H, dose, penalty='auto', wald_screen=0.0):
+def _select_supports(T, W, H, dose, penalty='auto', wald_screen=0.0, weights=None):
     """This function selects the subset S of materials for each pixel.  It minimizes
     dose * f_p(S) + lam * size(S) by branch and bound, where lam is the penalty in nats.  If
     ``wald_screen`` > 0, the function uses a Wald statistic to skip unlikely single-material fits.
-    It returns (support, W0, f).  These are the (pixels, R) bool support, the coefficients on the
-    support, and the loss of each pixel."""
+    With ``weights`` (see ``_nnal_prep``), dose times the weights must be the open beam count of
+    each bin, so that dose * f_p is the negative log-likelihood.  It returns (support, W0, f).
+    These are the (pixels, R) bool support, the coefficients on the support, and the loss of each
+    pixel."""
     if not dose > 0:
         raise ValueError(f"support selection needs a positive dose, got {dose!r}")
     R = H.shape[0]
     lam = _penalty_nats(penalty, T, dose)
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T, weights)
     X = W @ H
     f_full = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
     plausible = None
@@ -306,19 +318,21 @@ def _warn_collinear_rows(H, cosine=0.999):
                       "are not separately identified; consider a smaller rank")
 
 
-def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, compile_mode='auto'):
+def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, compile_mode='auto', weights=None):
     """This function chooses the subset of materials for each pixel by penalized likelihood.  It
     then refits W and H with all other coefficients held at zero.
 
     Holding the coefficients that are truly zero at zero removes the bias of the spectra.  If a
     component is selected in almost no pixels, the function keeps that component free in every
     pixel, as in the maximum-likelihood fit.  The function returns (W, H, support, steps).  These
-    are the refitted factors, the (pixels, R) bool support, and the number of refit steps.
+    are the refitted factors, the (pixels, R) bool support, and the number of refit steps.  With
+    ``weights``, dose times the weights must be the open beam count of each bin (see
+    ``_select_supports``).
     """
     compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)
-    prep = _nnal_prep(T)
-    support, W0, _ = _select_supports(T, W, H, dose, penalty=penalty, wald_screen=wald_screen)
+    prep = _nnal_prep(T, weights)
+    support, W0, _ = _select_supports(T, W, H, dose, penalty=penalty, wald_screen=wald_screen, weights=weights)
     _guard_components(support, W, W0)
     Wn, Hn, steps, _ = _joint_newton_pcg(T, W0, H, max_steps=_REFIT_MAX_STEPS, cg_max=_CG_MAX, rel_tol=_REFIT_REL_TOL,
                                          prep=prep, nnal=nnal_fn, deriv=deriv, w_mask=support)

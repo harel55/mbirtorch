@@ -216,11 +216,11 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
 
 
 def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
-                          compile_mode=None, nonneg_W=True):
+                          compile_mode=None, nonneg_W=True, weights=None):
     """This function minimizes the non-negative attenuation loss by alternating projected Newton
-    steps on W and on H."""
+    steps on W and on H.  ``weights`` multiplies each entry's loss (see ``_nnal_prep``)."""
     _, _, rowwise, step_fn = _kernels(compile_mode)
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T, weights)
     W, H = W_init, H_init
     X = W @ H
     prev_loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
@@ -258,14 +258,15 @@ def _stationarity(projected_gnorm2, V, axis):
 
 
 
-def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compile_mode=None):
+def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compile_mode=None, weights=None):
     """This function computes the pixel coefficients W for a fixed H by block Newton steps.  It
     starts from ``W_init``, or from a nonnegative least squares fit when ``W_init`` is None.  It
-    constrains W >= 0 unless nonneg=False."""
+    constrains W >= 0 unless nonneg=False.  ``weights`` multiplies each entry's loss (see
+    ``_nnal_prep``)."""
     if W_init is None:
         W_init = _nonneg_least_squares_start(_attenuation_for_start(T), H)
     W, _, _ = block_newton_optimize(T, H.shape[0], max_steps, rel_tol, update_H=False, W_init=W_init, H_init=H,
-                                    compile_mode=compile_mode, nonneg_W=nonneg)
+                                    compile_mode=compile_mode, nonneg_W=nonneg, weights=weights)
     return W
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
@@ -421,7 +422,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
 
 
 def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
-                          warmup_steps=5, cg_max=10, compile_mode=None, quick=False, stats=None):
+                          warmup_steps=5, cg_max=10, compile_mode=None, quick=False, stats=None, weights=None):
     """This function minimizes the loss over W and H.  It first takes a few block Newton steps,
     and then it solves for W and H together by a preconditioned Newton method.
 
@@ -429,13 +430,13 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
     converges quickly.  With update_H=False, this function solves only for W, by block Newton
     steps.  When the map or spectrum of a component becomes zero, ``_reseed_dead`` replaces the
     component with small random values.  The arguments ``quick`` and ``stats`` go to the joint
-    solve (``_joint_newton_pcg``).
+    solve (``_joint_newton_pcg``).  ``weights`` multiplies each entry's loss (see ``_nnal_prep``).
     """
     if not update_H:
         return block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=False, W_init=W_init,
-                                     H_init=H_init, compile_mode=compile_mode)
+                                     H_init=H_init, compile_mode=compile_mode, weights=weights)
     nnal_fn, deriv_fn, _, step_fn = _kernels(compile_mode)
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T, weights)
     W, H = W_init, H_init
     steps = min(warmup_steps, max_steps)
     for i in range(steps):

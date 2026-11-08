@@ -1,19 +1,27 @@
 import torch
 
 
-def _nnal_prep(T):
+def _nnal_prep(T, weights=None):
     """This function computes the quantities in the loss that depend only on the transmission T.
 
+    Args:
+        T: (torch.Tensor) The transmission ratio.
+        weights: (torch.Tensor, optional) Nonnegative weights that broadcast against T, such as the
+            open beam count of each bin as a (1, bins) tensor.  Each entry's loss and derivatives are
+            multiplied by its weight.  With the open beam counts as weights, the loss is the Poisson
+            negative log-likelihood of the counts when the open beam differs between bins.  The
+            default is None, which gives every entry the weight 1.
+
     Returns:
-        tuple: (log_T, positive, all_positive).  ``log_T`` is log(T), with 0 where T is not positive.
-        ``positive`` is the boolean mask T > 0.  ``all_positive`` is True if every entry of T
-        is positive.
+        tuple: (log_T, positive, all_positive, weights).  ``log_T`` is log(T), with 0 where T is not
+        positive.  ``positive`` is the boolean mask T > 0.  ``all_positive`` is True if every entry
+        of T is positive.  ``weights`` is the argument.
     """
     positive = T > 0
     Tsafe = torch.where(positive, T, torch.ones((), dtype=T.dtype, device=T.device))
     log_T = torch.log(Tsafe)
     all_positive = bool(positive.all())
-    return log_T, positive, all_positive
+    return log_T, positive, all_positive, weights
 
 
 def _nnal_elementwise(X, T, prep):
@@ -22,13 +30,13 @@ def _nnal_elementwise(X, T, prep):
     Where T > 0, the term is T * phi(X + log T), with phi(u) = exp(-u) - 1 + u.  Where T = 0, the
     term is exp(-X).
     """
-    log_T, positive, all_positive = prep
+    log_T, positive, all_positive, weights = prep
     Xp = X + log_T
     loss = T * (torch.expm1(-Xp) + Xp)
     if not all_positive:
         # Where T == 0, the term is exp(-Xp).  The form expm1(-Xp) + 1 underflows for large Xp.
         loss = torch.where(positive, loss, torch.exp(-Xp))
-    return loss
+    return loss if weights is None else loss * weights
 
 
 def stable_nnal(X, T, prep=None, dtype=None):
@@ -60,7 +68,7 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
     The first derivative is G = dL/dX = T - exp(-X).  The second derivative is
     Z = d^2L/dX^2 = exp(-X).  The function returns correct values where T = 0.
     """
-    log_T, positive, all_positive = _nnal_prep(T) if prep is None else prep
+    log_T, positive, all_positive, weights = _nnal_prep(T) if prep is None else prep
 
     Xp = X + log_T
 
@@ -75,6 +83,9 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
         G = torch.where(positive, G, -eXp)
         Z = torch.where(positive, Z, eXp)
 
+    if weights is not None:
+        G = G * weights
+        Z = Z * weights
     return G, Z
 
 
