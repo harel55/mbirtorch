@@ -1,8 +1,15 @@
+import numpy as np
 import torch
 
 # This is the number of entries per block when a loss or a fit quality is computed in blocks of
 # pixels: 64 MiB per float64 array.
 _CHUNK_ELEMENTS = 2 ** 23
+
+
+def _weights_tensor(weights, device, dtype=torch.float32):
+    """This function converts the weight of each bin to a (1, bins) tensor on the device.  It
+    returns None when ``weights`` is None."""
+    return None if weights is None else torch.as_tensor(np.asarray(weights), dtype=dtype, device=device).reshape(1, -1)
 
 
 def _nnal_prep(T, weights=None):

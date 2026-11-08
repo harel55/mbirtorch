@@ -40,7 +40,7 @@ _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
 
 
 def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384, device=None,
-                          compile_mode='off', verbose=0, stats=None, chunk_sizes=None):
+                          compile_mode='off', verbose=0, stats=None, chunk_sizes=None, weights=None):
     """This function factorizes a dataset that is too large for device memory.
 
     The function processes the data one chunk of pixels at a time.  It first fits H by a joint
@@ -70,6 +70,9 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         chunk_sizes (sequence of int, optional): The number of pixels in each chunk.  With this
             argument, the function does not need to load a chunk to find its size.
             Defaults to None.
+        weights (torch.Tensor, optional): One weight per bin, as a (1, bins) tensor on the
+            device.  Each entry's loss is multiplied by the weight of its bin (see
+            ``_nnal_prep``).  Defaults to None, which gives every entry the weight 1.
 
     Returns:
         (W_chunks, H, passes): W_chunks is a list of CPU tensors, one for each chunk.  H is the
@@ -91,7 +94,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         if local.size:
             parts.append(c[torch.from_numpy(local).to(c.device)])
     T_sub = torch.cat(parts, 0).to(device)
-    _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode)
+    _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode, weights=weights)
     del T_sub
     rows, cols = torch.triu_indices(R, R, device=H.device)
     pin = torch.device(device).type == 'cuda'
@@ -126,7 +129,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 Tc = nxt
                 if i + 1 < len(chunks):
                     nxt = to_device(chunks[i + 1])            # This copy overlaps the solve below.
-                prep = _nnal_prep(Tc)
+                prep = _nnal_prep(Tc, weights)
                 W0 = W_chunks[i].to(device=device, dtype=H.dtype) if W_chunks[i] is not None else None
                 W = solve_chunk(Tc, W0, i)
                 W_chunks[i] = W.cpu()
@@ -190,7 +193,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 Tc = nxt
                 if i + 1 < len(chunks):
                     nxt = to_device(chunks[i + 1])
-                prep = _nnal_prep(Tc)
+                prep = _nnal_prep(Tc, weights)
                 W = W_chunks[i].to(device)
                 X = W @ H
                 B = W @ d.T
@@ -223,7 +226,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         return passes
 
     def solve_mle(Tc, W0, i):
-        return solve_W(Tc, H, W0, _W_MAX_STEPS, _W_REL_TOL, compile_mode=compile_mode)
+        return solve_W(Tc, H, W0, _W_MAX_STEPS, _W_REL_TOL, compile_mode=compile_mode, weights=weights)
 
     passes = polish(solve_mle, max_passes)
     return W_chunks, H, passes
