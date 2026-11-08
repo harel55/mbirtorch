@@ -103,8 +103,12 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             maximum likelihood estimate.  'unconstrained' removes the bias that the constraint
             W >= 0 causes at low dose.  'support' selects which components are present in each
             pixel, and it requires ``dose``.  Defaults to 'mle'.
-        dose (float, optional): The open beam counts per pixel and bin.  Only 'support' uses
-            it.  Defaults to None.
+        dose (float or numpy.ndarray, optional): The open beam counts per pixel and bin.  A
+            scalar is used only by 'support'.  A 1-D array gives the open beam count of each
+            bin, with length :math:`N_k`.  Use an array when the open beam differs between bins.
+            Every fit then weights each bin by its open beam count, so that the loss is the
+            Poisson likelihood of the counts, and 'support' uses the mean of the array as its
+            dose.  Defaults to None.
         penalty (str or float, optional): The penalty per component that 'support' uses.  It
             is either a multiple of log(N_k) or 'auto'.  Defaults to 'auto'.
         max_steps (int, optional): The maximum number of solver iterations.  Defaults to 1000.
@@ -167,6 +171,7 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     if int(max_passes) < 0:
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
     T_all, shape = _to_transmission(data, dataset_type)
+    dose, weights = _dose_and_weights(dose, shape[-1])
     device = _default_device(device)
     lead = shape[:-1]
     mask = _sample_mask(sample_mask, lead)
@@ -187,7 +192,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             raise ValueError(f"spectra={spectra!r} re-estimates the spectra, which fix_spectra=True holds fixed")
         from ._fit import _fit_fixed_basis
         W, H, rep = _fit_fixed_basis(T, init[1], device=device, mode=mode, chunk_pixels=chunk_pixels,
-                                     max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode, W_init=init[0])
+                                     max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode, W_init=init[0],
+                                     weights=weights)
         if verbose >= 1:
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given spectra, held fixed)")
@@ -196,10 +202,11 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         note = f"rank {num_materials} given"
         if num_materials is None:
             num_materials, note, _ = _estimate_rank(T_all, spatial_shape=_spatial_shape(lead), device=device,
-                                                    max_rank=max_rank, verbose=max(0, verbose - 1))
+                                                    max_rank=max_rank, verbose=max(0, verbose - 1),
+                                                    weights=weights)
         W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, device=device, mode=mode,
                          chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes),
-                         compile_mode=compile_mode, init=init, quick=bool(quick))
+                         compile_mode=compile_mode, init=init, quick=bool(quick), weights=weights)
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             if rep.get("quick_stop"):
@@ -210,11 +217,27 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     if mask is not None:
         if check_mask and not mask.all():
             _check_outside(T, W, np.ascontiguousarray(T_all[~mask]), H, dose, device, mode, chunk_pixels, max_steps,
-                           rel_tol, compile_mode, verbose)
+                           rel_tol, compile_mode, verbose, weights)
         W_all = np.zeros((T_all.shape[0], W.shape[1]), dtype=np.float32)
         W_all[mask] = W
         W = W_all
     return [W.reshape(*lead, H.shape[0]), H, dataset_type]
+
+
+def _dose_and_weights(dose, bins):
+    """This function splits the ``dose`` of ``dehydrate`` into a scalar dose and the weight of
+    each bin.  A scalar or None is returned unchanged with no weights.  An array of the open beam
+    count of each bin gives its mean as the dose and the array divided by its mean as the weights."""
+    if dose is None or np.ndim(_to_host(dose)) == 0:
+        return dose, None
+    d = np.asarray(_to_host(dose), dtype=np.float64)
+    if d.ndim != 1 or d.shape[0] != bins:
+        raise ValueError(f"an array dose must hold one open beam count per bin, with shape ({bins},); got shape "
+                         f"{d.shape}")
+    if not (np.isfinite(d).all() and (d > 0).all()):
+        raise ValueError("an array dose must be finite and positive in every bin")
+    mean = float(d.mean())
+    return mean, d / mean
 
 
 def _check_init(init, pixels, bins, num_materials, mask):
@@ -267,7 +290,8 @@ def _sample_mask(sample_mask, lead):
     return np.ascontiguousarray(m).reshape(-1)
 
 
-def _check_outside(T_in, W_in, T_out, H, dose, device, mode, chunk_pixels, max_steps, rel_tol, compile_mode, verbose):
+def _check_outside(T_in, W_in, T_out, H, dose, device, mode, chunk_pixels, max_steps, rel_tol, compile_mode, verbose,
+                   weights=None):
     """This function checks whether the pixels outside ``sample_mask`` hold attenuation.
 
     It fits each outside pixel to the spectra H and computes the gain in log likelihood over
@@ -275,25 +299,27 @@ def _check_outside(T_in, W_in, T_out, H, dose, device, mode, chunk_pixels, max_s
     the fit inside the mask, as the rank estimate does.  When the mask is correct, twice the gain
     is at most a chi-square variable with rank degrees of freedom.  This function flags the pixels
     above the _MASK_CHECK_LEVEL quantile of that variable, and it warns when the flagged share
-    exceeds _MASK_CHECK_WARN.  It returns the flagged share."""
+    exceeds _MASK_CHECK_WARN.  The argument ``weights`` holds the weight of each bin, as in
+    ``dehydrate``.  It returns the flagged share."""
     import torch
     from scipy.stats import chi2
     from ._fit import _fit_fixed_basis
-    from ._loss import _nnal_prep, _nnal_rowwise
+    from ._loss import _nnal_prep, _nnal_rowwise, _weights_tensor
     from .outputs import _CHUNK_ELEMENTS
     from .rank import _loss_and_residual
     if dose is None:
         resid = _loss_and_residual(torch.from_numpy(T_in), torch.from_numpy(W_in), torch.from_numpy(H))[1]
         dose = 1.0 / max(resid, np.finfo(np.float64).tiny)
     W_out, _, _ = _fit_fixed_basis(T_out, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
-                                   rel_tol=rel_tol, compile_mode=compile_mode)
+                                   rel_tol=rel_tol, compile_mode=compile_mode, weights=weights)
     R, K = H.shape
     Hd = torch.as_tensor(H, device=device)
+    wd = _weights_tensor(weights, device)
     rows = max(1, _CHUNK_ELEMENTS // K)
     gains = []
     for i in range(0, T_out.shape[0], rows):
         Tc = torch.from_numpy(T_out[i:i + rows]).to(device)
-        prep = _nnal_prep(Tc)
+        prep = _nnal_prep(Tc, wd)
         X = torch.from_numpy(W_out[i:i + rows]).to(device) @ Hd
         gains.append((_nnal_rowwise(torch.zeros_like(X), Tc, prep, 1, dtype=torch.float64)
                       - _nnal_rowwise(X, Tc, prep, 1, dtype=torch.float64)).cpu())
