@@ -89,17 +89,19 @@ def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None, compile_m
     return mode, chunk_pixels, warmup, note
 
 
-def _loss(W, H, T_host, device):
+def _loss(W, H, T_host, device, weights=None):
     """This function computes the float64 NNAL loss of W @ H against the data in host memory.
-    It moves the data to the device in chunks of pixels."""
-    from ._loss import stable_nnal
+    It moves the data to the device in chunks of pixels.  With ``weights``, one weight per bin,
+    the loss is the weighted loss (see ``_loss._nnal_prep``)."""
+    from ._loss import _nnal_prep, _weights_tensor, stable_nnal
     from .outputs import _CHUNK_ELEMENTS
     Hd = H.to(device).double()
+    wd = _weights_tensor(weights, device, torch.float64)
     chunk = max(1, _CHUNK_ELEMENTS // T_host.shape[1])
     total = 0.0
     for i in range(0, T_host.shape[0], chunk):
         Tc = torch.from_numpy(T_host[i:i + chunk]).to(device).double()
-        total += stable_nnal(W[i:i + chunk].to(device).double() @ Hd, Tc).item()
+        total += stable_nnal(W[i:i + chunk].to(device).double() @ Hd, Tc, _nnal_prep(Tc, wd)).item()
     return total
 
 
@@ -139,13 +141,16 @@ def _report_zero_counts(rep, W, H, T, device, chunk):
 
 
 def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8,
-                     compile_mode="auto", report=None, W_init=None):
+                     compile_mode="auto", report=None, W_init=None, weights=None):
     """This function computes the maps W >= 0 for a fixed basis H.  It uses block Newton steps on
     chunks of pixels, starting from ``W_init`` when it is given.  It returns (W, H, report), and it
-    fills ``report`` in the same way as :func:`_fit`."""
+    fills ``report`` in the same way as :func:`_fit`.  The argument ``weights`` is as in
+    :func:`_fit`."""
+    from ._loss import _weights_tensor
     from ._newton import _resolve_compile, solve_W
     P, K = T.shape
     Hd = torch.as_tensor(np.ascontiguousarray(H, dtype=np.float32), device=device)
+    wd = _weights_tensor(weights, device)
     mode, chunk, _, note = _plan(P, K, device, "basis", mode, chunk_pixels, compile_mode)
     chunk = P if mode == "full" else chunk
     rep = {} if report is None else report
@@ -160,13 +165,13 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
         Tc = torch.from_numpy(T[i:i + chunk]).to(device)
         W0 = None if W_init is None else torch.from_numpy(W_init[i:i + chunk]).to(device)
         parts.append(solve_W(Tc, Hd, W_init=W0, max_steps=max_steps, rel_tol=rel_tol,
-                             compile_mode=_resolve_compile(compile_mode, Tc)).cpu())
+                             compile_mode=_resolve_compile(compile_mode, Tc), weights=wd).cpu())
         del Tc
     W = torch.cat(parts)
     if device.startswith("cuda"):
         torch.cuda.synchronize(device)
     rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
-    rep["loss_mle"] = rep["loss_final"] = _loss(W, Hd, T, device)
+    rep["loss_mle"] = rep["loss_final"] = _loss(W, Hd, T, device, weights)
     log.info("maps for the given basis: %s, %d chunk(s) in %.1f s, loss %.6g", mode, rep["chunks"],
              rep["solve_seconds"], rep["loss_final"])
     _report_zero_counts(rep, W, Hd, T, device, chunk)
@@ -178,7 +183,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
 
 def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, device="cpu",
          mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5, warmup_pixels=16384,
-         compile_mode="auto", report=None, init=None, quick=False):
+         compile_mode="auto", report=None, init=None, quick=False, weights=None):
     """This function fits the transmission T at the given rank.  T is a float32 numpy array with
     shape (pixels, bins).  The function returns (W, H, report).  W and H are the numpy factors,
     and ``report`` is a dict that describes what the fit did.
@@ -188,8 +193,12 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     It is either 'auto' or a multiple of log K.  The function fills ``report`` in place.  As a
     result, the caller has the memory plan even when the solve fails.  The argument ``init`` is a
     pair (W, H) of numpy starting factors, either of which may be None.  The argument ``quick``
-    selects the quick stop.
+    selects the quick stop.  The argument ``weights`` is None or a numpy array with one weight per
+    bin, such as the open beam count of each bin divided by its mean.  Each entry's loss is then
+    multiplied by the weight of its bin, and dose times the weights is the open beam count of
+    each bin.  The reported losses are the weighted losses.
     """
+    from ._loss import _weights_tensor
     from ._streaming import _stream_factorization
     from .factorization import _nnal_factorization
     from .spectra import _support_selected_spectra, _unconstrained_spectra
@@ -208,11 +217,12 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
             _check_host_memory(2 * min(chunk, P) * K * T.dtype.itemsize, "the stream's pinned chunk copies")
     t0 = time.perf_counter()
     stats = {}
+    wd = _weights_tensor(weights, device)
     if mode == "full":
         Td = torch.from_numpy(T).to(device)
         W0, H0 = [None if f is None else torch.from_numpy(f).to(device) for f in (init or (None, None))]
         W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode,
-                                          W_init=W0, H_init=H0, quick=quick, stats=stats)
+                                          W_init=W0, H_init=H0, quick=quick, stats=stats, weights=wd)
         rep["steps"] = int(steps)
     else:
         chunks = [torch.from_numpy(T[i:i + chunk]) for i in range(0, P, chunk)]
@@ -225,7 +235,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
                                                     nonneg_W=(spectra != "unconstrained"), support_selection=support,
                                                     compile_mode="on" if compile_mode == "on" else "off",
                                                     chunk_sizes=[c.shape[0] for c in chunks], W_init=W0, H_init=H0,
-                                                    quick=quick)
+                                                    quick=quick, weights=wd)
         W = torch.cat(W_chunks)
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         Td = None
@@ -239,7 +249,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
                         "before the maps have converged.  For more precision, refine the result: call dehydrate "
                         "again with init=(W, H) and quick=False.", rep["effective_dose"])
     if mode == "full":
-        rep["loss_mle"] = _loss(W, H, T, device)
+        rep["loss_mle"] = _loss(W, H, T, device, weights)
     # Otherwise, the loss of the last pass is at the final W and H.  With unconstrained W, this
     # loss is not the MLE loss.
     else:
@@ -253,19 +263,19 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
             log.warning("the maximum-likelihood fit stopped at max_steps (%d) before its rel_tol stop", max_steps)
     if spectra == "unconstrained" and mode == "full":
         t1 = time.perf_counter()
-        W, H, st = _unconstrained_spectra(Td, W, H, compile_mode=compile_mode)
+        W, H, st = _unconstrained_spectra(Td, W, H, compile_mode=compile_mode, weights=wd)
         rep.update(unconstrained_steps=int(st), unconstrained_seconds=round(time.perf_counter() - t1, 2))
     elif spectra == "support" and mode == "full":
         t1 = time.perf_counter()
         W, H, S, st = _support_selected_spectra(Td, W, H, dose, penalty=penalty, wald_screen=wald_screen,
-                                                compile_mode=compile_mode)
+                                                compile_mode=compile_mode, weights=wd)
         rep.update(support_steps=int(st), support_seconds=round(time.perf_counter() - t1, 2),
                    mean_support_size=S.sum(1).double().mean().item())
     elif spectra == "support":
         S = torch.cat(stats["support_chunks"])
         rep.update(mean_support_size=S.sum(1).double().mean().item(), support_refit_passes=int(stats["refit_passes"]),
                    loss_per_pass_refit=stats.get("loss_refit"))
-    rep["loss_final"] = rep["loss_mle"] if spectra == "mle" else _loss(W, H, T, device)
+    rep["loss_final"] = rep["loss_mle"] if spectra == "mle" else _loss(W, H, T, device, weights)
     if spectra != "mle":
         support_text = (f", mean {rep['mean_support_size']:.2f} materials per pixel" if "mean_support_size" in rep
                         else "")

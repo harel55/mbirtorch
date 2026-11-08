@@ -10,35 +10,41 @@ import numpy as np
 import torch
 
 from ._device import _default_device
+from ._loss import _weights_tensor
 
 
-def _loss_and_residual(T, W, H):
+def _loss_and_residual(T, W, H, weights=None):
     """This function returns two float64 values: the loss of X = W @ H against T, and the mean
-    of (T - e^-X)^2 / e^-X.  It computes both values in blocks of pixels to limit memory."""
-    from ._loss import stable_nnal
+    of (T - e^-X)^2 / e^-X.  It computes both values in blocks of pixels to limit memory.  With
+    ``weights``, a (1, bins) tensor of the weight of each bin, both values weight each entry by
+    the weight of its bin."""
+    from ._loss import _nnal_prep, stable_nnal
     from .outputs import _CHUNK_ELEMENTS
     Hd = H.double()
+    wd = None if weights is None else weights.double()
     chunk = max(1, _CHUNK_ELEMENTS // T.shape[1])
     loss = resid = 0.0
     for i in range(0, T.shape[0], chunk):
         Xd = W[i:i + chunk].double() @ Hd
         Th = torch.exp(-Xd)
         Td = T[i:i + chunk].double()
-        loss += stable_nnal(Xd, Td).item()
-        resid += (((Td - Th) ** 2) / Th.clamp_min(1e-12)).sum().item()
+        loss += stable_nnal(Xd, Td, _nnal_prep(Td, wd)).item()
+        r2 = ((Td - Th) ** 2) / Th.clamp_min(1e-12)
+        resid += (r2 if wd is None else r2 * wd).sum().item()
     return loss, resid / T.numel()
 
 
-def _lrt_rank(T, max_rank, label, verbose=0):
+def _lrt_rank(T, max_rank, label, verbose=0, weights=None):
     """This function runs the likelihood-ratio rank test on the transmission T.  It returns the
-    tuple (rank, detail), where detail is a dict of the losses, gains, and threshold."""
+    tuple (rank, detail), where detail is a dict of the losses, gains, and threshold.  The
+    argument ``weights`` is a (1, bins) tensor of the weight of each bin, or None."""
     from .factorization import _nnal_factorization
     P, K = T.shape
     losses, resid = [], []
     for r in range(1, max_rank + 1):
         # The fit is not compiled, because each rank has a new shape that would force a recompile.
-        W, H, _ = _nnal_factorization(T, r, max_steps=200, rel_tol=1e-6, compile_mode="off")
-        loss, res = _loss_and_residual(T, W, H)
+        W, H, _ = _nnal_factorization(T, r, max_steps=200, rel_tol=1e-6, compile_mode="off", weights=weights)
+        loss, res = _loss_and_residual(T, W, H, weights)
         losses.append(loss)
         resid.append(res)
     dose_eff = 1.0 / max(resid[-1], np.finfo(np.float64).tiny)
@@ -125,17 +131,21 @@ def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, poo
     return _estimate_rank(T, _spatial_shape(shape[:-1]), device, max_rank, pool=pool, verbose=verbose)
 
 
-def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=16384, pool="auto", verbose=0):
+def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=16384, pool="auto", verbose=0,
+                   weights=None):
     """This function performs :func:`estimate_rank` on a transmission ratio with shape
-    (pixels, bins).  The argument ``subsample`` is the most pixels that each test uses."""
+    (pixels, bins).  The argument ``subsample`` is the most pixels that each test uses.  The
+    argument ``weights`` is None or a numpy array with the weight of each bin, as in
+    ``_fit._fit``."""
     device = _default_device(device)
+    wd = _weights_tensor(weights, device)
     T_np = T.detach().cpu().numpy() if torch.is_tensor(T) else np.asarray(T)
     pixels, K = T_np.shape
     rows_per = max(1, 2**24 // max(K, 1))
     if not any(bool((T_np[i:i + rows_per] > 0).any()) for i in range(0, pixels, rows_per)):
         raise ValueError("the data hold no counts: the transmission is zero everywhere")
     Tt = torch.from_numpy(_subsample(T_np, subsample)).to(device)
-    rank_full, d_full = _lrt_rank(Tt, max_rank, "full resolution", verbose)
+    rank_full, d_full = _lrt_rank(Tt, max_rank, "full resolution", verbose, wd)
     block = 0
     if spatial_shape is not None and pool:
         rows, cols = spatial_shape[1], spatial_shape[2]
@@ -158,7 +168,7 @@ def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=163
                       "(rows, cols, bins), or give the number of components")
     if block > 1:
         Tp = torch.from_numpy(_subsample(_pool_pixels(T_np, spatial_shape, block), subsample)).to(device)
-        rank_pool, d_pool = _lrt_rank(Tp, max_rank, f"pooled {block}x{block}", verbose)
+        rank_pool, d_pool = _lrt_rank(Tp, max_rank, f"pooled {block}x{block}", verbose, wd)
         detail.update(pooled=d_pool, rank_pooled=rank_pool)
         rank = max(rank_full, rank_pool)
         parts.append(f"pooled {block}x{block} ({d_pool['pixels']:,} pixels) gave {rank_pool}")

@@ -41,7 +41,7 @@ _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
 
 def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384, device=None,
                           compile_mode='off', verbose=0, stats=None, nonneg_W=True, support_selection=None,
-                          chunk_sizes=None, W_init=None, H_init=None, quick=False):
+                          chunk_sizes=None, W_init=None, H_init=None, quick=False, weights=None):
     """This function factorizes a dataset that is too large for device memory.
 
     The function processes the data one chunk of pixels at a time.  It first fits H by a joint
@@ -89,6 +89,10 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             is measured over all parameters and over the spectra alone.  The function then
             sets stats['quick_stop'] to True, and it records stats['effective_dose'].
             Defaults to False.
+        weights (torch.Tensor, optional): One weight per bin, as a (1, bins) tensor on the
+            device.  Each entry's loss is multiplied by the weight of its bin (see
+            ``_nnal_prep``).  With support selection, the dose times the weights must be the open
+            beam count of each bin.  Defaults to None, which gives every entry the weight 1.
 
     Returns:
         (W_chunks, H, passes): W_chunks is a list of CPU tensors, one for each chunk.  H is the
@@ -117,7 +121,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         T_sub = torch.cat(parts, 0).to(device)
         W_sub = None if W_init is None else W_init[torch.from_numpy(picks)].to(device=device, dtype=T_sub.dtype)
         _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode, W_init=W_sub,
-                                      quick=quick)
+                                      quick=quick, weights=weights)
         del T_sub, W_sub
     rows, cols = torch.triu_indices(R, R, device=H.device)
     pin = torch.device(device).type == 'cuda'
@@ -157,23 +161,28 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 Tc = nxt
                 if i + 1 < len(chunks):
                     nxt = to_device(chunks[i + 1])            # This copy overlaps the solve below.
-                prep = _nnal_prep(Tc)
+                prep = _nnal_prep(Tc, weights)
                 W0 = W_chunks[i].to(device=device, dtype=H.dtype) if W_chunks[i] is not None else None
                 W = solve_chunk(Tc, W0, i)
                 W_chunks[i] = W.cpu()
                 if quick:
                     # The Pearson residual gives the effective dose, and the change of W since the
                     # last pass is measured in the same units as the joint solve's quick stop.
+                    # With weights, both sums weight each entry as the loss does.
                     E = torch.exp(-(W @ H))
-                    pearson = pearson + ((Tc - E) ** 2 / E.clamp_min(torch.finfo(E.dtype).tiny)).sum(dtype=torch.float64)
+                    r2 = (Tc - E) ** 2 / E.clamp_min(torch.finfo(E.dtype).tiny)
+                    Ew = E
+                    if weights is not None:
+                        r2, Ew = r2 * weights, E * weights
+                    pearson = pearson + r2.sum(dtype=torch.float64)
                     n_entries += Tc.numel()
                     if W0 is None:
                         changed = False
                     else:
                         dX = (W - W0) @ H
-                        q_W = q_W + (E * dX).mul_(dX).sum(dtype=torch.float64)
+                        q_W = q_W + (Ew * dX).mul_(dX).sum(dtype=torch.float64)
                         del dX
-                    del E
+                    del E, Ew, r2
                 g_c, f_c, b_c = _h_stats_accumulate(W, H, Tc, prep, rows, cols, deriv, rowwise)
                 grad += g_c
                 flat += f_c
@@ -249,13 +258,14 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 Tc = nxt
                 if i + 1 < len(chunks):
                     nxt = to_device(chunks[i + 1])
-                prep = _nnal_prep(Tc)
+                prep = _nnal_prep(Tc, weights)
                 W = W_chunks[i].to(device)
                 X = W @ H
                 B = W @ d.T
                 Bs = W @ snap.T if with_snap else None
                 if quick:
-                    q_bin += (torch.exp(-X) * B).mul_(B).sum(0, dtype=torch.float64)
+                    q = (torch.exp(-X) * B).mul_(B).sum(0, dtype=torch.float64)
+                    q_bin += q if weights is None else q * weights[0]
                 for t in range(_LS_TRIALS):
                     Xt = X - alphas[t][None, :] * B
                     trial[t] += rowwise(Xt, Tc, prep, 0, dtype=torch.float64)
@@ -286,7 +296,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         return passes
 
     def solve_mle(Tc, W0, i):
-        return solve_W(Tc, H, W0, _W_MAX_STEPS, _W_REL_TOL, nonneg=nonneg_W, compile_mode=compile_mode)
+        return solve_W(Tc, H, W0, _W_MAX_STEPS, _W_REL_TOL, nonneg=nonneg_W, compile_mode=compile_mode,
+                       weights=weights)
 
     passes = polish(solve_mle, max_passes, '')
     if not nonneg_W:
@@ -294,7 +305,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         for i in range(len(chunks)):
             Tc = to_device(chunks[i])
             W = solve_W(Tc, H, W_chunks[i].to(device=device, dtype=H.dtype).clamp(min=0), _W_MAX_STEPS, _W_REL_TOL,
-                        compile_mode=compile_mode)
+                        compile_mode=compile_mode, weights=weights)
             W_chunks[i] = W.cpu()
             del Tc, W
 
@@ -319,7 +330,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         for i in range(len(chunks)):
             Tc = to_device(chunks[i])
             Wc = W_chunks[i].to(device=device, dtype=H.dtype)
-            support, W0, _ = _select_supports(Tc, Wc, H, dose, penalty=penalty, wald_screen=wald_screen)
+            support, W0, _ = _select_supports(Tc, Wc, H, dose, penalty=penalty, wald_screen=wald_screen,
+                                              weights=weights)
             S_chunks[i] = support.cpu()
             W_chunks[i] = W0.cpu()
             counts = counts + support.sum(0)
@@ -335,7 +347,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
 
         # The passes run again, with each W restricted to its supports.
         def solve_masked(Tc, W0, i):
-            return _solve_W_on_support(Tc, H, W0, S_chunks[i].to(device))
+            return _solve_W_on_support(Tc, H, W0, S_chunks[i].to(device), weights=weights)
 
         refit_passes = polish(solve_masked, refit_passes, '_refit')
         _warn_collinear_rows(H)
