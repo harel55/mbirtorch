@@ -91,6 +91,58 @@ def _check_host_memory(n_bytes, what):
         warnings.warn(f"{what} needs {n_bytes / 2**30:.1f} GiB of the {avail / 2**30:.1f} GiB of host memory available")
 
 
+def _pooled(T, spatial_shape, block):
+    """This function returns T averaged over square blocks of block x block pixels in each view,
+    as a float32 numpy array with one row per block, in the order of ``rank._pool_pixels``.  A
+    tensor is averaged on its own device, one band of rows at a time."""
+    from .rank import _pool_pixels
+    if not torch.is_tensor(T):
+        return np.asarray(_pool_pixels(np.asarray(T), spatial_shape, block), dtype=np.float32)
+    V, rows, cols = spatial_shape
+    r, c = rows // block * block, cols // block * block
+    X = T.detach().reshape(V, rows, cols, -1)
+    bands = [X[v, i * block:(i + 1) * block, :c].reshape(block, c // block, block, -1).mean(dim=(0, 2))
+             for v in range(V) for i in range(r // block)]
+    return torch.cat(bands).float().cpu().numpy()
+
+
+def _averaged_start(chunks, T_pool, spatial_shape, rank, warmup, device, compile_mode, sizes, weights=None,
+                    pool_mask=None):
+    """This function returns the starting spectra of a streamed fit, and a dict that says how it
+    found them.  At low counts, the spectra are fitted to blocks of neighboring pixels whose
+    averages hold about ``rank._POOL_COUNTS`` counts per bin.  This start avoids local minima that
+    a fit on single pixels can reach.  At higher counts, the spectra are fitted to random single
+    pixels, as the streamed solver does by default.
+
+    ``T_pool`` holds the transmission of every pixel of ``spatial_shape`` (views, rows, cols), in
+    that order.  ``pool_mask`` is None or a boolean array with one entry per pixel of ``T_pool``.
+    When it is given, only the blocks that lie wholly inside it are fitted."""
+    from ._newton import _resolve_compile
+    from ._streaming import _START_MAX_STEPS, _START_REL_TOL, _subset_fit
+    from .factorization import _nnal_factorization
+    from .rank import _loss_and_residual, _pool_block, _pool_pixels, _subsample
+    mode = _resolve_compile(compile_mode, chunks[0], device)
+    T_sub, W_sub, H = _subset_fit(chunks, rank, warmup, device, mode, sizes=sizes, weights=weights)
+    resid = _loss_and_residual(T_sub, W_sub, H, weights)[1]
+    del T_sub, W_sub
+    dose_eff = 1.0 / max(resid, np.finfo(np.float64).tiny)
+    block = _pool_block(dose_eff, T_pool.shape[0], T_pool.shape[1], spatial_shape)
+    info = dict(effective_dose=dose_eff, block=block)
+    single = dict(info, kind="subset", pixels=int(min(warmup, sum(sizes))))
+    if block <= 1:
+        return H, single
+    pooled = _pooled(T_pool, spatial_shape, block)
+    if pool_mask is not None:
+        inside = _pool_pixels(np.asarray(pool_mask, dtype=np.float32).reshape(-1, 1), spatial_shape, block)[:, 0]
+        pooled = pooled[inside == 1.0]
+        if pooled.shape[0] == 0:
+            return H, dict(single, note="no block lies wholly inside the sample mask")
+    Tp = torch.from_numpy(_subsample(pooled, warmup)).to(device)
+    _, H, _ = _nnal_factorization(Tp, rank, max_steps=_START_MAX_STEPS, rel_tol=_START_REL_TOL, compile_mode=mode,
+                                  weights=weights)
+    return H, dict(info, kind="averaged", pixels=int(Tp.shape[0]))
+
+
 def _rows(T, start, stop):
     """This function returns the rows start to stop of T as a tensor.  T is a numpy array or a
     tensor, and the rows of a tensor stay on its device."""
@@ -188,11 +240,19 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
 
 
 def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5,
-         warmup_pixels=16384, compile_mode="auto", report=None, weights=None):
+         warmup_pixels=16384, compile_mode="auto", report=None, weights=None, spatial_shape=None, pool_T=None,
+         pool_mask=None, start="averaged"):
     """This function fits the transmission T at the given rank.  T is a float32 numpy array or
     tensor with shape (pixels, bins).  A tensor on the solve's device is used without a copy.
     The function returns (W, H, report).  W and H are the numpy factors,
     and ``report`` is a dict that describes what the fit did.
+
+    The argument ``spatial_shape`` is the shape (views, rows, cols) of the pixels, or None.  When
+    it is given, a streamed fit takes its starting spectra from ``_averaged_start``.  When T holds
+    only the pixels inside a sample mask, ``pool_T`` holds every pixel of that shape and
+    ``pool_mask`` marks the pixels of T.  The argument ``start`` is 'averaged' or 'subset'.  The
+    value 'subset' starts a streamed fit from spectra fitted to random single pixels at every
+    count level.  For a streamed fit, report['start'] says which start the fit used.
 
     The function fills ``report`` in place.  As a result, the caller has the memory plan even
     when the solve fails.  The argument ``weights`` is None or a numpy array with one weight per
@@ -202,6 +262,8 @@ def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, 
     from ._loss import _weights_tensor
     from ._streaming import _stream_factorization
     from .factorization import _nnal_factorization
+    if start not in ("averaged", "subset"):
+        raise ValueError(f"start must be 'averaged' or 'subset', got {start!r}")
     P, K = T.shape
     mode, chunk, warmup, note = _plan(P, K, device, "mle", mode, chunk_pixels, compile_mode, warmup_pixels)
     rep = {} if report is None else report
@@ -220,11 +282,20 @@ def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, 
         rep["steps"] = int(steps)
     else:
         chunks = [_rows(T, i, i + chunk) for i in range(0, P, chunk)]
+        H0 = None
+        if spatial_shape is not None and start == "averaged":
+            H0, rep["start"] = _averaged_start(chunks, T if pool_T is None else pool_T, spatial_shape, rank, warmup,
+                                               device, "on" if compile_mode == "on" else "off",
+                                               [c.shape[0] for c in chunks], weights=wd, pool_mask=pool_mask)
+            log.info("streamed start: %s (block %d, effective dose %.3g counts per bin)", rep["start"]["kind"],
+                     rep["start"]["block"], rep["start"]["effective_dose"])
+        else:
+            rep["start"] = dict(kind="subset")
         W_chunks, H, passes = _stream_factorization(chunks, rank, max_passes=max_passes, rel_tol=rel_tol,
                                                     warmup_pixels=warmup, device=device,
                                                     verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,
                                                     compile_mode="on" if compile_mode == "on" else "off",
-                                                    chunk_sizes=[c.shape[0] for c in chunks], weights=wd)
+                                                    chunk_sizes=[c.shape[0] for c in chunks], H_init=H0, weights=wd)
         W = torch.cat(W_chunks)
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         Td = None

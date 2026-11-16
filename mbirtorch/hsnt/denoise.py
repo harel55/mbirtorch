@@ -137,7 +137,9 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
         device (str, optional): The torch device.  Defaults to None, which uses CUDA when
             available and the CPU otherwise.
         mode (str, optional): 'full' holds all pixels in device memory.  'stream' processes
-            the pixels in chunks.  'auto' chooses by the available memory.  Defaults to 'auto'.
+            the pixels in chunks.  'auto' chooses by the available memory.  When the data have
+            image axes and few counts, a streamed fit starts from spectra fitted to averaged
+            blocks of neighboring pixels.  Defaults to 'auto'.
         max_passes (int, optional): The passes over the chunks in 'stream' mode.  Defaults
             to 5.
         sample_mask (numpy.ndarray or torch.Tensor, optional): A boolean array, True where the
@@ -195,7 +197,8 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
                                                     max_rank=max_num_est_materials,
                                                     verbose=max(0, verbose - 1), weights=weights)
         W, H, rep = _fit(T, int(num_materials), device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol,
-                         max_passes=int(max_passes), weights=weights)
+                         max_passes=int(max_passes), weights=weights, spatial_shape=_spatial_shape(lead),
+                         pool_T=None if mask is None else T_all, pool_mask=mask)
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             print("dehydrate(): ")

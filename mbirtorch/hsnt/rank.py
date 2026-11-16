@@ -12,6 +12,26 @@ import torch
 from ._device import _default_device
 from ._loss import _weights_tensor
 
+# Blocks of neighboring pixels are averaged until each bin holds about _POOL_COUNTS counts.  The
+# rank estimate and the start of a streamed fit both use these settings.  The blocks are never so
+# wide that fewer than _POOL_MIN_BLOCKS_PER_BIN blocks per bin remain, and never wider than the
+# smaller image side divided by _POOL_SIDE_DIVISOR.  _POOL_DOSE_FLOOR keeps the width finite when
+# the estimated counts are zero.
+_POOL_COUNTS = 64.0
+_POOL_MIN_BLOCKS_PER_BIN = 0.5
+_POOL_SIDE_DIVISOR = 4
+_POOL_DOSE_FLOOR = 1e-9
+
+
+def _pool_block(effective_dose, pixels, bins, spatial_shape):
+    """This function returns the width of the square blocks of pixels whose averages hold about
+    _POOL_COUNTS counts per bin, for data with ``effective_dose`` counts per pixel and bin.  A
+    width of 1 means that the data need no averaging."""
+    rows, cols = spatial_shape[1], spatial_shape[2]
+    block = int(np.ceil(np.sqrt(_POOL_COUNTS / max(effective_dose, _POOL_DOSE_FLOOR))))
+    widest = np.ceil(np.sqrt(pixels / (_POOL_MIN_BLOCKS_PER_BIN * bins)))
+    return int(min(block, widest, max(1, min(rows, cols) // _POOL_SIDE_DIVISOR)))
+
 
 def _loss_and_residual(T, W, H, weights=None):
     """This function returns two float64 values: the loss of X = W @ H against T, and the mean
@@ -149,16 +169,14 @@ def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=163
     rank_full, d_full = _lrt_rank(Tt, max_rank, "full resolution", verbose, wd)
     block = 0
     if spatial_shape is not None and pool:
-        rows, cols = spatial_shape[1], spatial_shape[2]
         if pool == "auto":
-            block = int(np.ceil(np.sqrt(64.0 / max(d_full["effective_dose"], 1e-9))))
-            block = int(min(block, np.ceil(np.sqrt(2.0 * pixels / K)), max(1, min(rows, cols) // 4)))
+            block = _pool_block(d_full["effective_dose"], pixels, K, spatial_shape)
         else:
             block = int(pool)
     detail = dict(full=d_full, pool_block=block, max_rank=max_rank, rank_full=rank_full, rank_pooled=None)
     rank = rank_full
     parts = [f"full resolution gave {rank_full}"]
-    if spatial_shape is None and pool == "auto" and d_full["effective_dose"] < 64.0:
+    if spatial_shape is None and pool == "auto" and d_full["effective_dose"] < _POOL_COUNTS:
         # With pool='auto', averaging is used below 64 counts per bin.  At such low counts the
         # full-resolution test can miss faint components.
         parts.append("no pooling: the data have no image axes")

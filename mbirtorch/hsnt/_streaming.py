@@ -37,10 +37,32 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9, ub=None):
 # _W_REL_TOL and _W_MAX_STEPS are the tolerance and the step limit of the block Newton solve for
 # W in each chunk.  _LS_TRIALS is the number of step lengths that each line search on H tries.
 _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
+# _START_MAX_STEPS and _START_REL_TOL are the step limit and the tolerance of the joint Newton
+# solve that finds the starting spectra, on a subset of the pixels or on averaged blocks of pixels.
+_START_MAX_STEPS, _START_REL_TOL = 300, 1e-6
+
+
+def _subset_fit(chunks, num_materials, warmup_pixels, device, compile_mode, sizes=None, weights=None):
+    """This function fits W and H by a joint Newton solve on a random subset of the pixels.  The
+    subset holds ``warmup_pixels`` pixels, drawn from all chunks with seed 0.  The streamed solve
+    starts from the H of this fit when it is given no starting spectra.  The function returns
+    (T_sub, W_sub, H): the subset's transmission and maps on the device, and the spectra."""
+    sizes = np.array(sizes if sizes is not None else [c.shape[0] for c in chunks])
+    offsets = np.concatenate([[0], np.cumsum(sizes)])
+    picks = np.sort(np.random.default_rng(0).choice(offsets[-1], min(warmup_pixels, offsets[-1]), replace=False))
+    parts = []
+    for i, c in enumerate(chunks):
+        local = picks[(picks >= offsets[i]) & (picks < offsets[i + 1])] - offsets[i]
+        if local.size:
+            parts.append(c[torch.from_numpy(local).to(c.device)])
+    T_sub = torch.cat(parts, 0).to(device)
+    W_sub, H, _ = _nnal_factorization(T_sub, num_materials, max_steps=_START_MAX_STEPS, rel_tol=_START_REL_TOL,
+                                      compile_mode=compile_mode, weights=weights)
+    return T_sub, W_sub, H
 
 
 def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384, device=None,
-                          compile_mode='off', verbose=0, stats=None, chunk_sizes=None, weights=None):
+                          compile_mode='off', verbose=0, stats=None, chunk_sizes=None, H_init=None, weights=None):
     """This function factorizes a dataset that is too large for device memory.
 
     The function processes the data one chunk of pixels at a time.  It first fits H by a joint
@@ -70,6 +92,9 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         chunk_sizes (sequence of int, optional): The number of pixels in each chunk.  With this
             argument, the function does not need to load a chunk to find its size.
             Defaults to None.
+        H_init (torch.Tensor, optional): Starting spectra, with shape (R, bins).  When it is
+            given, the function skips the fit on the subset and starts the passes from it.
+            Defaults to None.
         weights (torch.Tensor, optional): One weight per bin, as a (1, bins) tensor on the
             device.  Each entry's loss is multiplied by the weight of its bin (see
             ``_nnal_prep``).  Defaults to None, which gives every entry the weight 1.
@@ -86,16 +111,10 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
 
     # The first fit of H uses a random subset of pixels, drawn from all chunks with seed 0.
     sizes = np.array(chunk_sizes if chunk_sizes is not None else [c.shape[0] for c in chunks])
-    offsets = np.concatenate([[0], np.cumsum(sizes)])
-    picks = np.sort(np.random.default_rng(0).choice(offsets[-1], min(warmup_pixels, offsets[-1]), replace=False))
-    parts = []
-    for i, c in enumerate(chunks):
-        local = picks[(picks >= offsets[i]) & (picks < offsets[i + 1])] - offsets[i]
-        if local.size:
-            parts.append(c[torch.from_numpy(local).to(c.device)])
-    T_sub = torch.cat(parts, 0).to(device)
-    _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode, weights=weights)
-    del T_sub
+    if H_init is not None:
+        H = H_init.to(device)
+    else:
+        H = _subset_fit(chunks, R, warmup_pixels, device, compile_mode, sizes=sizes, weights=weights)[2]
     rows, cols = torch.triu_indices(R, R, device=H.device)
     pin = torch.device(device).type == 'cuda'
 
