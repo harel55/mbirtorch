@@ -25,6 +25,14 @@ _PATIENCE = 5
 _COMPILE_MIN_ELEMENTS = 5e8
 # The largest number of times the joint solve restarts after it replaces zero components with random values.
 _MAX_RESEEDS = 2
+# The conjugate gradient loop of the joint solve reads its stop flag from the device once every this many
+# iterations.  Each read waits for the device, and a larger value runs more iterations after the stop.
+_CG_CHECK_EVERY = 1
+# The joint solve replays each step's search direction from CUDA graphs when the data have at most this many
+# entries.  A graph keeps the memory of its intermediate arrays, so larger data run without graphs.
+_GRAPH_MAX_ELEMENTS = 2 ** 25
+# The graphs' bodies run this many times before the capture, so that the libraries set up their workspaces.
+_GRAPH_WARMUP_RUNS = 2
 
 
 def _resolve_compile(compile_mode, T, device=None):
@@ -264,6 +272,184 @@ def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compil
                                     compile_mode=compile_mode, nonneg_W=nonneg, weights=weights)
     return W
 
+_CG_STATE = ("xW", "xH", "rW", "rH", "pW", "pH", "rz", "done", "ncg")      # the CG values that change per iteration
+
+
+def _pcg_setup(W, H, T, prep, deriv, lam, rows, cols, nonneg_W, w_mask):
+    """This function starts one step of ``_joint_newton_pcg``.  It returns a dict with the projected
+    gradient, its squared norm ``gnorm2`` and scaled norm ``gnorm``, the free entries, the upper bounds
+    ``uW`` and ``uH`` of W and H (None when W is not constrained), the preconditioner, the damping
+    ``lam``, and the CG values before the first iteration."""
+    rank = W.shape[1]
+    X = W @ H
+    G, Z = deriv(X, T, prep)
+    gW, gH = G @ H.T, W.T @ G
+    fW = ~((W <= 0) & (gW > 0)) if nonneg_W else torch.ones_like(W, dtype=torch.bool)
+    if w_mask is not None:
+        fW = fW & w_mask
+    fH = ~((H <= 0) & (gH > 0))
+    uW = uH = None
+    if nonneg_W:                                         # upper bounds from _X_MAX, fixed for this step
+        uW, uH = _partner_bound(H, 1), _partner_bound(W, 0).T
+        fW = fW & ~((W >= uW * (1 - _ACTIVE_TOL)) & (gW < 0))
+        fH = fH & ~((H >= uH * (1 - _ACTIVE_TOL)) & (gH < 0))
+    gW, gH = gW * fW, gH * fH
+    s = dict(W=W, H=H, G=G, Z=Z, fW=fW, fH=fH, uW=uW, uH=uH, gW=gW, gH=gH, lam=lam)
+    s["gnorm2"] = _joint_dot(gW, gW, gH, gH)
+    s["gnorm"] = (gW.norm(dim=0) * W.norm(dim=0)).sum() + (gH.norm(dim=1) * H.norm(dim=1)).sum()
+    s["LW"] = _joint_blocks(Z @ (H[rows] * H[cols]).T, rows, cols, rank, fW, 1e-8)
+    s["LH"] = _joint_blocks(((W[:, rows] * W[:, cols]).T @ Z).T, rows, cols, rank, fH.T, 1e-8)
+    rW, rH = -gW, -gH
+    zW, zH = _precond(s, rW, rH)
+    s.update(xW=torch.zeros_like(gW), xH=torch.zeros_like(gH), rW=rW, rH=rH, zW=zW, zH=zH, pW=zW.clone(),
+             pH=zH.clone(), rz=_joint_dot(rW, zW, rH, zH),
+             done=torch.zeros((), dtype=torch.bool, device=W.device),
+             ncg=torch.zeros((), dtype=torch.int64, device=W.device))
+    r0 = _joint_dot(rW, rW, rH, rH)
+    s["tol2"] = (torch.clamp(s["gnorm2"].sqrt().sqrt(), max=0.5) ** 2) * r0
+    return s
+
+
+def _precond(s, rW, rH):
+    """This function applies the block preconditioner of the step ``s``."""
+    zW = torch.cholesky_solve(rW.unsqueeze(-1), s["LW"]).squeeze(-1) * s["fW"]
+    zH = torch.cholesky_solve(rH.T.unsqueeze(-1), s["LH"]).squeeze(-1).T * s["fH"]
+    # A row with a zero Hessian block can overflow the preconditioner.  For such rows, CG
+    # uses the residual without preconditioning.
+    zW = torch.where(torch.isfinite(zW), zW, rW)
+    zH = torch.where(torch.isfinite(zH), zH, rH)
+    return zW, zH
+
+
+def _hvp(s, dW, dH):
+    """This function multiplies (dW, dH) by the damped Hessian of the step ``s``."""
+    W, H, G, fW, fH, lam = s["W"], s["H"], s["G"], s["fW"], s["fH"], s["lam"]
+    dW, dH = dW * fW, dH * fH
+    dX = dW @ H + W @ dH
+    ZdX = s["Z"] * dX
+    return ((ZdX @ H.T + G @ dH.T) * fW + lam * dW,
+            (W.T @ ZdX + dW.T @ G) * fH + lam * dH)
+
+
+def _cg_iteration(s, first):
+    """This function takes one CG iteration on the step ``s`` and returns the new CG values.  CG
+    stops at the first iteration whose curvature is not positive or whose residual is below
+    ``tol2``.  The stop is kept on the device: after a stop, the iterate is frozen.  ``first``
+    says whether this is the first iteration."""
+    xW, xH, rW, rH, pW, pH, rz, done = (s[k] for k in ("xW", "xH", "rW", "rH", "pW", "pH", "rz", "done"))
+    ApW, ApH = _hvp(s, pW, pH)
+    pAp = _joint_dot(pW, ApW, pH, ApH)
+    curved = pAp > 0
+    if first:                                            # without curvature on the first iteration, CG returns z
+        xW = torch.where(curved, xW, s["zW"])
+        xH = torch.where(curved, xH, s["zH"])
+    ncg = s["ncg"] + (~done).long()
+    active = ~done & curved
+    a = rz / pAp
+    xW = torch.where(active, xW + a * pW, xW)
+    xH = torch.where(active, xH + a * pH, xH)
+    rW = torch.where(active, rW - a * ApW, rW)
+    rH = torch.where(active, rH - a * ApH, rH)
+    done = done | ~curved | (_joint_dot(rW, rW, rH, rH) <= s["tol2"])
+    zW, zH = _precond(s, rW, rH)
+    rz_new = _joint_dot(rW, zW, rH, zH)
+    b = rz_new / rz
+    return dict(xW=xW, xH=xH, rW=rW, rH=rH, pW=zW + b * pW, pH=zH + b * pH, rz=rz_new, done=done, ncg=ncg)
+
+
+def _pcg_finish(s):
+    """This function returns the search direction of the step ``s`` and its slope.  When the CG
+    direction does not descend, the direction is the projected steepest descent direction."""
+    slope = _joint_dot(s["gW"], s["xW"], s["gH"], s["xH"])
+    uphill = slope >= 0
+    return (torch.where(uphill, -s["gW"], s["xW"]), torch.where(uphill, -s["gH"], s["xH"]),
+            torch.where(uphill, -s["gnorm2"], slope))
+
+
+def _pcg_direction(W, H, T, prep, deriv, lam, rows, cols, cg_max, nonneg_W, w_mask):
+    """This function computes the search direction of one step of ``_joint_newton_pcg`` without a
+    CUDA graph.  It returns (xW, xH, slope, gnorm2, gnorm, uW, uH, ncg).  The host reads the CG stop
+    flag every ``_CG_CHECK_EVERY`` iterations.  The iterations after the stop leave the direction
+    unchanged."""
+    s = _pcg_setup(W, H, T, prep, deriv, lam, rows, cols, nonneg_W, w_mask)
+    for it in range(1, cg_max + 1):
+        s.update(_cg_iteration(s, it == 1))
+        if it < cg_max and it % _CG_CHECK_EVERY == 0 and bool(s["done"]):
+            break
+    xW, xH, slope = _pcg_finish(s)
+    return xW, xH, slope, s["gnorm2"], s["gnorm"], s["uW"], s["uH"], s["ncg"]
+
+
+class _DirectionGraphs:
+    """CUDA graphs of the search direction of ``_joint_newton_pcg`` for one solve.  Replaying a graph
+    launches all its kernels at once, which saves the launch time of each kernel.  There are three
+    graphs: the start of a step with the first CG iteration, one more CG iteration, and the end of
+    the step.  The CG iteration is replayed until the host reads the stop flag, as in
+    ``_pcg_direction``, so the direction is the same."""
+
+    def __init__(self, W, H, T, prep, deriv, rows, cols, nonneg_W, w_mask):
+        self.W, self.H = W.clone(), H.clone()
+        self.lam = torch.zeros((), dtype=W.dtype, device=W.device)
+        device = W.device
+
+        def start():
+            s = _pcg_setup(self.W, self.H, T, prep, deriv, self.lam, rows, cols, nonneg_W, w_mask)
+            s.update(_cg_iteration(s, True))
+            return s
+
+        def iteration():
+            new = _cg_iteration(self.s, False)
+            for k in _CG_STATE:
+                self.s[k].copy_(new[k])
+
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):                    # the libraries set up their workspaces before the capture
+            for _ in range(_GRAPH_WARMUP_RUNS):
+                self.s = start()
+                iteration()
+                _pcg_finish(self.s)
+        torch.cuda.current_stream(device).wait_stream(side)
+        self.start_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.start_graph):
+            self.s = start()
+        pool = self.start_graph.pool()
+        self.iteration_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.iteration_graph, pool=pool):
+            iteration()
+        self.finish_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.finish_graph, pool=pool):
+            self.direction = _pcg_finish(self.s)
+
+    def __call__(self, W, H, lam, cg_max):
+        self.W.copy_(W)
+        self.H.copy_(H)
+        self.lam.fill_(lam)
+        self.start_graph.replay()
+        for it in range(2, cg_max + 1):
+            if (it - 1) % _CG_CHECK_EVERY == 0 and bool(self.s["done"]):     # the stop after iteration it - 1
+                break
+            self.iteration_graph.replay()
+        self.finish_graph.replay()
+        s = self.s
+        return (*self.direction, s["gnorm2"], s["gnorm"], s["uW"], s["uH"], s["ncg"])
+
+
+def _direction_graphs(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask):
+    """This function returns ``_DirectionGraphs`` on CUDA for data of at most ``_GRAPH_MAX_ELEMENTS``
+    entries, and None otherwise.  A graph keeps the memory of its intermediate arrays, so larger
+    data run without graphs.  Compiled kernels also run without graphs.  When an operation cannot
+    be captured, the solve runs without graphs."""
+    if (not W.is_cuda or T.numel() > _GRAPH_MAX_ELEMENTS or nnal is not stable_nnal
+            or deriv is not stable_nnal_derivatives or cg_max < 1):
+        return None
+    try:
+        return _DirectionGraphs(W, H, T, prep, deriv, rows, cols, nonneg_W, w_mask)
+    except RuntimeError:
+        torch.cuda.synchronize(W.device)
+        return None
+
+
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
                       nonneg_W=True, w_mask=None, patience=1):
     """This function solves for W and H together by a truncated Newton method with preconditioned
@@ -287,85 +473,32 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     total_cg = 0
     step = 0
     gnorm0 = None
-    quiet = 0
+    quiet = torch.zeros((), dtype=torch.int64, device=W.device)   # accepted steps in a row with a small loss change
+    graphs = _direction_graphs(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask)
     for step in range(1, max_steps + 1):
-        X = W @ H
-        G, Z = deriv(X, T, prep)
-        gW, gH = G @ H.T, W.T @ G
-        fW = ~((W <= 0) & (gW > 0)) if nonneg_W else torch.ones_like(W, dtype=torch.bool)
-        if w_mask is not None:
-            fW = fW & w_mask
-        fH = ~((H <= 0) & (gH > 0))
-        if nonneg_W:                                     # upper bounds from _X_MAX, fixed for this step
-            uW, uH = _partner_bound(H, 1), _partner_bound(W, 0).T
-            fW = fW & ~((W >= uW * (1 - _ACTIVE_TOL)) & (gW < 0))
-            fH = fH & ~((H >= uH * (1 - _ACTIVE_TOL)) & (gH < 0))
-        gW, gH = gW * fW, gH * fH
-        gnorm2 = _joint_dot(gW, gW, gH, gH)
-        if not torch.isfinite(gnorm2) or gnorm2 == 0:
-            break
+        if graphs is None:
+            xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = _pcg_direction(W, H, T, prep, deriv, lam, rows, cols, cg_max,
+                                                                      nonneg_W, w_mask)
+        else:
+            xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = graphs(W, H, lam, cg_max)
         # This KKT test stops the solve when the model fits the data exactly.  In that case the
-        # loss goes to zero, and the relative change of the loss stays large.  The loss test below
-        # is the main test.
-        gnorm = (gW.norm(dim=0) * W.norm(dim=0)).sum() + (gH.norm(dim=1) * H.norm(dim=1)).sum()
-        if gnorm0 is None:
-            gnorm0 = gnorm
-        elif rel_tol > 0 and gnorm <= max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps) * gnorm0:
+        # loss goes to zero, and the relative change of the loss stays large.  The loss test of
+        # the previous step is the main test.  All tests are read in one transfer from the device.
+        # When the loss test stops the solve, the previous step was the last one, and the work of
+        # this step is dropped.
+        stop = ~torch.isfinite(gnorm2) | (gnorm2 == 0)
+        if gnorm0 is not None and rel_tol > 0:
+            stop = stop | (gnorm <= max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps) * gnorm0)
+        settled, stop = torch.stack([quiet >= patience if rel_tol > 0 else torch.zeros_like(stop), stop]).tolist()
+        if settled:
+            step -= 1
             break
+        if stop:
+            break
+        if gnorm0 is None:
+            gnorm0 = gnorm.clone()
+        total_cg = total_cg + ncg
 
-        LW = _joint_blocks(Z @ (H[rows] * H[cols]).T, rows, cols, rank, fW, 1e-8)
-        LH = _joint_blocks(((W[:, rows] * W[:, cols]).T @ Z).T, rows, cols, rank, fH.T, 1e-8)
-
-        def precond(rW, rH):
-            zW = torch.cholesky_solve(rW.unsqueeze(-1), LW).squeeze(-1) * fW
-            zH = torch.cholesky_solve(rH.T.unsqueeze(-1), LH).squeeze(-1).T * fH
-            # A row with a zero Hessian block can overflow the preconditioner.  For such rows, CG
-            # uses the residual without preconditioning.
-            zW = torch.where(torch.isfinite(zW), zW, rW)
-            zH = torch.where(torch.isfinite(zH), zH, rH)
-            return zW, zH
-
-        def hvp(dW, dH):
-            dW, dH = dW * fW, dH * fH
-            dX = dW @ H + W @ dH
-            ZdX = Z * dX
-            return ((ZdX @ H.T + G @ dH.T) * fW + lam * dW,
-                    (W.T @ ZdX + dW.T @ G) * fH + lam * dH)
-
-        xW = torch.zeros_like(gW)
-        xH = torch.zeros_like(gH)
-        rW, rH = -gW, -gH
-        zW, zH = precond(rW, rH)
-        pW, pH = zW.clone(), zH.clone()
-        rz = _joint_dot(rW, zW, rH, zH)
-        r0 = _joint_dot(rW, rW, rH, rH)
-        tol2 = (torch.clamp(gnorm2.sqrt().sqrt(), max=0.5) ** 2) * r0
-        ncg = 0
-        for ncg in range(1, cg_max + 1):
-            ApW, ApH = hvp(pW, pH)
-            pAp = _joint_dot(pW, ApW, pH, ApH)
-            if pAp <= 0:
-                if ncg == 1: xW, xH = zW, zH
-                break
-            a = rz / pAp
-            xW = xW + a * pW
-            xH = xH + a * pH
-            rW = rW - a * ApW
-            rH = rH - a * ApH
-            if _joint_dot(rW, rW, rH, rH) <= tol2:
-                break
-            zW, zH = precond(rW, rH)
-            rz_new = _joint_dot(rW, zW, rH, zH)
-            b = rz_new / rz
-            pW = zW + b * pW
-            pH = zH + b * pH
-            rz = rz_new
-        total_cg += ncg
-
-        slope = _joint_dot(gW, xW, gH, xH)
-        if slope >= 0:
-            xW, xH = -gW, -gH
-            slope = -gnorm2
         a, accepted = 1.0, False
         for _ in range(30):
             Wn = torch.minimum((W + a * xW).clamp_(min=0), uW) if nonneg_W else W + a * xW
@@ -373,7 +506,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
             if nonneg_W:                                 # recompute the bound on W from the new H
                 Wn = torch.minimum(Wn, _partner_bound(Hn, 1))
             new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
-            if torch.isfinite(new_loss) and new_loss <= loss + 1e-4 * a * slope:
+            if bool(torch.isfinite(new_loss) & (new_loss <= loss + 1e-4 * a * slope)):
                 accepted = True
                 break
             a *= 0.5
@@ -385,10 +518,8 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         # At the limit of float precision, no step is accepted, and the test lam > 1e6 ends the solve.
         rel_change = torch.abs(loss - new_loss) / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny)
         W, H, loss = Wn, Hn, new_loss
-        quiet = quiet + 1 if bool(rel_change <= rel_tol) else 0
-        if rel_tol > 0 and quiet >= patience:
-            break
-    return W, H, step, total_cg
+        quiet = torch.where(rel_change <= rel_tol, quiet + 1, torch.zeros_like(quiet))
+    return W, H, step, int(total_cg)
 
 
 def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
