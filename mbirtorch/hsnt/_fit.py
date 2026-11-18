@@ -118,7 +118,7 @@ def _subset_dose(chunks, rank, warmup, device, mode, sizes, weights):
 
 
 def _averaged_start(chunks, T_pool, spatial_shape, rank, warmup, device, compile_mode, sizes, weights=None,
-                    pool_mask=None, dose=None, need_start=True):
+                    pool_mask=None, dose=None, need_start=True, max_steps=None, rel_tol=None):
     """This function returns the starting spectra of a fit, and a dict that says how it found
     them.  At low counts, the spectra are fitted to blocks of neighboring pixels whose averages
     hold about ``rank._POOL_COUNTS`` counts per bin.  This start avoids local minima that a fit on
@@ -131,7 +131,9 @@ def _averaged_start(chunks, T_pool, spatial_shape, rank, warmup, device, compile
     inside it are fitted.  ``dose`` is the mean open-beam count per bin, or None.  When it is None,
     the counts are estimated from a fit to random single pixels.  When ``need_start`` is False and
     the counts need no averaging, the function returns None as the spectra, and the caller uses
-    its own start."""
+    its own start.  ``max_steps`` and ``rel_tol`` stop the fit to the averaged blocks.  They
+    default to the streamed start's limits.  A full fit passes its own limits, because a looser
+    start costs the main fit more steps than it saves."""
     from ._newton import _resolve_compile
     from ._streaming import _START_MAX_STEPS, _START_REL_TOL, _subset_fit
     from .factorization import _nnal_factorization
@@ -162,7 +164,8 @@ def _averaged_start(chunks, T_pool, spatial_shape, rank, warmup, device, compile
             return single_start("no block lies wholly inside the sample mask")
     Tp = _subsample(pooled, warmup)
     Tp = (Tp if torch.is_tensor(Tp) else torch.from_numpy(Tp)).to(device)
-    _, H, _ = _nnal_factorization(Tp, rank, max_steps=_START_MAX_STEPS, rel_tol=_START_REL_TOL, compile_mode=mode,
+    _, H, _ = _nnal_factorization(Tp, rank, max_steps=_START_MAX_STEPS if max_steps is None else max_steps,
+                                  rel_tol=_START_REL_TOL if rel_tol is None else rel_tol, compile_mode=mode,
                                   weights=weights)
     return H, dict(info, kind="averaged", pixels=int(Tp.shape[0]))
 
@@ -306,7 +309,7 @@ def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, 
         if spatial_shape is not None and start == "averaged":   # The pixels are pooled on the device.
             H0, rep["start"] = _averaged_start([Td], Td if pool_T is None else pool_T, spatial_shape, rank,
                                                warmup_pixels, device, compile_mode, [P], weights=wd, pool_mask=pool_mask,
-                                               dose=dose, need_start=False)
+                                               dose=dose, need_start=False, max_steps=max_steps, rel_tol=rel_tol)
         else:
             rep["start"] = dict(kind="default")
         W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode,
