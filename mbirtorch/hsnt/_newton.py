@@ -33,6 +33,11 @@ _CG_CHECK_EVERY = 1
 _GRAPH_MAX_ELEMENTS = 2 ** 25
 # The graphs' bodies run this many times before the capture, so that the libraries set up their workspaces.
 _GRAPH_WARMUP_RUNS = 2
+# The line search of the joint solve accepts a step when the loss falls by at least this fraction of the
+# decrease that the slope predicts (the Armijo test).
+_ARMIJO_SLOPE = 1e-4
+# The line search of the joint solve halves the step at most this many times.
+_LINE_SEARCH_TRIALS = 30
 
 
 def _resolve_compile(compile_mode, T, device=None):
@@ -183,7 +188,7 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
         # A step is accepted when its loss exceeds the Armijo target by no more than float32 rounding.
         noise = _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * base.abs()
         ok = (_nnal_rowwise(X - expand(trial) * B, T, prep, dim, dtype=torch.float64)
-              <= base - 1e-4 * trial * slope + noise) | (trial == 0)
+              <= base - _ARMIJO_SLOPE * trial * slope + noise) | (trial == 0)
         accepted = torch.where(ok & ~done, trial, accepted)
         done = done | ok
         if bool(done.all()):
@@ -380,17 +385,39 @@ def _pcg_direction(W, H, T, prep, deriv, lam, rows, cols, cg_max, nonneg_W, w_ma
     return xW, xH, slope, s["gnorm2"], s["gnorm"], s["uW"], s["uH"], s["ncg"]
 
 
+def _trial_point(W, H, xW, xH, uW, uH, a, nonneg_W):
+    """This function returns the factors at step ``a`` along (xW, xH) in the line search of
+    ``_joint_newton_pcg``.  The factors are clamped to their bounds.  ``a`` is a number or a
+    tensor with one entry."""
+    Wn = torch.minimum((W + a * xW).clamp_(min=0), uW) if nonneg_W else W + a * xW
+    Hn = torch.minimum((H + a * xH).clamp_(min=0), uH) if nonneg_W else (H + a * xH).clamp_(min=0)
+    if nonneg_W:                                         # recompute the bound on W from the new H
+        Wn = torch.minimum(Wn, _partner_bound(Hn, 1))
+    return Wn, Hn
+
+
 class _DirectionGraphs:
-    """CUDA graphs of the search direction of ``_joint_newton_pcg`` for one solve.  Replaying a graph
-    launches all its kernels at once, which saves the launch time of each kernel.  There are three
-    graphs: the start of a step with the first CG iteration, one more CG iteration, and the end of
-    the step.  The CG iteration is replayed until the host reads the stop flag, as in
-    ``_pcg_direction``, so the direction is the same."""
+    """CUDA graphs of one step of ``_joint_newton_pcg`` for one solve.  Replaying a graph launches
+    all its kernels at once, which saves the launch time of each kernel.  There are four graphs:
+    the start of a step with the first CG iteration, one more CG iteration, the end of the step,
+    and one trial of the line search.  The CG iteration is replayed until the host reads the stop
+    flag, as in ``_pcg_direction``, so the direction is the same.  The trial is replayed with the
+    step length of each trial, so the accepted step is the same."""
 
     def __init__(self, W, H, T, prep, deriv, rows, cols, nonneg_W, w_mask):
         self.W, self.H = W.clone(), H.clone()
         self.lam = torch.zeros((), dtype=W.dtype, device=W.device)
+        self.a = torch.ones((), dtype=W.dtype, device=W.device)            # the step length of a trial
+        self.armijo = torch.zeros((), dtype=W.dtype, device=W.device)      # _ARMIJO_SLOPE times the step length
+        self.loss = torch.zeros((), dtype=torch.float64, device=W.device)  # the loss at W and H
         device = W.device
+
+        def trial():
+            xW, xH, slope = self.direction
+            Wn, Hn = _trial_point(self.W, self.H, xW, xH, self.s["uW"], self.s["uH"], self.a, nonneg_W)
+            new_loss = stable_nnal(Wn @ Hn, T, prep, dtype=torch.float64)
+            ok = torch.isfinite(new_loss) & (new_loss <= self.loss + self.armijo * slope)
+            return Wn, Hn, new_loss, ok
 
         def start():
             s = _pcg_setup(self.W, self.H, T, prep, deriv, self.lam, rows, cols, nonneg_W, w_mask)
@@ -408,7 +435,8 @@ class _DirectionGraphs:
             for _ in range(_GRAPH_WARMUP_RUNS):
                 self.s = start()
                 iteration()
-                _pcg_finish(self.s)
+                self.direction = _pcg_finish(self.s)
+                trial()
         torch.cuda.current_stream(device).wait_stream(side)
         self.start_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.start_graph):
@@ -420,11 +448,15 @@ class _DirectionGraphs:
         self.finish_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.finish_graph, pool=pool):
             self.direction = _pcg_finish(self.s)
+        self.trial_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.trial_graph, pool=pool):
+            self.trial_out = trial()
 
-    def __call__(self, W, H, lam, cg_max):
+    def __call__(self, W, H, lam, cg_max, loss):
         self.W.copy_(W)
         self.H.copy_(H)
         self.lam.fill_(lam)
+        self.loss.copy_(loss)
         self.start_graph.replay()
         for it in range(2, cg_max + 1):
             if (it - 1) % _CG_CHECK_EVERY == 0 and bool(self.s["done"]):     # the stop after iteration it - 1
@@ -433,6 +465,16 @@ class _DirectionGraphs:
         self.finish_graph.replay()
         s = self.s
         return (*self.direction, s["gnorm2"], s["gnorm"], s["uW"], s["uH"], s["ncg"])
+
+    def trial(self, a):
+        """This function replays the line search trial at step length ``a``.  It returns the
+        graph's arrays (Wn, Hn, new_loss) and whether the trial passed the Armijo test.  The arrays
+        change at the next replay."""
+        self.a.fill_(a)
+        self.armijo.fill_(_ARMIJO_SLOPE * a)
+        self.trial_graph.replay()
+        Wn, Hn, new_loss, ok = self.trial_out
+        return Wn, Hn, new_loss, bool(ok)
 
 
 def _direction_graphs(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask):
@@ -480,7 +522,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
             xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = _pcg_direction(W, H, T, prep, deriv, lam, rows, cols, cg_max,
                                                                       nonneg_W, w_mask)
         else:
-            xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = graphs(W, H, lam, cg_max)
+            xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = graphs(W, H, lam, cg_max, loss)
         # This KKT test stops the solve when the model fits the data exactly.  In that case the
         # loss goes to zero, and the relative change of the loss stays large.  The loss test of
         # the previous step is the main test.  All tests are read in one transfer from the device.
@@ -500,14 +542,17 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         total_cg = total_cg + ncg
 
         a, accepted = 1.0, False
-        for _ in range(30):
-            Wn = torch.minimum((W + a * xW).clamp_(min=0), uW) if nonneg_W else W + a * xW
-            Hn = torch.minimum((H + a * xH).clamp_(min=0), uH) if nonneg_W else (H + a * xH).clamp_(min=0)
-            if nonneg_W:                                 # recompute the bound on W from the new H
-                Wn = torch.minimum(Wn, _partner_bound(Hn, 1))
-            new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
-            if bool(torch.isfinite(new_loss) & (new_loss <= loss + 1e-4 * a * slope)):
+        for _ in range(_LINE_SEARCH_TRIALS):
+            if graphs is None:
+                Wn, Hn = _trial_point(W, H, xW, xH, uW, uH, a, nonneg_W)
+                new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
+                ok = bool(torch.isfinite(new_loss) & (new_loss <= loss + _ARMIJO_SLOPE * a * slope))
+            else:
+                Wn, Hn, new_loss, ok = graphs.trial(a)
+            if ok:
                 accepted = True
+                if graphs is not None:                   # the graph's arrays change at its next replay
+                    Wn, Hn, new_loss = Wn.clone(), Hn.clone(), new_loss.clone()
                 break
             a *= 0.5
         if not accepted:
