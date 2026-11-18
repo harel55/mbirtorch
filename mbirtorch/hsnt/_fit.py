@@ -150,7 +150,8 @@ def _averaged_start(chunks, T_pool, spatial_shape, rank, warmup, device, compile
     def single_start(note=None):
         """The fallback when no averaged block is used: the subset fit's spectra, or None."""
         h = H if H is not None or not need_start else _subset_fit(chunks, rank, warmup, device, mode, sizes=sizes,
-                                                                    weights=weights)[2]
+                                                                    weights=weights, max_steps=max_steps,
+                                                                    rel_tol=rel_tol)[2]
         out = single if h is not None else dict(info, kind="default")
         return h, out if note is None else dict(out, note=note)
     if block <= 1:
@@ -309,7 +310,8 @@ def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, 
         if spatial_shape is not None and start == "averaged":   # The pixels are pooled on the device.
             H0, rep["start"] = _averaged_start([Td], Td if pool_T is None else pool_T, spatial_shape, rank,
                                                warmup_pixels, device, compile_mode, [P], weights=wd, pool_mask=pool_mask,
-                                               dose=dose, need_start=False, max_steps=max_steps, rel_tol=rel_tol)
+                                               dose=dose, need_start=P > warmup_pixels, max_steps=max_steps,
+                                               rel_tol=rel_tol)
         else:
             rep["start"] = dict(kind="default")
         W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode,

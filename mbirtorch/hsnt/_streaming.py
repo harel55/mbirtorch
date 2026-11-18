@@ -42,11 +42,13 @@ _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
 _START_MAX_STEPS, _START_REL_TOL = 300, 1e-6
 
 
-def _subset_fit(chunks, num_materials, warmup_pixels, device, compile_mode, sizes=None, weights=None):
+def _subset_fit(chunks, num_materials, warmup_pixels, device, compile_mode, sizes=None, weights=None, max_steps=None,
+                rel_tol=None):
     """This function fits W and H by a joint Newton solve on a random subset of the pixels.  The
     subset holds ``warmup_pixels`` pixels, drawn from all chunks with seed 0.  The streamed solve
     starts from the H of this fit when it is given no starting spectra.  The function returns
-    (T_sub, W_sub, H): the subset's transmission and maps on the device, and the spectra."""
+    (T_sub, W_sub, H): the subset's transmission and maps on the device, and the spectra.  The
+    fit stops at ``max_steps`` and ``rel_tol``, which default to the streamed start's limits."""
     sizes = np.array(sizes if sizes is not None else [c.shape[0] for c in chunks])
     offsets = np.concatenate([[0], np.cumsum(sizes)])
     picks = np.sort(np.random.default_rng(0).choice(offsets[-1], min(warmup_pixels, offsets[-1]), replace=False))
@@ -56,7 +58,8 @@ def _subset_fit(chunks, num_materials, warmup_pixels, device, compile_mode, size
         if local.size:
             parts.append(c[torch.from_numpy(local).to(c.device)])
     T_sub = torch.cat(parts, 0).to(device)
-    W_sub, H, _ = _nnal_factorization(T_sub, num_materials, max_steps=_START_MAX_STEPS, rel_tol=_START_REL_TOL,
+    W_sub, H, _ = _nnal_factorization(T_sub, num_materials, max_steps=_START_MAX_STEPS if max_steps is None else max_steps,
+                                      rel_tol=_START_REL_TOL if rel_tol is None else rel_tol,
                                       compile_mode=compile_mode, weights=weights)
     return T_sub, W_sub, H
 
