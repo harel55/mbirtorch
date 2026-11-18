@@ -32,7 +32,7 @@ _MAX_RESEEDS = 2
 # The conjugate gradient loop of the joint solve reads its stop flag from the device once every this many
 # iterations.  Each read waits for the device, and a larger value runs more iterations after the stop.
 _CG_CHECK_EVERY = 1
-# The joint solve replays each step's search direction from CUDA graphs when the data have at most this many
+# The joint solve replays each step from a CUDA graph when the data have at most this many
 # entries.  A graph keeps the memory of its intermediate arrays, so larger data run without graphs.
 _GRAPH_MAX_ELEMENTS = 2 ** 25
 # The graphs' bodies run this many times before the capture, so that the libraries set up their workspaces.
@@ -416,27 +416,40 @@ def _trial_point(W, H, xW, xH, uW, uH, a, nonneg_W):
     return Wn, Hn
 
 
-class _DirectionGraphs:
+class _StepGraph:
     """CUDA graphs of one step of ``_joint_newton_pcg`` for one solve.  Replaying a graph launches
-    all its kernels at once, which saves the launch time of each kernel.  There are four graphs:
-    the start of a step with the first CG iteration, one more CG iteration, the end of the step,
-    and one trial of the line search.  The CG iteration is replayed until the host reads the stop
-    flag, as in ``_pcg_direction``, so the direction is the same.  The trial is replayed with the
-    step length of each trial, so the accepted step is the same."""
+    all its kernels at once, which saves the launch time of each kernel.  There are four graphs.
+    The first starts the step and takes the first CG iteration.  The second takes one more CG
+    iteration, and it is replayed until the host reads the CG stop flag, as in ``_pcg_direction``.
+    The third ends the step: it finds the direction, runs the stop tests, takes the first trial of
+    the line search, and gathers the flags that the host reads in one transfer.  The fourth takes
+    one later trial of the line search.  The direction, the stop tests, and the accepted trial are
+    therefore those of the loop without graphs.
 
-    def __init__(self, W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask):
-        self.W, self.H = W.clone(), H.clone()
-        self.lam = torch.zeros((), dtype=W.dtype, device=W.device)
-        self.a = torch.ones((), dtype=W.dtype, device=W.device)            # the step length of a trial
-        self.armijo = torch.zeros((), dtype=W.dtype, device=W.device)      # _ARMIJO_SLOPE times the step length
-        self.loss = torch.zeros((), dtype=torch.float64, device=W.device)  # the loss at W and H
+    Conditional nodes could skip the CG iterations after the stop without a host read, but torch
+    never frees the memory that a conditional node's operations allocate, so they are not used."""
+
+    def __init__(self, W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask, rel_tol, patience):
         device = W.device
+        self.W, self.H = W.clone(), H.clone()
+        self.loss = torch.zeros((), dtype=torch.float64, device=device)    # the loss at W and H
+        self.lam = torch.zeros((), dtype=W.dtype, device=device)
+        self.quiet = torch.zeros((), dtype=torch.int64, device=device)     # accepted steps with a small change
+        self.gnorm0 = torch.zeros((), dtype=W.dtype, device=device)        # the scaled gradient norm of step 1
+        self.has_gnorm0 = torch.zeros((), dtype=torch.bool, device=device)
+        self.a = torch.ones((), dtype=W.dtype, device=device)              # the step length of a later trial
+        self.armijo = torch.zeros((), dtype=W.dtype, device=device)        # _ARMIJO_SLOPE times that length
+        # The first trial's step length and Armijo factor, as the host would fill them.  The graph reads these
+        # arrays, so they live as long as the graph.
+        self.first_length = torch.ones((), dtype=W.dtype, device=device)
+        self.first_armijo = torch.full((), _ARMIJO_SLOPE * 1.0, dtype=W.dtype, device=device)
+        gnorm_factor = max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps)
 
-        def trial():
+        def trial(a, armijo):
             xW, xH, slope = self.direction
-            Wn, Hn = _trial_point(self.W, self.H, xW, xH, self.s["uW"], self.s["uH"], self.a, nonneg_W)
+            Wn, Hn = _trial_point(self.W, self.H, xW, xH, self.s["uW"], self.s["uH"], a, nonneg_W)
             new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
-            ok = torch.isfinite(new_loss) & (new_loss <= self.loss + self.armijo * slope)
+            ok = torch.isfinite(new_loss) & (new_loss <= self.loss + armijo * slope)
             return Wn, Hn, new_loss, ok
 
         def start():
@@ -449,14 +462,29 @@ class _DirectionGraphs:
             for k in _CG_STATE:
                 self.s[k].copy_(new[k])
 
+        def finish():
+            self.direction = _pcg_finish(self.s)
+            gnorm2, gnorm = self.s["gnorm2"], self.s["gnorm"]
+            stop = ~torch.isfinite(gnorm2) | (gnorm2 == 0)
+            if rel_tol > 0:
+                stop = stop | (self.has_gnorm0 & (gnorm <= gnorm_factor * self.gnorm0))
+                settled = self.quiet >= patience
+            else:
+                settled = torch.zeros_like(stop)
+            Wn, Hn, new_loss, ok = trial(self.first_length, self.first_armijo)
+            self.out = (Wn, Hn, new_loss)
+            rel_change = torch.abs(self.loss - new_loss) / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny)
+            self.quiet_new = torch.where(rel_change <= rel_tol, self.quiet + 1, torch.zeros_like(self.quiet))
+            self.flags = torch.stack([settled, stop, ok])
+
         side = torch.cuda.Stream(device=device)
         side.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(side):                    # the libraries set up their workspaces before the capture
             for _ in range(_GRAPH_WARMUP_RUNS):
                 self.s = start()
                 iteration()
-                self.direction = _pcg_finish(self.s)
-                trial()
+                finish()
+                trial(self.a, self.armijo)
         torch.cuda.current_stream(device).wait_stream(side)
         self.start_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.start_graph):
@@ -467,29 +495,26 @@ class _DirectionGraphs:
             iteration()
         self.finish_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.finish_graph, pool=pool):
-            self.direction = _pcg_finish(self.s)
+            finish()
         self.trial_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.trial_graph, pool=pool):
-            self.trial_out = trial()
+            self.trial_out = trial(self.a, self.armijo)
 
-    def __call__(self, W, H, lam, cg_max, loss):
-        self.W.copy_(W)
-        self.H.copy_(H)
-        self.lam.fill_(lam)
-        self.loss.copy_(loss)
+    def step(self, cg_max):
+        """This function replays the step from the graph's W, H, loss, lam, and quiet.  It returns
+        the host values (settled, stop, accepted)."""
         self.start_graph.replay()
         for it in range(2, cg_max + 1):
             if (it - 1) % _CG_CHECK_EVERY == 0 and bool(self.s["done"]):     # the stop after iteration it - 1
                 break
             self.iteration_graph.replay()
         self.finish_graph.replay()
-        s = self.s
-        return (*self.direction, s["gnorm2"], s["gnorm"], s["uW"], s["uH"], s["ncg"])
+        return self.flags.tolist()
 
     def trial(self, a):
-        """This function replays the line search trial at step length ``a``.  It returns the
-        graph's arrays (Wn, Hn, new_loss) and whether the trial passed the Armijo test.  The arrays
-        change at the next replay."""
+        """This function replays one later trial of the line search at step length ``a`` along the
+        direction of the last step.  It returns the graph's arrays (Wn, Hn, new_loss) and whether
+        the trial passed the Armijo test.  The arrays change at the next replay."""
         self.a.fill_(a)
         self.armijo.fill_(_ARMIJO_SLOPE * a)
         self.trial_graph.replay()
@@ -497,8 +522,8 @@ class _DirectionGraphs:
         return Wn, Hn, new_loss, bool(ok)
 
 
-def _direction_graphs(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask):
-    """This function returns ``_DirectionGraphs`` on CUDA for data of at most ``_GRAPH_MAX_ELEMENTS``
+def _step_graph(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask, rel_tol, patience):
+    """This function returns ``_StepGraph`` on CUDA for data of at most ``_GRAPH_MAX_ELEMENTS``
     entries, and None otherwise.  A graph keeps the memory of its intermediate arrays, so larger
     data run without graphs.  The loss and its derivatives may be compiled.  Their first calls run
     before the capture, so the capture does not compile.  When an operation cannot be captured, the
@@ -506,10 +531,58 @@ def _direction_graphs(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, 
     if not W.is_cuda or T.numel() > _GRAPH_MAX_ELEMENTS or cg_max < 1:
         return None
     try:
-        return _DirectionGraphs(W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask)
+        return _StepGraph(W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask, rel_tol, patience)
     except RuntimeError:
         torch.cuda.synchronize(W.device)
         return None
+
+
+def _graphed_newton(g, W, H, loss, max_steps, rel_tol, cg_max):
+    """This function runs the steps of ``_joint_newton_pcg`` by replaying the step graph ``g``.  It
+    takes the same decisions as the loop without graphs, and it returns (W, H, steps, total_cg)."""
+    g.W.copy_(W)
+    g.H.copy_(H)
+    g.loss.copy_(loss)
+    lam = 1e-12
+    total_cg = torch.zeros((), dtype=torch.int64, device=W.device)
+    step = 0
+    has_gnorm0 = False
+    for step in range(1, max_steps + 1):
+        g.lam.fill_(lam)
+        settled, stop, accepted = g.step(cg_max)
+        if settled:
+            step -= 1
+            break
+        if stop:
+            break
+        if not has_gnorm0:
+            g.gnorm0.copy_(g.s["gnorm"])
+            g.has_gnorm0.fill_(True)
+            has_gnorm0 = True
+        total_cg = total_cg + g.s["ncg"]
+        Wn, Hn, new_loss = g.out
+        quiet = g.quiet_new
+        if not accepted:                                 # the host continues the line search
+            a = 0.5
+            for _ in range(_LINE_SEARCH_TRIALS - 1):
+                Wn, Hn, new_loss, accepted = g.trial(a)
+                if accepted:
+                    rel_change = (torch.abs(g.loss - new_loss)
+                                  / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny))
+                    quiet = torch.where(rel_change <= rel_tol, g.quiet + 1, torch.zeros_like(g.quiet))
+                    break
+                a *= 0.5
+        if not accepted:
+            lam = lam * 10.0 if lam > 0 else 1e-12
+            if lam > 1e6: break
+            continue
+        lam = max(lam * 0.3, 1e-14)
+        # The step's results are copied into the graph's inputs, which the next replay reads.
+        g.W.copy_(Wn)
+        g.H.copy_(Hn)
+        g.loss.copy_(new_loss)
+        g.quiet.copy_(quiet)
+    return g.W.clone(), g.H.clone(), step, int(total_cg)
 
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
@@ -536,13 +609,12 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     step = 0
     gnorm0 = None
     quiet = torch.zeros((), dtype=torch.int64, device=W.device)   # accepted steps in a row with a small loss change
-    graphs = _direction_graphs(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask)
+    graph = _step_graph(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask, rel_tol, patience)
+    if graph is not None:
+        return _graphed_newton(graph, W, H, loss, max_steps, rel_tol, cg_max)
     for step in range(1, max_steps + 1):
-        if graphs is None:
-            xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = _pcg_direction(W, H, T, prep, deriv, lam, rows, cols, cg_max,
-                                                                      nonneg_W, w_mask)
-        else:
-            xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = graphs(W, H, lam, cg_max, loss)
+        xW, xH, slope, gnorm2, gnorm, uW, uH, ncg = _pcg_direction(W, H, T, prep, deriv, lam, rows, cols, cg_max,
+                                                                  nonneg_W, w_mask)
         # This KKT test stops the solve when the model fits the data exactly.  In that case the
         # loss goes to zero, and the relative change of the loss stays large.  The loss test of
         # the previous step is the main test.  All tests are read in one transfer from the device.
@@ -563,16 +635,10 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
 
         a, accepted = 1.0, False
         for _ in range(_LINE_SEARCH_TRIALS):
-            if graphs is None:
-                Wn, Hn = _trial_point(W, H, xW, xH, uW, uH, a, nonneg_W)
-                new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
-                ok = bool(torch.isfinite(new_loss) & (new_loss <= loss + _ARMIJO_SLOPE * a * slope))
-            else:
-                Wn, Hn, new_loss, ok = graphs.trial(a)
-            if ok:
+            Wn, Hn = _trial_point(W, H, xW, xH, uW, uH, a, nonneg_W)
+            new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
+            if bool(torch.isfinite(new_loss) & (new_loss <= loss + _ARMIJO_SLOPE * a * slope)):
                 accepted = True
-                if graphs is not None:                   # the graph's arrays change at its next replay
-                    Wn, Hn, new_loss = Wn.clone(), Hn.clone(), new_loss.clone()
                 break
             a *= 0.5
         if not accepted:
