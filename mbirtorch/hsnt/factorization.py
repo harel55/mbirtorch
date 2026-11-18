@@ -6,7 +6,7 @@ NNAL stands for non-negative attenuation loss.
 import torch
 
 from ._linalg import _attenuation_for_start, _nonneg_least_squares_start, nndsvda
-from ._newton import _X_MAX, _resolve_compile, joint_newton_optimize
+from ._newton import _X_MAX, _fuse_mode, joint_newton_optimize
 
 
 def _initial_factors(T, num_materials):
@@ -36,7 +36,8 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
             change in loss is at most ``rel_tol``.  Defaults to 1e-8.
         compile_mode (str, optional): 'on' always compiles with torch.compile, and 'off' never
             compiles.  'auto' compiles only on CUDA with a working Triton and only when T has
-            at least 5e8 entries.  Defaults to 'auto'.
+            at least 5e8 entries.  On smaller data with at least 2**20 entries, 'auto' compiles
+            only the loss and its derivatives.  Defaults to 'auto'.
         W_init, H_init (torch.Tensor, optional): The starting factors.  If only one factor is
             given, the function fits the other one by non-negative least squares.  If neither is
             given, the function uses an NNDSVDa start.  Defaults to None.
@@ -53,7 +54,7 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
     """
     if not 1 <= int(num_materials) <= min(T.shape):
         raise ValueError(f"num_materials must be between 1 and min(pixels, bins) = {min(T.shape)}, got {num_materials}")
-    compile_mode = _resolve_compile(compile_mode, T)
+    compile_mode = _fuse_mode(compile_mode, T)
     if W_init is None and H_init is None:
         W_init, H_init = _initial_factors(T, num_materials)
     elif W_init is None:

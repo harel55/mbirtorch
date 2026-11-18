@@ -165,8 +165,10 @@ def _averaged_start(chunks, T_pool, spatial_shape, rank, warmup, device, compile
             return single_start("no block lies wholly inside the sample mask")
     Tp = _subsample(pooled, warmup)
     Tp = (Tp if torch.is_tensor(Tp) else torch.from_numpy(Tp)).to(device)
+    # The pooled fit chooses its own compile mode from its size, unless the caller asked for 'on' or 'off'.
     _, H, _ = _nnal_factorization(Tp, rank, max_steps=_START_MAX_STEPS if max_steps is None else max_steps,
-                                  rel_tol=_START_REL_TOL if rel_tol is None else rel_tol, compile_mode=mode,
+                                  rel_tol=_START_REL_TOL if rel_tol is None else rel_tol,
+                                  compile_mode=compile_mode if mode == "off" else mode,
                                   weights=weights)
     return H, dict(info, kind="averaged", pixels=int(Tp.shape[0]))
 

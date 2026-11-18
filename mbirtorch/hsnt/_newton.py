@@ -23,6 +23,10 @@ _X_MAX = 27.631021115928547                              # -log(1e-12)
 _PATIENCE = 5
 # With compile_mode 'auto', mbirtorch compiles on CUDA when the data have at least this many entries.
 _COMPILE_MIN_ELEMENTS = 5e8
+# With compile_mode 'auto', smaller data on CUDA compile only the loss and its derivatives, which fuses their
+# elementwise operations, when the data have at least this many entries.  Below it, a fit is too short for the
+# compile time to pay off.
+_FUSE_MIN_ELEMENTS = 2 ** 20
 # The largest number of times the joint solve restarts after it replaces zero components with random values.
 _MAX_RESEEDS = 2
 # The conjugate gradient loop of the joint solve reads its stop flag from the device once every this many
@@ -56,13 +60,29 @@ def _resolve_compile(compile_mode, T, device=None):
     return 'on' if triton_available()[0] else 'off'
 
 
+def _fuse_mode(compile_mode, T):
+    """This function returns 'fuse' when ``compile_mode`` is 'auto', the data ``T`` are on CUDA with
+    a working Triton, and T has at least ``_FUSE_MIN_ELEMENTS`` and fewer than
+    ``_COMPILE_MIN_ELEMENTS`` entries.  Otherwise it returns ``_resolve_compile(compile_mode, T)``.
+    The mode 'fuse' compiles only the loss and its derivatives."""
+    resolved = _resolve_compile(compile_mode, T)
+    if compile_mode != 'auto' or resolved == 'on' or T.device.type != 'cuda' or T.numel() < _FUSE_MIN_ELEMENTS:
+        return resolved
+    from ..kernel_availability import triton_available
+    return 'fuse' if triton_available()[0] else resolved
+
+
 def _kernels(compile_mode):
     """This function returns the four most used functions: the loss, its derivatives, the loss
     per row, and the block Newton step.  It compiles them with torch.compile when compile_mode
-    is 'on'."""
-    if compile_mode != 'on':
+    is 'on'.  When compile_mode is 'fuse', it compiles the first three, and the block Newton step
+    runs without compiling."""
+    if compile_mode not in ('on', 'fuse'):
         return stable_nnal, stable_nnal_derivatives, _nnal_rowwise, block_newton_step
     from ..projectors import maybe_compile
+    if compile_mode == 'fuse':
+        return (*(maybe_compile(f, True) for f in (stable_nnal, stable_nnal_derivatives, _nnal_rowwise)),
+                block_newton_step)
     return tuple(maybe_compile(f, True) for f in (stable_nnal, stable_nnal_derivatives, _nnal_rowwise,
                                                   block_newton_step))
 
@@ -404,7 +424,7 @@ class _DirectionGraphs:
     flag, as in ``_pcg_direction``, so the direction is the same.  The trial is replayed with the
     step length of each trial, so the accepted step is the same."""
 
-    def __init__(self, W, H, T, prep, deriv, rows, cols, nonneg_W, w_mask):
+    def __init__(self, W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask):
         self.W, self.H = W.clone(), H.clone()
         self.lam = torch.zeros((), dtype=W.dtype, device=W.device)
         self.a = torch.ones((), dtype=W.dtype, device=W.device)            # the step length of a trial
@@ -415,7 +435,7 @@ class _DirectionGraphs:
         def trial():
             xW, xH, slope = self.direction
             Wn, Hn = _trial_point(self.W, self.H, xW, xH, self.s["uW"], self.s["uH"], self.a, nonneg_W)
-            new_loss = stable_nnal(Wn @ Hn, T, prep, dtype=torch.float64)
+            new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
             ok = torch.isfinite(new_loss) & (new_loss <= self.loss + self.armijo * slope)
             return Wn, Hn, new_loss, ok
 
@@ -480,13 +500,13 @@ class _DirectionGraphs:
 def _direction_graphs(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask):
     """This function returns ``_DirectionGraphs`` on CUDA for data of at most ``_GRAPH_MAX_ELEMENTS``
     entries, and None otherwise.  A graph keeps the memory of its intermediate arrays, so larger
-    data run without graphs.  Compiled kernels also run without graphs.  When an operation cannot
-    be captured, the solve runs without graphs."""
-    if (not W.is_cuda or T.numel() > _GRAPH_MAX_ELEMENTS or nnal is not stable_nnal
-            or deriv is not stable_nnal_derivatives or cg_max < 1):
+    data run without graphs.  The loss and its derivatives may be compiled.  Their first calls run
+    before the capture, so the capture does not compile.  When an operation cannot be captured, the
+    solve runs without graphs."""
+    if not W.is_cuda or T.numel() > _GRAPH_MAX_ELEMENTS or cg_max < 1:
         return None
     try:
-        return _DirectionGraphs(W, H, T, prep, deriv, rows, cols, nonneg_W, w_mask)
+        return _DirectionGraphs(W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask)
     except RuntimeError:
         torch.cuda.synchronize(W.device)
         return None
