@@ -43,10 +43,11 @@ def _nnal_elementwise(X, T, prep):
     """
     log_T, positive, all_positive, weights = prep
     Xp = X + log_T
-    loss = T * (torch.expm1(-Xp) + Xp)
+    neg = -Xp
+    loss = T * (torch.expm1(neg) + Xp)
     if not all_positive:
         # Where T == 0, the term is exp(-Xp).  The form expm1(-Xp) + 1 underflows for large Xp.
-        loss = torch.where(positive, loss, torch.exp(-Xp))
+        loss = torch.where(positive, loss, torch.exp(neg))
     return loss if weights is None else loss * weights
 
 
@@ -81,11 +82,11 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
     """
     log_T, positive, all_positive, weights = _nnal_prep(T) if prep is None else prep
 
-    Xp = X + log_T
+    neg = -(X + log_T)
 
     # expm1 is accurate near Xp = 0.  exp is used where T = 0, because expm1 + 1 underflows at large Xp.
-    E = torch.expm1(-Xp)
-    eXp = torch.exp(-Xp)
+    E = torch.expm1(neg)
+    eXp = torch.exp(neg)
 
     G = -T * E
     Z = T * eXp
