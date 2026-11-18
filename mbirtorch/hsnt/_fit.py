@@ -91,10 +91,16 @@ def _check_host_memory(n_bytes, what):
         warnings.warn(f"{what} needs {n_bytes / 2**30:.1f} GiB of the {avail / 2**30:.1f} GiB of host memory available")
 
 
+def _rows(T, start, stop):
+    """This function returns the rows start to stop of T as a tensor.  T is a numpy array or a
+    tensor, and the rows of a tensor stay on its device."""
+    return T[start:stop] if torch.is_tensor(T) else torch.from_numpy(T[start:stop])
+
+
 def _loss(W, H, T_host, device, weights=None):
-    """This function computes the float64 NNAL loss of W @ H against the data in host memory.
-    It moves the data to the device in chunks of pixels.  With ``weights``, one weight per bin,
-    the loss is the weighted loss (see ``_loss._nnal_prep``)."""
+    """This function computes the float64 NNAL loss of W @ H against the data.  The data are a
+    numpy array or a tensor.  It moves the data to the device in chunks of pixels.  With
+    ``weights``, one weight per bin, the loss is the weighted loss (see ``_loss._nnal_prep``)."""
     from ._loss import _nnal_prep, _weights_tensor, stable_nnal
     from ._loss import _CHUNK_ELEMENTS
     Hd = H.to(device).double()
@@ -102,7 +108,7 @@ def _loss(W, H, T_host, device, weights=None):
     chunk = max(1, _CHUNK_ELEMENTS // T_host.shape[1])
     total = 0.0
     for i in range(0, T_host.shape[0], chunk):
-        Tc = torch.from_numpy(T_host[i:i + chunk]).to(device).double()
+        Tc = _rows(T_host, i, i + chunk).to(device).double()
         total += stable_nnal(W[i:i + chunk].to(device).double() @ Hd, Tc, _nnal_prep(Tc, wd)).item()
     return total
 
@@ -119,7 +125,7 @@ def _report_zero_counts(rep, W, H, T, device, chunk):
     on_zero = torch.zeros(Hd.shape[0], dtype=torch.float64, device=device)
     at_bound = torch.zeros(Hd.shape[0], dtype=torch.int64, device=device)
     for i in range(0, T.shape[0], chunk):
-        Tc = T[i:i + chunk] if torch.is_tensor(T) else torch.from_numpy(T[i:i + chunk])
+        Tc = _rows(T, i, i + chunk)
         Wc, Tc = W[i:i + chunk].to(device), Tc.to(device)
         m, n = _zero_count_divergence(Wc, Hd, Tc)
         x_max, n_above = max(x_max, m), n_above + n
@@ -163,7 +169,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
     t0 = time.perf_counter()
     parts = []
     for i in range(0, P, chunk):
-        Tc = torch.from_numpy(T[i:i + chunk]).to(device)
+        Tc = _rows(T, i, i + chunk).to(device)
         parts.append(solve_W(Tc, Hd, max_steps=max_steps, rel_tol=rel_tol,
                              compile_mode=_resolve_compile(compile_mode, Tc), weights=wd).cpu())
         del Tc
@@ -183,8 +189,9 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
 
 def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5,
          warmup_pixels=16384, compile_mode="auto", report=None, weights=None):
-    """This function fits the transmission T at the given rank.  T is a float32 numpy array with
-    shape (pixels, bins).  The function returns (W, H, report).  W and H are the numpy factors,
+    """This function fits the transmission T at the given rank.  T is a float32 numpy array or
+    tensor with shape (pixels, bins).  A tensor on the solve's device is used without a copy.
+    The function returns (W, H, report).  W and H are the numpy factors,
     and ``report`` is a dict that describes what the fit did.
 
     The function fills ``report`` in place.  As a result, the caller has the memory plan even
@@ -207,12 +214,12 @@ def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, 
     stats = {}
     wd = _weights_tensor(weights, device)
     if mode == "full":
-        Td = torch.from_numpy(T).to(device)
+        Td = _rows(T, 0, P).to(device)
         W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode,
                                           weights=wd)
         rep["steps"] = int(steps)
     else:
-        chunks = [torch.from_numpy(T[i:i + chunk]) for i in range(0, P, chunk)]
+        chunks = [_rows(T, i, i + chunk) for i in range(0, P, chunk)]
         W_chunks, H, passes = _stream_factorization(chunks, rank, max_passes=max_passes, rel_tol=rel_tol,
                                                     warmup_pixels=warmup, device=device,
                                                     verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,

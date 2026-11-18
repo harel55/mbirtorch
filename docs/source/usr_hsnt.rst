@@ -42,6 +42,8 @@ A few more facts about ``dehydrate``:
 * Given ``spectra``, only the maps are fitted.  This is how a large scan is dehydrated piece by piece,
   against spectra fitted on part of it.
 * Given a ``sample_mask``, only the pixels inside the mask are fitted.  The maps are zero outside it.
+* Given an ``open_beam`` with one count per bin, each bin's loss is weighted by its count.  Use it when the
+  open beam differs between bins.
 
 .. autofunction:: dehydrate
 .. autofunction:: rehydrate
