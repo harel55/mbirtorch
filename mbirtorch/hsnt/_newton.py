@@ -382,6 +382,42 @@ def _cg_iteration(s, first):
     return dict(xW=xW, xH=xH, rW=rW, rH=rH, pW=zW + b * pW, pH=zH + b * pH, rz=rz_new, done=done, ncg=ncg)
 
 
+_CG_INPUTS = ("W", "H", "G", "Z", "fW", "fH", "lam", "LW", "LH", "tol2")    # the step's values that a CG iteration reads
+
+
+def _cg_step(xW, xH, rW, rH, pW, pH, rz, done, ncg, W, H, G, Z, fW, fH, lam, LW, LH, tol2):
+    """This function is ``_cg_iteration`` after the first iteration, with the CG values and the
+    step's values as tensor arguments, in the orders of ``_CG_STATE`` and ``_CG_INPUTS``.  It
+    returns the new CG values in the order of ``_CG_STATE``.  Tensor arguments let torch.compile
+    fuse the iteration's small operations."""
+    s = dict(xW=xW, xH=xH, rW=rW, rH=rH, pW=pW, pH=pH, rz=rz, done=done, ncg=ncg, W=W, H=H, G=G, Z=Z, fW=fW,
+             fH=fH, lam=lam, LW=LW, LH=LH, tol2=tol2)
+    new = _cg_iteration(s, False)
+    return tuple(new[k] for k in _CG_STATE)
+
+
+def _cg_step_inplace(xW, xH, rW, rH, pW, pH, rz, done, ncg, W, H, G, Z, fW, fH, lam, LW, LH, tol2):
+    """This function is ``_cg_step``, but it writes the new CG values into its first nine
+    arguments.  Compiled, it stores each result straight into its array, without a copy."""
+    state = (xW, xH, rW, rH, pW, pH, rz, done, ncg)
+    for old, new in zip(state, _cg_step(*state, W, H, G, Z, fW, fH, lam, LW, LH, tol2)):
+        old.copy_(new)
+
+
+_START_KEYS = ("W", "H", "G", "Z", "fW", "fH", "uW", "uH", "gW", "gH", "lam", "gnorm2", "gnorm", "LW", "LH", "xW",
+               "xH", "rW", "rH", "zW", "zH", "pW", "pH", "rz", "done", "ncg", "tol2")     # the values of a step
+
+
+def _pcg_start(W, H, T, prep, lam, rows, cols, nonneg_W, w_mask):
+    """This function starts one step of ``_joint_newton_pcg`` and takes its first CG iteration,
+    with the loss derivatives of ``stable_nnal_derivatives``.  It returns the step's values in the
+    order of ``_START_KEYS``.  Compiled, it fuses the setup's small operations with the
+    derivatives."""
+    s = _pcg_setup(W, H, T, prep, stable_nnal_derivatives, lam, rows, cols, nonneg_W, w_mask)
+    s.update(_cg_iteration(s, True))
+    return tuple(s[k] for k in _START_KEYS)
+
+
 def _pcg_finish(s):
     """This function returns the search direction of the step ``s`` and its slope.  When the CG
     direction does not descend, the direction is the projected steepest descent direction."""
@@ -426,10 +462,13 @@ class _StepGraph:
     one later trial of the line search.  The direction, the stop tests, and the accepted trial are
     therefore those of the loop without graphs.
 
+    When ``fused`` is True, the start of the step and each later CG iteration run in compiled forms,
+    which fuse their small operations.
+
     Conditional nodes could skip the CG iterations after the stop without a host read, but torch
     never frees the memory that a conditional node's operations allocate, so they are not used."""
 
-    def __init__(self, W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask, rel_tol, patience):
+    def __init__(self, W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask, rel_tol, patience, fused):
         device = W.device
         self.W, self.H = W.clone(), H.clone()
         self.loss = torch.zeros((), dtype=torch.float64, device=device)    # the loss at W and H
@@ -452,15 +491,22 @@ class _StepGraph:
             ok = torch.isfinite(new_loss) & (new_loss <= self.loss + armijo * slope)
             return Wn, Hn, new_loss, ok
 
+        if fused:                                        # one compiled form per function, shared by all solves
+            from ..projectors import maybe_compile
+            pcg_start, cg_step = maybe_compile(_pcg_start, True), maybe_compile(_cg_step_inplace, True)
+        else:
+            pcg_start, cg_step = None, _cg_step_inplace
+
         def start():
+            if pcg_start is not None:
+                return dict(zip(_START_KEYS, pcg_start(self.W, self.H, T, prep, self.lam, rows, cols, nonneg_W,
+                                                       w_mask)))
             s = _pcg_setup(self.W, self.H, T, prep, deriv, self.lam, rows, cols, nonneg_W, w_mask)
             s.update(_cg_iteration(s, True))
             return s
 
         def iteration():
-            new = _cg_iteration(self.s, False)
-            for k in _CG_STATE:
-                self.s[k].copy_(new[k])
+            cg_step(*(self.s[k] for k in _CG_STATE + _CG_INPUTS))
 
         def finish():
             self.direction = _pcg_finish(self.s)
@@ -522,7 +568,7 @@ class _StepGraph:
         return Wn, Hn, new_loss, bool(ok)
 
 
-def _step_graph(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask, rel_tol, patience):
+def _step_graph(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask, rel_tol, patience, fused):
     """This function returns ``_StepGraph`` on CUDA for data of at most ``_GRAPH_MAX_ELEMENTS``
     entries, and None otherwise.  A graph keeps the memory of its intermediate arrays, so larger
     data run without graphs.  The loss and its derivatives may be compiled.  Their first calls run
@@ -531,7 +577,7 @@ def _step_graph(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask
     if not W.is_cuda or T.numel() > _GRAPH_MAX_ELEMENTS or cg_max < 1:
         return None
     try:
-        return _StepGraph(W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask, rel_tol, patience)
+        return _StepGraph(W, H, T, prep, nnal, deriv, rows, cols, nonneg_W, w_mask, rel_tol, patience, fused)
     except RuntimeError:
         torch.cuda.synchronize(W.device)
         return None
@@ -586,7 +632,7 @@ def _graphed_newton(g, W, H, loss, max_steps, rel_tol, cg_max):
 
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
-                      nonneg_W=True, w_mask=None, patience=1):
+                      nonneg_W=True, w_mask=None, patience=1, fused=False):
     """This function solves for W and H together by a truncated Newton method with preconditioned
     CG.  It starts from the given W and H, and returns (W, H, steps, total_cg).
 
@@ -594,7 +640,9 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     Hessian blocks for each pixel and for each bin.  A backtracking line search then accepts the
     step.  The solve stops after ``patience`` accepted steps in a row with a relative loss change
     of at most rel_tol.  With nonneg_W=False, W is not constrained to be nonnegative.  When
-    ``w_mask`` is given, the coefficients outside the mask stay at their current values.
+    ``w_mask`` is given, the coefficients outside the mask stay at their current values.  When the
+    solve runs from CUDA graphs and ``fused`` is True, the start of each step and its CG iterations
+    run compiled.
     """
     nnal = stable_nnal if nnal is None else nnal
     deriv = stable_nnal_derivatives if deriv is None else deriv
@@ -609,7 +657,8 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     step = 0
     gnorm0 = None
     quiet = torch.zeros((), dtype=torch.int64, device=W.device)   # accepted steps in a row with a small loss change
-    graph = _step_graph(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask, rel_tol, patience)
+    graph = _step_graph(W, H, T, prep, nnal, deriv, rows, cols, cg_max, nonneg_W, w_mask, rel_tol, patience,
+                        fused)
     if graph is not None:
         return _graphed_newton(graph, W, H, loss, max_steps, rel_tol, cg_max)
     for step in range(1, max_steps + 1):
@@ -681,7 +730,8 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
         if steps >= max_steps:
             break
         W, H, taken, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps - steps, cg_max=cg_max, rel_tol=rel_tol,
-                                           prep=prep, nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE)
+                                           prep=prep, nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE,
+                                           fused=compile_mode == 'fuse')
         steps += taken
         if before is not None and bool(nnal_fn(W @ H, T, prep, dtype=torch.float64) >= before[2]):
             W, H, steps = before[0], before[1], before[3]           # restore the saved W, H, and step count
