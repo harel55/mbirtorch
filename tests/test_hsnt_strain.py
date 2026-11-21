@@ -199,7 +199,8 @@ def test_traction_planefit_flat_face():
     E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
     E[..., 0, 0] = -nu * sig; E[..., 0, 1] = sig; E[..., 0, 2] = -nu * sig
     tf.traction_model = 'planefit'
-    nrm = tf._plane_fit_normal(ins[..., 0])
+    tf._refresh_plane_fit_normal(ins[..., 0])
+    nrm = tf._plane_fit_cache[1]
     torch.testing.assert_close(nrm[3, 3, 3], torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64))
     assert float(tf._traction_normal(E)[3, 3, 3, 0].abs().max()) < 1e-9
 

@@ -904,6 +904,8 @@ class TomoFit:
         side) whose eight surrounding voxels all hold it."""
         inside = self.material_voxels()
         self._eq_inside = inside                                                    # for the traction-free faces
+        if getattr(self, 'traction_model', 'axis') == 'planefit':
+            self._refresh_plane_fit_normal(inside.any(-1))                          # here, outside torch.func transforms
         m = inside.clone()
         if getattr(self, 'eq_stencil', 'central') == 'corner':
             for shift in ((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1)):
@@ -976,19 +978,17 @@ class TomoFit:
         g = torch.stack([0.5 * (torch.roll(fill, -1, ax) - torch.roll(fill, 1, ax)) for ax in (1, 0, 2)], -1)
         return -g / g.norm(dim=-1, keepdim=True).clamp_min(1e-12), fill
 
-    def _plane_fit_normal(self, occupied):
-        """(n, n, n, 3): the sample's outward surface normal (x, y, z) at its boundary voxels, from local plane fits to
-        the exposed voxel faces of the occupied voxels (surface.plane_fit_normals, as in MONSTR).  It is recomputed only
-        when the occupied voxels change."""
+    def _refresh_plane_fit_normal(self, occupied):
+        """Recompute the sample's outward surface normal (x, y, z) at its boundary voxels, (n, n, n, 3), from local plane
+        fits to the exposed voxel faces of the occupied voxels (surface.plane_fit_normals, as in MONSTR), when the
+        occupied voxels have changed.  Call it outside torch.func transforms, which cannot copy tensors to the host."""
         from .surface import plane_fit_normals
         occ = occupied.detach().cpu().numpy()
         key = hash(occ.tobytes())
         cache = getattr(self, '_plane_fit_cache', None)
         if cache is None or cache[0] != key:
             n = plane_fit_normals(occ.transpose(2, 0, 1)).transpose(1, 2, 0, 3)    # volume axes (y, x, z) <-> (z, y, x)
-            cache = (key, torch.as_tensor(n, dtype=self.V.dtype, device=occupied.device))
-            self._plane_fit_cache = cache
-        return cache[1]
+            self._plane_fit_cache = (key, torch.as_tensor(n, dtype=self.V.dtype, device=occupied.device))
 
     def _traction_normal(self, E):
         """Traction / Young's modulus on the free surface, (n, n, n, R, 3), at the voxels of _traction's faces: the
@@ -1006,7 +1006,9 @@ class TomoFit:
                 bnd |= ins & ~(torch.roll(occupied, 1, ax) & torch.roll(occupied, -1, ax))
             nrm, fill = self._fill_normal(r, ins)
             if getattr(self, 'traction_model', 'axis') == 'planefit':
-                nrm = self._plane_fit_normal(occupied)
+                if getattr(self, '_plane_fit_cache', None) is None:
+                    self._refresh_plane_fit_normal(occupied)
+                nrm = self._plane_fit_cache[1]
             axes = (1, 0, 2)                                                      # volume axes of x, y, z
             d = (fill - 0.5) * nrm.abs().sum(-1)
             s = self._stress(E[..., r, :], nu)                                    # xx, yy, zz, xy, yz, xz
