@@ -559,7 +559,8 @@ class TomoFit:
         # the traction-free faces' model: traction_model 'axis' (the stress times the axis normal at the centre of each
         # voxel with an empty neighbour) or 'normal' (the normal from the volume fraction's gradient, and the traction
         # carried from the voxel centre to the surface, placed by the voxel's fill fraction) or 'aligned' ('axis' on the
-        # faces whose surface normal is within TRACTION_ALIGN_COS of their axis, none elsewhere); traction_sd None (the
+        # faces whose surface normal is within TRACTION_ALIGN_COS of their axis, none elsewhere) or 'planefit' ('normal'
+        # with the normal from local plane fits to the sample's exposed voxel faces, as in MONSTR); traction_sd None (the
         # equilibrium prior's), 'grid' (TRACTION_OFFSET x smooth_sd: the error of a face off the true surface) or a
         # number. Use 'grid' or 'normal' when the surfaces are not on the voxel faces (curved or oblique faces).
         self.traction_model, self.traction_sd = 'axis', None
@@ -952,7 +953,7 @@ class TomoFit:
         div = self._divergence(E, mask).reshape(*E.shape[:3], -1)
         if not self.traction:
             return div
-        t = self._traction_normal(E) if getattr(self, 'traction_model', 'axis') == 'normal' else self._traction(E)
+        t = self._traction_normal(E) if getattr(self, 'traction_model', 'axis') in ('normal', 'planefit') else self._traction(E)
         return torch.cat([div, self._traction_scale() * t.reshape(*E.shape[:3], -1)], -1)
 
     def _traction_scale(self):
@@ -975,6 +976,20 @@ class TomoFit:
         g = torch.stack([0.5 * (torch.roll(fill, -1, ax) - torch.roll(fill, 1, ax)) for ax in (1, 0, 2)], -1)
         return -g / g.norm(dim=-1, keepdim=True).clamp_min(1e-12), fill
 
+    def _plane_fit_normal(self, occupied):
+        """(n, n, n, 3): the sample's outward surface normal (x, y, z) at its boundary voxels, from local plane fits to
+        the exposed voxel faces of the occupied voxels (surface.plane_fit_normals, as in MONSTR).  It is recomputed only
+        when the occupied voxels change."""
+        from .surface import plane_fit_normals
+        occ = occupied.detach().cpu().numpy()
+        key = hash(occ.tobytes())
+        cache = getattr(self, '_plane_fit_cache', None)
+        if cache is None or cache[0] != key:
+            n = plane_fit_normals(occ.transpose(2, 0, 1)).transpose(1, 2, 0, 3)    # volume axes (y, x, z) <-> (z, y, x)
+            cache = (key, torch.as_tensor(n, dtype=self.V.dtype, device=occupied.device))
+            self._plane_fit_cache = cache
+        return cache[1]
+
     def _traction_normal(self, E):
         """Traction / Young's modulus on the free surface, (n, n, n, R, 3), at the voxels of _traction's faces: the
         outward normal n is minus the gradient of the material's fill fraction (its volume fraction over its median on
@@ -990,6 +1005,8 @@ class TomoFit:
             for ax in range(3):
                 bnd |= ins & ~(torch.roll(occupied, 1, ax) & torch.roll(occupied, -1, ax))
             nrm, fill = self._fill_normal(r, ins)
+            if getattr(self, 'traction_model', 'axis') == 'planefit':
+                nrm = self._plane_fit_normal(occupied)
             axes = (1, 0, 2)                                                      # volume axes of x, y, z
             d = (fill - 0.5) * nrm.abs().sum(-1)
             s = self._stress(E[..., r, :], nu)                                    # xx, yy, zz, xy, yz, xz

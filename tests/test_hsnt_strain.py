@@ -162,6 +162,48 @@ def test_traction_normal_flat_face():
     assert float(tf._traction(E)[3, 3, 3, 0].abs().max()) > 0.1
 
 
+def test_plane_fit_normals_sphere_and_cube():
+    """surface.plane_fit_normals gives a voxelized sphere's boundary voxels normals near the radial direction, and a
+    cube's faces, edges and corners their exact normals."""
+    import numpy as np
+    from mbirtorch.hsnt.strain.surface import plane_fit_normals
+
+    n, radius = 24, 9.3
+    g = np.indices((n,) * 3).astype(float) - (n - 1) / 2
+    N = plane_fit_normals((g ** 2).sum(0) <= radius ** 2)
+    b = np.linalg.norm(N, axis=-1) > 0
+    radial = np.stack([g[2], g[1], g[0]], -1)[b]
+    cos = (N[b] * radial).sum(-1) / np.linalg.norm(radial, axis=-1)
+    assert cos.min() > np.cos(np.radians(10)) and np.degrees(np.arccos(np.clip(cos, -1, 1))).mean() < 5
+    m = np.zeros((12,) * 3, bool); m[2:9, 2:9, 2:9] = True
+    N = plane_fit_normals(m)
+    np.testing.assert_allclose(N[5, 5, 8], [1, 0, 0], atol=1e-9)
+    np.testing.assert_allclose(N[5, 8, 8], [2 ** -0.5, 2 ** -0.5, 0], atol=1e-9)
+    np.testing.assert_allclose(N[8, 8, 8], [3 ** -0.5] * 3, atol=1e-9)
+
+
+def test_traction_planefit_flat_face():
+    """traction_model='planefit' matches 'normal' on a flat, grid-aligned free face: both carry the traction to the
+    surface, where a stress falling linearly to zero gives zero traction."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n, nu = 8, 0.3
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.elastic = 1, 6, [(1.0, nu)]
+    ins = torch.zeros(n, n, n, 1, dtype=torch.bool); ins[1:4, 1:7, 1:7] = True          # volume axes (y, x, z)
+    tf._eq_inside = ins
+    tf.V = ins.to(torch.float64)
+    y = torch.arange(n, dtype=torch.float64)[:, None, None].expand(n, n, n)
+    sig = 3.5 - y
+    E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
+    E[..., 0, 0] = -nu * sig; E[..., 0, 1] = sig; E[..., 0, 2] = -nu * sig
+    tf.traction_model = 'planefit'
+    nrm = tf._plane_fit_normal(ins[..., 0])
+    torch.testing.assert_close(nrm[3, 3, 3], torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64))
+    assert float(tf._traction_normal(E)[3, 3, 3, 0].abs().max()) < 1e-9
+
+
 def test_refresh_mask():
     """TomoFit.refresh_mask replaces a frozen material mask that overlaps the current volume fractions' mask poorly, and
     keeps one that agrees."""
