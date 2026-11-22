@@ -83,7 +83,6 @@ VIEW_OFFSET_DAMP = 1e-2         # relative damping of the per-view offset step
 VIEW_ANGLE_FD = math.radians(0.05)        # finite-difference step (radians) for the per-view angles' derivatives
 VIEW_ANGLE_MAX_STEP = math.radians(0.5)   # largest change of a view's own angle per step (radians)
 ANCHOR_STIFFNESS = 1e3          # the spectrum scale pin's weight, relative to the largest global Fisher diagonal entry
-TEXTURE_AXIS_START = (0.6, 0.4)  # texture3d: the axis's starting polar and azimuthal angles (generic, off the axes)
 
 
 STACK_GAP = 2                    # empty slices between stacked volumes, so a fractional row offset cannot mix them
@@ -1922,10 +1921,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     the rays that miss the sample (noise.measure_noise) and fits with the dose divided by the measured dispersion and
     the measured inflation in place of d and inflation; None uses d and inflation as given. detector_tiles: the
     detector's sensors as (rows, channels) tiles, each with its own open-beam level when air rays are found.
-    shape_model='texture3d' gives each material a March-Dollase texture (strength and axis, model.Hybrid2.texture_factor):
-    each view's edges carry its own factor (needs the strain-tensor weights, which hold the views' beam directions); it
-    starts as a random powder. shape_model='cubic4' gives each cubic material its lowest-order texture instead (9
-    coefficients, linear; model.harmonics4), also starting as a random powder. per_bin_dispersion=True divides the dose
+    shape_model='cubic4' gives each cubic material its lowest-order texture (9 coefficients, linear; model.harmonics4):
+    each view's edges carry their own factor (it needs the strain-tensor weights, which hold the views' beam
+    directions). The texture starts as a random powder. per_bin_dispersion=True divides the dose
     by each bin's measured dispersion (noise.noise_statistics' dispersion_per_bin) instead of the overall one; it needs
     noise='measure'."""
     from mbirtorch import hsnt
@@ -1997,10 +1995,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     for r in range(R):
         ls_init_material(M, g, r, targets[r], a0[r])
         M.lb[M.slices[r]['a']] = M.ub[M.slices[r]['a']] = a0[r]                    # d0 reference
-        if shape_model == 'texture3d':                                             # a random powder to start
-            x0 = M.slices[r]['x'][0]
-            g[x0] = 1.0; g[x0 + 1] = TEXTURE_AXIS_START[0]; g[x0 + 2] = TEXTURE_AXIS_START[1]
-        elif shape_model == 'cubic4':                                              # a random powder: no degree-4 term
+        if shape_model == 'cubic4':                                              # a random powder: no degree-4 term
             g[M.slices[r]['x'][0]:M.slices[r]['x'][1]] = 0.0
     Mx = np.linalg.lstsq(targets.T, H0_local.T.astype(np.float64), rcond=None)[0].T
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
@@ -2021,7 +2016,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     V = x.clamp_min(0)
     fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask)
-    if shape_model in ('texture3d', 'cubic4'):                                     # each view's beam, each ray's view
+    if shape_model == 'cubic4':                                                    # each view's beam, each ray's view
         from .geometry import directions_from_weights
         assert weights is not None, 'a view-dependent texture needs the strain-tensor weights (they hold the beam directions)'
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n)
