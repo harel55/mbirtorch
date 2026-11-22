@@ -324,7 +324,12 @@ def _scan_correlation(Q, lam, lattice, a_values, min_width, S_smooth, device, ch
 
 
 SEARCH_MISFIT_MIN = 3e-4         # warm_start: a scan whose median misfit 1 - sigma lies below this cannot tell lattice
-                                 # parameters apart (working searches: 3e-3 or more; the IMAT rods: 2e-5)
+                                 # parameters apart, over every lattice type's full range (search-limits study 2026-11-22:
+                                 # working searches 4.4e-4 or more; failures 1.6e-5 or less)
+SEARCH_MISFIT_MIN_TYPED = 5e-5   # the same for a given lattice type, scanned over a narrow range, where working scans
+                                 # reach 1.9e-4 (the IMAT rods' failures: 6e-6 to 3e-5)
+SEARCH_EDGE_TOL = 2e-4           # a given lattice's parameter within this relative distance of its range's end is a failed
+                                 # search (the IMAT rods' Ti stopped at the -2% end)
 
 
 def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"), a_range=(2.0, 7.0), lattices=None,
@@ -377,12 +382,13 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
         # coarse scan with edges smoothed to a few bins, so the correlation peaks are wider than the grid spacing
         grid = np.geomspace(lo, hi, int(np.log(hi / lo) / 0.001) + 2)
         sig, _ = scan(lt, grid, 3.0 * bin_w)                                          # float64 eigh: faster on the CPU
-        if float(np.median(1.0 - sig)) < SEARCH_MISFIT_MIN:
+        floor = SEARCH_MISFIT_MIN if lattices is None else SEARCH_MISFIT_MIN_TYPED
+        if float(np.median(1.0 - sig)) < floor:
             # every lattice parameter in the range fits the components almost exactly: the scan cannot tell them apart
             # (2026-11-22, the IMAT rods: six mixed components, median misfit 2e-5), so its peak would be arbitrary
             raise ValueError(f'warm_start: the {lt} search over a = {lo:.4g}-{hi:.4g} A cannot tell lattice parameters '
-                             f'apart (median misfit {float(np.median(1.0 - sig)):.1e} < SEARCH_MISFIT_MIN = '
-                             f'{SEARCH_MISFIT_MIN:g}). Name the material or give its starting spectrum.')
+                             f'apart (median misfit {float(np.median(1.0 - sig)):.1e} < {floor:g}). Name the '
+                             f'material or give its starting spectrum.')
         peaks = [i for i in range(len(grid)) if sig[i] >= sig[max(i - 1, 0)] and sig[i] >= sig[min(i + 1, len(grid) - 1)]]
         peaks = np.array(sorted(peaks, key=lambda i: -sig[i])[:8 if lattices is None else 4])
         # refine every peak with the sharp model, all peaks in one batch: a fine grid to bracket, then a vectorised
@@ -489,6 +495,10 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
         for _ in range(polish):
             target = Q @ (Q.T @ fit); target = np.clip(target, 0, None) / max(target.max(), 1e-12)
             theta, fit, a, e = fit_spectrum(m, target, a_grid=np.linspace(a * (1 - 1e-4), a * (1 + 1e-4), 3), ridge=ridge, refine_steps=1)
+        if lattices is not None and min(a / lo - 1, 1 - a / hi) < SEARCH_EDGE_TOL:
+            raise ValueError(f'warm_start: the {c["type"]} search ended at the edge of its range ({lo:.4g}-{hi:.4g} A, '
+                             f'a = {a:.4g} A), so it found no lattice in the range. Name the material or give its '
+                             f'starting spectrum.')
         if verbose:
             print(f"  component {len(thetas)}: {c['type']} a = {a:.4f} A, {len(c['edges'])} edges in range, residual {c['resid']:.2e}, fit rms {e:.2e}", flush=True)
         thetas.append(theta); out_lattices.append((c["type"], rng)); residuals.append(c["resid"])
