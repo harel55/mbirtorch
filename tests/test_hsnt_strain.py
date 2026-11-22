@@ -962,6 +962,16 @@ def test_warmup_searches_unknown_materials(known):
         assert lt_f == lt and abs(a_f / a - 1) < 1e-3
 
 
+def test_warm_start_refuses_a_flat_search():
+    """When every lattice parameter fits the components almost exactly (here smooth curves with no edges, which the
+    search's smooth basis holds), warm_start stops with an error instead of returning an arbitrary lattice."""
+    from mbirtorch.hsnt.strain.bragg import warm_start
+    lam = np.linspace(1.5, 5.0, 300); x = (lam - lam.mean()) / np.ptp(lam)
+    H = np.stack([1 + 0.5 * x, 1 - 0.3 * x + 0.2 * x ** 2])
+    with pytest.raises(ValueError, match='cannot tell lattice parameters apart'):
+        warm_start(H, lam, n_bragg=1, lattices=[('bcc', (2.80, 2.93))], device='cpu')
+
+
 def test_fine_projector_set_mount():
     """A FineProjector whose mount is changed in place projects like one built with that mount, series by series, and
     reports the mount in voxels of the detector grid."""

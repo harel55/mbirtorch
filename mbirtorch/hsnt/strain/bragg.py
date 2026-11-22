@@ -323,6 +323,10 @@ def _scan_correlation(Q, lam, lattice, a_values, min_width, S_smooth, device, ch
     return np.concatenate(sig), np.concatenate(dirs)
 
 
+SEARCH_MISFIT_MIN = 3e-4         # warm_start: a scan whose median misfit 1 - sigma lies below this cannot tell lattice
+                                 # parameters apart (working searches: 3e-3 or more; the IMAT rods: 2e-5)
+
+
 def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"), a_range=(2.0, 7.0), lattices=None,
                resolution=None, ridge=1.0, smooth_degree=SMOOTH_DEGREE, polish=2, free_ratio=4.0, free_floor=5e-3, device=None, verbose=False):
     """Bragg parameters for the crystalline components, discovered from the row space of a bilinear factorization.
@@ -373,6 +377,12 @@ def warm_start(H_rows, lam, n_bragg=None, lattice_types=("fcc", "bcc", "diamond"
         # coarse scan with edges smoothed to a few bins, so the correlation peaks are wider than the grid spacing
         grid = np.geomspace(lo, hi, int(np.log(hi / lo) / 0.001) + 2)
         sig, _ = scan(lt, grid, 3.0 * bin_w)                                          # float64 eigh: faster on the CPU
+        if float(np.median(1.0 - sig)) < SEARCH_MISFIT_MIN:
+            # every lattice parameter in the range fits the components almost exactly: the scan cannot tell them apart
+            # (2026-11-22, the IMAT rods: six mixed components, median misfit 2e-5), so its peak would be arbitrary
+            raise ValueError(f'warm_start: the {lt} search over a = {lo:.4g}-{hi:.4g} A cannot tell lattice parameters '
+                             f'apart (median misfit {float(np.median(1.0 - sig)):.1e} < SEARCH_MISFIT_MIN = '
+                             f'{SEARCH_MISFIT_MIN:g}). Name the material or give its starting spectrum.')
         peaks = [i for i in range(len(grid)) if sig[i] >= sig[max(i - 1, 0)] and sig[i] >= sig[min(i + 1, len(grid) - 1)]]
         peaks = np.array(sorted(peaks, key=lambda i: -sig[i])[:8 if lattices is None else 4])
         # refine every peak with the sharp model, all peaks in one batch: a fine grid to bracket, then a vectorised
