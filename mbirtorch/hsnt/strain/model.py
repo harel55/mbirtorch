@@ -128,6 +128,7 @@ CUBIC4_BOUND = 1.0               # cubic4: the bound on each degree-4 texture co
 CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a truncated expansion can go negative)
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
 VIEW_TEXTURES = ("cubic4",)      # shape models whose spectra depend on the view
+EDGE_SPREAD_MIN = 1e-3           # edge_step: an edge spread below this share of a fine bin is a sharp step
 SHAPE_MODELS = (None, "extinction", "texture", "cubic4")   # the shape models Hybrid2 accepts
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
 CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
@@ -135,6 +136,20 @@ CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvatu
 LEGENDRE_DEGREE = 8          # the smooth part's polynomial degree (the spline's effective degrees of freedom
                              # on the real Fe cube, q79, were 8.9)
 LEGENDRE_CURVATURE = 1e-2    # the smooth part's curvature penalty weight relative to FitB.ridge (q79 used 1.1e-2)
+
+
+def edge_step(off, hf, width=None):
+    """Each fine bin's share below a Bragg edge: off is the edge's position less the bin's lower end, hf the bin width
+    (the edge a sharp step, so the share is clamp(off / hf, 0, 1)). With width (the standard deviation of the edge's
+    position, broadcastable to off), the share's expectation over a Gaussian edge position:
+    (G(off) - G(off - hf)) / hf with G(u) = u Phi(u / width) + width phi(u / width). It is the sum of the edges of a ray
+    whose strain along the beam has that spread (to second order in the spread; see FitB.eps_sd)."""
+    sharp = (off / hf).clamp(0, 1)
+    if width is None:
+        return sharp
+    w = torch.as_tensor(width, dtype=off.dtype, device=off.device).clamp_min(1e-12 * hf)
+    G = lambda u: u * 0.5 * torch.erfc(-u / (w * math.sqrt(2))) + w * torch.exp(-0.5 * (u / w) ** 2) / math.sqrt(2 * math.pi)
+    return torch.where(w > EDGE_SPREAD_MIN * hf, (G(off) - G(off - hf)) / hf, sharp)
 
 
 def deviance_terms(m, T, d, open_beam_obs=None):
@@ -427,12 +442,13 @@ class Hybrid2:
         self.lb = torch.as_tensor(lb, **f64); self.ub = torch.as_tensor(ub, **f64)
 
     # -- spectra and their parameter derivatives
-    def spectra(self, g, eps=None, views=None, tex=None):
+    def spectra(self, g, eps=None, views=None, tex=None, sd=None):
         """mu (R, Kf), float64; or (Pc, R, Kf) in the model's dtype with per-pixel dilations eps (Pc, R): the edge
         positions are computed in float64, the per-pixel arrays (pixels x edges x bins) in the model's dtype. With
         shape_model 'cubic4' and views (Pc,) (each pixel's view), each pixel's edges carry its view's texture factor
         (texture_factor; tex: the factors per material, already computed at g); without views the spectra are a random
-        powder's."""
+        powder's. sd (Pc, R): each ray's spread of strain along the beam; each edge is then the sum of the ray's shifted
+        edges (edge_step)."""
         x = self.lamf / self.lam_ref
         out = []
         for r, (m, sl) in enumerate(zip(self.mats, self.slices)):
@@ -449,7 +465,7 @@ class Hybrid2:
             else:
                 dt = self.dt
                 off, ee = self._edge_offsets(e, eps[:, r:r + 1])
-                step = (off / self.hf).clamp(0, 1)
+                step = edge_step(off, self.hf, None if sd is None else (ee * sd[:, r:r + 1].to(dt))[:, :, None])
                 shape = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]       # 1 + t (lam - ee) / ee
                 shape = shape * self.linked_shape(self.lamf.to(dt)[None, None, :], ee[:, :, None], h.to(dt)[None, :, None],
                                                   m["mult"].to(dt)[None, :, None], xp).to(dt)
@@ -460,7 +476,7 @@ class Hybrid2:
                 out.append((x * x).to(dt) * torch.einsum('pek,e->pk', step * shape, h.to(dt)) + smooth.to(dt))
         return torch.stack(out, 0) if eps is None else torch.stack(out, 1)
 
-    def edge_terms(self, g, eps, r):
+    def edge_terms(self, g, eps, r, sd=None):
         """Material r's edge terms under per-pixel dilations eps (Pc, R): (Pc, n_edges, Kf) in the model's dtype, each the
         spectrum's derivative with respect to that edge's height when there is no linked shape model."""
         m, sl = self.mats[r], self.slices[r]
@@ -469,7 +485,7 @@ class Hybrid2:
             a = g[sl["a"]]; t = g[sl["t"][0]:sl["t"][1]].to(dt)
             x = (self.lamf / self.lam_ref).to(dt)
             off, ee = self._edge_offsets(2.0 * a / torch.sqrt(m["ns"]), eps[:, r:r + 1])
-            step = (off / self.hf).clamp(0, 1)
+            step = edge_step(off, self.hf, None if sd is None else (ee * sd[:, r:r + 1].to(dt))[:, :, None])
             shape = 1 - t[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
             return x * x * step * shape
 
@@ -705,6 +721,7 @@ class FitB:
         self.ray_view = None             # (rays,) each ray's view, for a view-dependent spectrum (cubic4)
         self.open_beam_obs = None        # the open beam's counts over the sample's at T = 1 (None: an exact open beam)
         self.shared_open_beam = None     # set_shared_open_beam: one measured open beam shared by every view
+        self.eps_sd = None               # (rays, R) each ray's spread of strain along the beam (TomoFit.refresh_spread)
         self.tex_Q = None                # texture field: per material, the rays' basis weights (rays, nb) (TomoFit.sync)
         self.chunk = chunk
         self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
@@ -825,6 +842,10 @@ class FitB:
         q = self._open_beam_factor(mm)
         return w if q is None else w * q
 
+    def _sd(self, sl):
+        """The strain spread of the rays sl (Pc, R), or None."""
+        return None if self.eps_sd is None else self.eps_sd[sl]
+
     def chunks(self):
         P = self.T.shape[0]
         return [slice(i, min(i + self.chunk, P)) for i in range(0, P, self.chunk)]
@@ -866,7 +887,7 @@ class FitB:
         if eps is None and self.eps is not None:
             eps = self.eps[sl]
         mu, Rb, kap = self._state(g) if cache is None else cache
-        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(g, eps, self._views(sl), self._texture(g)).to(M.dt))
+        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(g, eps, self._views(sl), self._texture(g), self._sd(sl)).to(M.dt))
         E = torch.exp(-X)
         n = M.apply_band(E, Rb)
         beta = torch.exp(-W @ kap.T)
@@ -975,14 +996,14 @@ class FitB:
             m, E, n, beta, s = self.mean(sl, cache=cache)
             mm = m.clamp_min(1e-12)
             cols = []
-            mus = mu if self.eps is None else M.spectra(self.g, self.eps[sl]).to(M.dt)
+            mus = mu if self.eps is None else M.spectra(self.g, self.eps[sl], sd=self._sd(sl)).to(M.dt)
             for r in range(R):
                 mur = mus[r] if self.eps is None else mus[:, r]
                 cols.append(-s * M.apply_band(E * mur, Rb) - torch.einsum('jk,pj,j->pk', self.f, beta, kap[:, r]))
             if self.eps is not None:
                 for r in range(R):
                     tg = torch.zeros_like(self.eps[sl]); tg[:, r] = 1
-                    _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_), (self.eps[sl].double(),), (tg.double(),))
+                    _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, sd=self._sd(sl)), (self.eps[sl].double(),), (tg.double(),))
                     dX = W[:, r:r + 1] * dmu[:, r].to(M.dt)
                     cols.append(-s * M.apply_band(E * dX, Rb))
             Jac = torch.stack(cols, 2)
@@ -1080,11 +1101,11 @@ class FitB:
         T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
-        mus = M.spectra(self.g, eps, self._views(sl), self._texture(self.g)).to(M.dt)  # (Pc, R, Kf)
+        mus = M.spectra(self.g, eps, self._views(sl), self._texture(self.g), self._sd(sl)).to(M.dt)  # (Pc, R, Kf)
         cols_w, cols_u = [], []
         for r in range(R):
             tg = torch.zeros_like(eps); tg[:, r] = 1
-            _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, self._views(sl), self._texture(self.g)), (eps.double(),), (tg.double(),))
+            _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, self._views(sl), self._texture(self.g), self._sd(sl)), (eps.double(),), (tg.double(),))
             dmu = dmu[:, r].to(M.dt)                                                  # d mu_r / d eps, (Pc, Kf)
             # X = sum_r W_r mu_r(U_r / W_r): dX/dU_r = mu_r', dX/dW_r (U fixed) = mu_r - eps_r mu_r'
             cols_w.append(-s * M.apply_band(E * (mus[:, r] - eps[:, r:r + 1] * dmu), Rb)
@@ -1099,7 +1120,7 @@ class FitB:
         M = self.M; slr = M.slices[r]
         eps = self.eps[sl] if eps is None else eps
         tq = self._views(sl)
-        terms = M.edge_terms(self.g, eps, r)
+        terms = M.edge_terms(self.g, eps, r, self._sd(sl))
         fac = M.texture_factor_rays(self.g, r, tq.views, tq.Q[r])
         e_ = 2.0 * self.g[slr["a"]] / torch.sqrt(M.mats[r]["ns"])
         st = (M.lamf[None, :] / e_[:, None]).clamp(0.0, 1.0)
@@ -1295,7 +1316,7 @@ class FitB:
                     # cubic4: a height's derivative is its edge term times the view's factor; a texture parameter's
                     # is the sum over edges of height x edge term x the factor's derivative (dtex, computed once)
                     if r not in terms:
-                        terms[r] = M.edge_terms(self.g, eps, r)
+                        terms[r] = M.edge_terms(self.g, eps, r, self._sd(sl))
                     if slr["h"][0] <= i < slr["h"][1]:
                         e_ = i - slr["h"][0]
                         dm = terms[r][:, e_] * tex[r][views, e_]
@@ -1307,14 +1328,14 @@ class FitB:
                     # a height under per-pixel strain, without a linked shape model: its derivative is its own edge
                     # term, so one evaluation serves all heights of the material
                     if r not in terms:
-                        terms[r] = M.edge_terms(self.g, eps, r)
+                        terms[r] = M.edge_terms(self.g, eps, r, self._sd(sl))
                     dm = terms[r][:, i - slr["h"][0]]
                     out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
                 elif eps is not None and i < M.slices[r]["c"][0]:
                     # an edge parameter (a, h, t, x) under per-pixel strain: its derivative moves with each pixel's
                     # edges (the smooth part is not dilated, so the unstrained derivative serves for c and s)
                     tg = torch.zeros_like(self.g); tg[i] = 1
-                    _, dm = torch.func.jvp(lambda gg: M.spectra(gg, eps, self._views(sl))[:, r], (self.g,), (tg,))
+                    _, dm = torch.func.jvp(lambda gg: M.spectra(gg, eps, self._views(sl), sd=self._sd(sl))[:, r], (self.g,), (tg,))
                     out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
                 else:
                     out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dmu[i][r][None, :]), Rb))

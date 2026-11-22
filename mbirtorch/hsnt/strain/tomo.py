@@ -669,6 +669,7 @@ class TomoFit:
         gradients on the normal equations, then a line search on the data loss plus the texture prior. Each ray's
         Fisher information in its mean coefficients is (Y Y^T) x B, with Y the view's degree-4 harmonics and B
         (materials x materials) from each material's texture curve (FitB.texture_curve). Returns the objective's change."""
+        self.refresh_spread()                                  # the rays' strain spread at the current volumes
         self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         fit = self.fit; M = fit.M; nt = len(self.tex_r)
         if nt == 0:
@@ -729,6 +730,26 @@ class TomoFit:
             P = pr.fwd(V[..., r:r + 1] * B)
             out.append(torch.where(W[:, r:r + 1] > EPS_W_MIN, P / W[:, r:r + 1].clamp_min(EPS_W_MIN), torch.zeros_like(P)))
         return out
+
+    def refresh_spread(self):
+        """Each ray's spread of strain along the beam (fit.eps_sd, (rays, R)), from the current volumes: the
+        density-weighted mean square of the strain the ray's view sees, sum_cd w_c w_d proj(V E_c E_d) / W, less its
+        mean squared. The model then sums each ray's shifted edges (model.edge_step) instead of placing one edge at the
+        mean strain. It is held fixed within a step and recomputed at the start of each volume and texture step. A no-op
+        unless edge_spread is set."""
+        if not getattr(self, 'edge_spread', False):
+            return
+        n, R, C = self.V.shape[0], self.R, self.C
+        iu = [(c, d) for c in range(C) for d in range(c, C)]
+        with torch.no_grad():
+            EE = torch.stack([self.E[..., c] * self.E[..., d] for c, d in iu], -1)                 # (n, n, n, R, 21)
+            M2 = self.proj.with_q(R * len(iu)).fwd((self.V[..., None] * EE).reshape(n, n, n, R * len(iu)))
+            M2 = M2.reshape(-1, R, len(iu))
+            w = self.w_ray
+            ww = torch.stack([(1.0 if c == d else 2.0) * w[:, c] * w[:, d] for c, d in iu], -1)  # (P, 21)
+            W, eps = self.fit.W, self.fit.eps
+            m2 = torch.where(W > EPS_W_MIN, (M2 * ww[:, None, :]).sum(-1) / W.clamp_min(EPS_W_MIN), torch.zeros_like(W))
+            self.fit.eps_sd = (m2 - eps ** 2).clamp_min(0).sqrt()
 
     def rays(self, V, E):
         W, U = self._fwd(V, V[..., None] * E)
@@ -1199,6 +1220,7 @@ class TomoFit:
     # ---- the Gauss-Newton step
     def volume_step(self):
         """One Gauss-Newton step on (V, E). Returns the step's Newton decrement per volume parameter (noise units)."""
+        self.refresh_spread()                                  # the rays' strain spread at the current volumes
         self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         fit, R, C = self.fit, self.R, self.C
         self.sync()
@@ -1901,7 +1923,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            strain_prior='qggmrf', smooth_order=1,
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
-           init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None):
+           init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1936,7 +1958,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     view, as a dict with 'open_beam' (detector pixels, K) its counts, 'pixel' (rays,) each ray's detector pixel and
     'exposure' (rays,) each ray's view exposure relative to the open beam; T must then be the sample counts over exposure
     x open beam. The likelihood profiles each pixel's true open beam out (FitB.set_shared_open_beam), which is exact;
-    use it instead of open_beam_obs when the raw open beam is at hand."""
+    use it instead of open_beam_obs when the raw open beam is at hand. edge_spread=True (the default; user 2026-11-22:
+    properly summed edges) sums each ray's edges over its strain spread along the beam (TomoFit.refresh_spread)
+    instead of placing one edge at the ray's mean strain."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -2078,6 +2102,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         tf.set_texture_voxels(*texture_voxels)
     if free_lattice:
         tf.free_lattice()
+    tf.edge_spread = edge_spread
     return tf, dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
                                                            resolution=[float(v) for v in resolution], traction=traction, smooth_sd=smooth_sd,
                                                            noise=noise_info)

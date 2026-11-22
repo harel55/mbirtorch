@@ -940,3 +940,44 @@ def test_shared_open_beam():
         fit.pixel_step(); fit.global_step()
         devs.append(fit.open_beam_deviance())
     assert all(b <= a * (1 + 1e-9) for a, b in zip(devs, devs[1:])) and devs[-1] < d0
+
+
+def test_edge_spread():
+    """Summed edges: edge_step reduces to the sharp step at zero width and equals a Monte-Carlo average of shifted sharp
+    steps; spectra with a strain spread equal a fine Gauss-Hermite average of spectra over the strain; and
+    TomoFit.refresh_spread gives each ray's variance of the strain along it."""
+    from mbirtorch.hsnt.strain.model import edge_step, Hybrid2, FitB
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    off = torch.linspace(-0.05, 0.06, 400, dtype=torch.float64); hf = 0.01
+    assert torch.equal(edge_step(off, hf, 0.0), (off / hf).clamp(0, 1))
+    w = 0.013
+    z = torch.randn(200000, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
+    mc = ((off[:, None] + w * z[None]) / hf).clamp(0, 1).mean(1)
+    assert float((edge_step(off, hf, w) - mc).abs().max()) < 4e-3
+    # spectra with a spread against a Monte-Carlo average over the strain (a Gauss-Hermite rule converges slowly here:
+    # each sharp edge is a ramp narrower than its nodes' spacing)
+    lam = np.linspace(3.6, 4.5, 400)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
+                device='cpu', dtype=torch.float64, two_scale=True)
+    g = torch.zeros(M.n_global, dtype=torch.float64); sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3
+    eps = torch.tensor([[1e-3], [-5e-4]], dtype=torch.float64); sd = torch.tensor([[2e-3], [5e-4]], dtype=torch.float64)
+    zs = torch.randn(20000, 1, generator=torch.Generator().manual_seed(4), dtype=torch.float64)
+    for i in range(2):
+        mc = M.spectra(g, eps[i:i + 1] + zs * sd[i:i + 1])[:, 0].mean(0)
+        assert float((M.spectra(g, eps[i:i + 1], sd=sd[i:i + 1])[0, 0] - mc).abs().max()) < 1.5e-2 * float(mc.abs().max())
+    # the rays' strain spread
+    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    dev = pr.fwd(torch.zeros(N, N, N, 2)).device
+    M2 = Hybrid2(np.linspace(2.0, 4.4, 60), np.full(60, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3,
+                 n_contam=1, device=dev, two_scale=True)
+    P = sum(pr.counts); kw = dict(device=dev)
+    fit = FitB(M2, torch.ones(P, M2.K, **kw), torch.zeros(M2.n_global, dtype=torch.float64, **kw), torch.ones(P, 1, **kw),
+               torch.zeros(1, M2.K, **kw), eps=torch.zeros(P, 1, **kw), chunk=512)
+    V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
+    E = 1e-3 * torch.randn(N, N, N, 1, 1, generator=torch.Generator().manual_seed(2)).to(dev)
+    tf = TomoFit(fit, pr, V, E); tf.sync(); tf.edge_spread = True; tf.refresh_spread()
+    W = pr.with_q(1).fwd(V); m1 = pr.with_q(1).fwd(V * E[..., 0]); m2 = pr.with_q(1).fwd(V * E[..., 0] ** 2)
+    keep = W[:, 0] > 1e-3
+    var = (m2 / W.clamp_min(1e-12) - (m1 / W.clamp_min(1e-12)) ** 2)[keep, 0]
+    assert torch.allclose(fit.eps_sd[keep, 0] ** 2, var.clamp_min(0), rtol=1e-3, atol=1e-10)
