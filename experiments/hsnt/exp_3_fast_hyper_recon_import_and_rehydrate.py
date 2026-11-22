@@ -39,10 +39,10 @@ def main():
     if not os.path.exists(filename):
         warnings.warn(f"{filename} not found. Run exp_2_fast_hyper_recon_dehydrate_and_export.py first.")
         return
-    hsnt_dehydrated_recons, _ = hsnt.import_hsnt_data_hdf5(filename)
+    dehydrated, _ = hsnt.import_hsnt_data_hdf5(filename)
 
     # Perform rehydration
-    hsnt_recons = hsnt.rehydrate(hsnt_dehydrated_recons)
+    hsnt_recons = hsnt.rehydrate(dehydrated)
 
     # Plot hyperspectral reconstruction and spectra
     plot_images(images=[hsnt_recons[:, :, display_slice_idx, display_wave_idx]],

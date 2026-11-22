@@ -38,8 +38,7 @@ dependencies = [
     "h5py",
     # The preprocess package needs scipy (filters, fitting), tifffile (scan
     # readers), tqdm (batch progress), and pywavelets (wavelet-FFT stripe
-    # removal).  hsnt uses tifffile for TIFF stacks and tqdm for conversion
-    # progress.
+    # removal).
     "scipy",
     "tifffile",
     "tqdm",
@@ -52,14 +51,10 @@ dependencies = [
     # Google Drive-hosted demo datasets in download_and_extract.
     "olefile",
     "gdown",
-    # get_memory_stats reads host RSS/USS via psutil; the hsnt loaders check
-    # available host memory with it.
+    # get_memory_stats reads host RSS/USS via psutil; the hsnt streamed fit
+    # checks available host memory with it.
     "psutil",
 ]
-
-[project.scripts]
-# hsnt from the shell: inspect / convert / dehydrate / rehydrate / denoise (mbirtorch/hsnt/cli.py).
-mbirtorch-hsnt = "mbirtorch.hsnt.cli:main"
 
 [project.optional-dependencies]
 

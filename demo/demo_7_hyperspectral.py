@@ -33,7 +33,7 @@ print(f'hyperspectral sinogram: {counts.shape} (views, rows, channels, wavelengt
 # transmission.  The components span the materials' spectra but need not be
 # the materials themselves.
 transmission = counts / open_beam
-maps, spectra, _ = hsnt.dehydrate(transmission, dataset_type='transmission', num_materials=3, verbose=0)
+maps, spectra = hsnt.dehydrate(transmission, dataset_input_type='transmission', num_materials=3, verbose=0)
 print(f'dehydrated to component sinograms {maps.shape} and spectra {spectra.shape}')
 
 # Reconstruct each component's sinogram as an ordinary scan.
@@ -42,8 +42,8 @@ map_recons = np.stack([ct_model.recon(maps[..., k])[0] for k in range(maps.shape
 # Rehydrate: the reconstructed maps times the spectra give the attenuation
 # volume at every wavelength, and the true volume the same way from the
 # material maps and their spectra.
-volume = hsnt.rehydrate([map_recons, spectra, 'attenuation'])
-truth = hsnt.rehydrate([np.moveaxis(material_maps, 0, -1), material_basis, 'attenuation'])
+volume = hsnt.rehydrate([map_recons, spectra])
+truth = hsnt.rehydrate([np.moveaxis(material_maps, 0, -1), material_basis])
 
 # The baseline: each wavelength bin reconstructed on its own by FBP from the
 # negative log of its transmission.  A zero count has no finite attenuation,

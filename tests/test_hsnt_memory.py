@@ -49,18 +49,16 @@ def _fake_cuda(monkeypatch, total, free, allocated=0.0, unused=0.0, releases=Tru
 
 
 def test_the_plan_solves_whole_on_a_large_gpu_and_streams_on_a_small_one(monkeypatch):
-    """1,048,576 pixels x 1200 bins with 78.6 GiB free (an H100) plans a full solve for all three estimators when
-    the solve compiles (its peaks were 43.6 and 44.7 GiB); eager, whose peak was 62.4 GiB, it streams in two chunks
+    """1,048,576 pixels x 1200 bins with 78.6 GiB free (an H100) plans a full solve when the solve compiles
+    (its peak was 43.6 GiB); eager, whose peak was 62.4 GiB, it streams in two chunks
     with the whole warm-up."""
     P, K = 2 ** 20, 1200
     _fake_cuda(monkeypatch, total=79.2, free=78.6)
-    for spectra in ("mle", "unconstrained", "support"):
-        plan = _plan(P, K, "cuda", spectra)
-        assert plan[0] == "full" and "compiled" in plan[-1] and "78.6 GiB available of 79.2" in plan[-1]
+    plan = _plan(P, K, "cuda", "mle")
+    assert plan[0] == "full" and "compiled" in plan[-1] and "78.6 GiB available of 79.2" in plan[-1]
     _fake_cuda(monkeypatch, total=79.2, free=78.6, triton=False)
-    for spectra in ("mle", "unconstrained", "support"):
-        mode, chunk, warmup, note = _plan(P, K, "cuda", spectra)
-        assert (mode, chunk, warmup) == ("stream", 585_728, 16384) and "eager" in note and "(2 chunks)" in note
+    mode, chunk, warmup, note = _plan(P, K, "cuda", "mle")
+    assert (mode, chunk, warmup) == ("stream", 585_728, 16384) and "eager" in note and "(2 chunks)" in note
     assert _plan(P, K, "cuda", "mle", compile_mode="off")[0] == "stream"                 # compile_mode is heeded
     assert _plan(P, K, "cuda", "mle", mode="full")[0] == "full"                            # and a mode given
 

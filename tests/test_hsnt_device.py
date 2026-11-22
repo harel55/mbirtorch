@@ -12,7 +12,6 @@ from test_hsnt_solvers import _sphere_problem
 
 N = 32
 RANK = 3
-STREAM_CHUNK = 300                                      # pixels per chunk in the streamed solve
 ROUNDING_RTOL = 1e-4                                    # a GPU solve or a different exp rounds differently
 
 
@@ -27,7 +26,7 @@ def _dehydrate(data, *args, **kwargs):
     torch gives only once per process."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        W, H, _ = hsnt.dehydrate(data, *args, verbose=0, device="cpu", **kwargs)
+        W, H = hsnt.dehydrate(data, *args, verbose=0, device="cpu", **kwargs)
     return W, H, sorted(str(w.message) for w in caught if "torch" not in str(w.message).lower())
 
 
@@ -36,8 +35,7 @@ def _assert_same(a, b):
         np.testing.assert_array_equal(x, y)
 
 
-@pytest.mark.parametrize("kwargs", [dict(), dict(mode="stream", chunk_pixels=STREAM_CHUNK), dict(spectra="unconstrained")],
-                         ids=["full", "stream", "unconstrained"])
+@pytest.mark.parametrize("kwargs", [dict(), dict(mode="stream")], ids=["full", "stream"])
 def test_a_tensor_and_an_array_give_the_same_fit(spheres, kwargs):
     _assert_same(_dehydrate(spheres, "transmission", RANK, **kwargs),
                  _dehydrate(torch.from_numpy(spheres), "transmission", RANK, **kwargs))
@@ -46,14 +44,14 @@ def test_a_tensor_and_an_array_give_the_same_fit(spheres, kwargs):
 def test_a_tensor_and_an_array_give_the_same_fit_with_a_mask(spheres):
     yy, xx = np.mgrid[:N, :N]
     mask = (yy - N / 2) ** 2 + (xx - N / 2) ** 2 < (0.45 * N) ** 2
-    _assert_same(_dehydrate(spheres, "transmission", RANK, sample_mask=mask, check_mask=True),
-                 _dehydrate(torch.from_numpy(spheres), "transmission", RANK, sample_mask=mask, check_mask=True))
+    _assert_same(_dehydrate(spheres, "transmission", RANK, sample_mask=mask),
+                 _dehydrate(torch.from_numpy(spheres), "transmission", RANK, sample_mask=mask))
 
 
 def test_a_tensor_and_an_array_give_the_same_fit_for_a_given_basis(spheres):
     H = _dehydrate(spheres, "transmission", RANK)[1]
-    _assert_same(_dehydrate(spheres, "transmission", subspace_basis=H),
-                 _dehydrate(torch.from_numpy(spheres), "transmission", subspace_basis=H))
+    _assert_same(_dehydrate(spheres, "transmission", spectra=H),
+                 _dehydrate(torch.from_numpy(spheres), "transmission", spectra=H))
 
 
 def test_a_tensor_and_an_array_give_the_same_rank(spheres):
@@ -77,6 +75,12 @@ def test_attenuation_from_a_tensor_matches_an_array(spheres):
     np.testing.assert_allclose(W1 @ H1, W0 @ H0, rtol=ROUNDING_RTOL, atol=ROUNDING_RTOL)
 
 
+def test_a_tensor_and_an_array_give_the_same_fit_with_an_open_beam(spheres):
+    open_beam = np.geomspace(20.0, 200.0, spheres.shape[-1])
+    _assert_same(_dehydrate(spheres, "transmission", RANK, open_beam=open_beam),
+                 _dehydrate(torch.from_numpy(spheres), "transmission", RANK, open_beam=open_beam))
+
+
 def test_a_tensor_is_not_copied_to_the_host(spheres, monkeypatch):
     def no_tensor(array):
         assert not torch.is_tensor(array), "dehydrate copied the tensor data to the host"
@@ -89,6 +93,6 @@ def test_a_tensor_is_not_copied_to_the_host(spheres, monkeypatch):
 def test_a_gpu_tensor_matches_an_array_on_the_gpu(spheres):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        W0, H0, _ = hsnt.dehydrate(spheres, "transmission", RANK, verbose=0, device="cuda")
-        W1, H1, _ = hsnt.dehydrate(torch.from_numpy(spheres).cuda(), "transmission", RANK, verbose=0, device="cuda")
+        W0, H0 = hsnt.dehydrate(spheres, "transmission", RANK, verbose=0, device="cuda")
+        W1, H1 = hsnt.dehydrate(torch.from_numpy(spheres).cuda(), "transmission", RANK, verbose=0, device="cuda")
     np.testing.assert_allclose(W1 @ H1, W0 @ H0, rtol=ROUNDING_RTOL, atol=ROUNDING_RTOL)

@@ -5,7 +5,7 @@ public functions take and return numpy arrays.  With ``output_sharded=True``, a 
 the tensor on the GPUs instead.  mbirtorch uses all available GPUs automatically.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 # These lines put the torch.compile caches under ~/.mbirtorch.  They take effect only if
 # mbirtorch is imported before torch compiles anything.
@@ -70,7 +70,7 @@ __all__ = [
     "gen_demo_data", "gen_demo_data_4d", "gen_shepp_logan_3d_reference",
     # Python imports these names on first access through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
-    "create_hsnt_metadata", "export_hsnt_data_hdf5", "generate_hyper_data",
+    "export_hsnt_data_hdf5", "generate_hyper_data",
     "synthetic_material_basis", "gen_material_phantom", "generate_hyper_sinogram",
     "get_opt_views", "show_image_with_projection_rays",
 ]
@@ -87,7 +87,7 @@ _LAZY_MODULES = ("preprocess", "hsnt", "vcls", "mace")
 # function in one of these modules needs a line here.
 _LAZY_NAMES = {
     'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt',
-    'import_hsnt_data_hdf5': 'hsnt', 'create_hsnt_metadata': 'hsnt',
+    'import_hsnt_data_hdf5': 'hsnt',
     'export_hsnt_data_hdf5': 'hsnt', 'generate_hyper_data': 'hsnt',
     'synthetic_material_basis': 'hsnt', 'gen_material_phantom': 'hsnt',
     'generate_hyper_sinogram': 'hsnt',
@@ -117,7 +117,7 @@ if TYPE_CHECKING:
                        resolve_device_pool)
     from .mace4d import MACE4DModel, temporal_filter_matrix, apply_temporal_filter
     from .hsnt import (hyper_denoise, dehydrate, rehydrate,
-                       import_hsnt_data_hdf5, create_hsnt_metadata,
+                       import_hsnt_data_hdf5,
                        export_hsnt_data_hdf5, generate_hyper_data,
                        synthetic_material_basis, gen_material_phantom,
                        generate_hyper_sinogram)

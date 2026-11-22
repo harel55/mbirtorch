@@ -4,13 +4,15 @@
 Hyperspectral CT
 ================
 
-The ``hsnt`` module processes hyperspectral neutron transmission data: the transmission of every detector pixel in
-each of many wavelength bins.  A sample made of a few materials has a low-rank attenuation X = W H, with a
-nonnegative spectrum per component in H and a map per component in W.  The module estimates W and H from the data
-(dehydration), multiplies them back into denoised data (rehydration), estimates the number of components, and
-reads and writes the hsnt HDF5 layout.  The scripts in
-`experiments/hsnt <https://github.com/cabouman/mbirtorch/blob/main/experiments/hsnt/>`__ are worked examples, and
-`Command line`_ runs the same steps on files.
+The ``hsnt`` module works on hyperspectral neutron data.  Each detector pixel holds a spectrum: one
+value per wavelength bin.  The spectral axis of the data is always the last axis.
+
+A sample made of a few materials has an attenuation of low rank, ``X = W H``.  Each row of ``H`` is the
+spectrum of one material, and each column of ``W`` is the map of that material over the pixels.  Both are
+nonnegative.  The module fits ``W`` and ``H`` to the data, which we call dehydration, and multiplies them back
+into denoised data, which we call rehydration.  It also estimates the number of materials, and it reads and
+writes the hsnt HDF5 file.  The scripts in
+`experiments/hsnt <https://github.com/cabouman/mbirtorch/blob/main/experiments/hsnt/>`__ are worked examples.
 
 .. currentmodule:: mbirtorch.hsnt
 
@@ -18,37 +20,46 @@ reads and writes the hsnt HDF5 layout.  The scripts in
 Dehydration and rehydration
 ---------------------------
 
-Dehydration fits W and H by maximum likelihood: the Poisson likelihood of the counts, written in terms of the
-transmission T = exp(-X).  The natural input is therefore the transmission, the counts divided by the open beam,
-and a zero count is simply a zero transmission:
+``dehydrate`` fits ``W`` and ``H`` by maximum likelihood.  The counts are Poisson, and the likelihood is
+written in terms of the transmission, ``T = exp(-W H)``.  So the natural input is the transmission, which is the
+counts divided by the open beam.  A zero count is simply a zero transmission:
 
 .. code-block:: python
 
    transmission = counts / open_beam                       # normalize by the detector calibration
-   maps, spectra, dataset_type = hsnt.dehydrate(transmission, dataset_type='transmission')
-   denoised = hsnt.rehydrate([maps, spectra, dataset_type])
+   maps, spectra = hsnt.dehydrate(transmission, dataset_input_type='transmission')
+   denoised = hsnt.rehydrate([maps, spectra], dataset_output_type='transmission')
 
-The dehydrated form ``[maps, spectra, dataset_type]`` is small: the maps have one entry per pixel and component, and
-the spectra one per component and bin.  ``rehydrate`` returns the same quantity as the input, transmission or
-attenuation.  When the number of components is not given, it is estimated by likelihood-ratio tests.  The components
-span the materials' spectra but need not be the materials themselves.  Data too large for the device are fitted by
-chunks of pixels.  Given a ``subspace_basis``, ``dehydrate`` fits only the maps, so a large scan can be dehydrated
-piece by piece against spectra fitted on part of it.  Given a ``sample_mask``, ``dehydrate`` fits only the pixels
-inside the mask and sets the maps to zero outside it.  With ``check_mask=True``, it warns when the pixels outside hold
-more attenuation than noise explains.
+The output ``[maps, spectra]`` takes far less memory than the data.  The data hold one value per pixel and
+bin.  The maps hold one value per pixel and material, and the spectra hold one value per material and bin.
+With a few materials and hundreds of bins, that is a reduction of about a hundred times.  The maps and spectra
+always describe attenuation.  ``rehydrate`` returns attenuation or transmission, as its ``dataset_output_type`` says.
+
+A few more facts about ``dehydrate``:
+
+* The fitted spectra span the materials' spectra, but they need not be the spectra of pure materials.
+* Data too large for the GPU are fitted in chunks of pixels.
+* Given ``spectra``, only the maps are fitted.  This is how a large scan is dehydrated piece by piece,
+  against spectra fitted on part of it.
+* Given a ``sample_mask``, only the pixels inside the mask are fitted.  The maps are zero outside it.
+* Given an ``open_beam`` with one count per bin, each bin's loss is weighted by its count.  Use it when the
+  open beam differs between bins.  A full open beam scan is also accepted, and it is averaged over all axes but
+  the last.
 
 .. autofunction:: dehydrate
 .. autofunction:: rehydrate
 .. autofunction:: hyper_denoise
-.. autofunction:: estimate_rank
 
 
 Import/Export
 -------------
 
-.. autofunction:: import_hsnt_data_hdf5
-.. autofunction:: create_hsnt_metadata
+``export_hsnt_data_hdf5`` writes hyperspectral data or dehydrated data to one HDF5 file, and
+``import_hsnt_data_hdf5`` reads it back.  The root of the file carries a format version and the mbirtorch
+version that wrote it, so a later mbirtorch can tell what it is reading.
+
 .. autofunction:: export_hsnt_data_hdf5
+.. autofunction:: import_hsnt_data_hdf5
 
 
 Synthetic data
@@ -62,18 +73,3 @@ and the hyperspectral sinogram of the phantom through a tomography model, with P
 .. autofunction:: synthetic_material_basis
 .. autofunction:: generate_hyper_sinogram
 .. autofunction:: generate_hyper_data
-
-
-Command line
-------------
-
-``mbirtorch-hsnt`` runs the same steps from the shell, on an HDF5 file in the hsnt layout or on a directory of TIFF
-images, one per wavelength bin.  Its subcommands are ``inspect``, ``convert`` (TIFFs to HDF5, normalized by an open
-beam), ``dehydrate``, ``rehydrate`` and ``denoise``:
-
-.. code-block:: bash
-
-   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ -o sample.h5
-   mbirtorch-hsnt denoise sample.h5 -o results/
-
-``mbirtorch-hsnt <subcommand> -h`` lists the options.

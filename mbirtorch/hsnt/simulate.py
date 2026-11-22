@@ -10,7 +10,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
 
     The open beam is noiseless and has dosage_rate counts in every pixel and bin.  The counts
     through the sample are Poisson.  The counts divided by the open beam give the transmission
-    that ``dehydrate`` accepts with dataset_type='transmission'.
+    that ``dehydrate`` accepts with dataset_input_type='transmission'.
 
     Args:
         material_basis: An ndarray of shape :math:`(N_m, N_k)`.  Each row is the linear
@@ -155,7 +155,7 @@ def generate_hyper_sinogram(ct_model, material_maps, material_basis, dosage_rate
     projections by the spectra to get the attenuation at every wavelength.  The open beam has
     ``dosage_rate`` counts in every pixel and bin.  The counts through the sample are Poisson.
     The counts divided by the open beam give the transmission that :func:`dehydrate` accepts
-    with ``dataset_type='transmission'``.
+    with ``dataset_input_type='transmission'``.
 
     Args:
         ct_model (TomographyModel): The model of the scan.

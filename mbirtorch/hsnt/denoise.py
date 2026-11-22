@@ -8,10 +8,6 @@ from ..utilities import _to_host
 
 # These keywords belong to the MBIRJAX version of dehydrate, which used scikit-learn.  mbirtorch rejects them.
 _L2_KEYWORDS = ("safety_factor", "beta_loss", "max_iter", "tolerance", "batch_size", "random_state")
-# check_mask flags an outside pixel when twice its gain in log likelihood exceeds this chi-square quantile.
-_MASK_CHECK_LEVEL = 0.999
-# check_mask warns when the share of flagged outside pixels exceeds this value.
-_MASK_CHECK_WARN = 0.01
 
 
 def _reject_unknown_keywords(name, kwargs):
@@ -104,67 +100,69 @@ def _to_transmission(data, dataset_type):
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
-def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
-              penalty="auto", max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
-              compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None, check_mask=False,
+def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, spectra=None,
+              max_steps=1000, rel_tol=1e-8, max_num_est_materials=6, device=None,
+              mode="auto", max_passes=5, sample_mask=None, open_beam=None,
               verbose=1, **kwargs):
-    """This function factors the attenuation of a hyperspectral dataset as X = W H by maximum
-    likelihood.  The factors satisfy W >= 0 and H >= 0.
+    """This function dehydrates hyperspectral data.  It computes a non-negative factorization
+    of the data in the attenuation domain.  The spectral axis of the data is always the last axis.
 
-    The spectral axis of the data is the last axis.  The maps ``W`` keep the leading axes of the
-    data.  This function handles zero counts correctly.  The components form a nonnegative basis
-    of the data, but they are not necessarily the spectra of pure materials.
+    For transmission data :math:`T`, this function computes the non-negative factorization
+    :math:`T = \\exp(-W H)`, where ``W`` has one row per pixel and :math:`N_m` columns, and ``H``
+    is :math:`N_m \\times N_k`.  The rows of ``H`` are the spectral basis, and the columns of
+    ``W`` are the maps.  The function ``rehydrate`` turns the result back into data.
+
+    The algorithm fits ``W`` and ``H`` by maximum likelihood.  It assumes that :math:`T` comes
+    from Poisson counts, so zero counts are handled correctly.
+
+    The input may be either 'attenuation' or 'transmission'.  The output ``W`` and ``H`` always
+    describe attenuation.
 
     Args:
-        data (numpy.ndarray or torch.Tensor): The data.  The last axis is the spectral axis,
-            of length :math:`N_k`.  This function treats a NaN or infinite transmission as zero
-            counts.  It clips a negative transmission to zero.
-        dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
-        num_materials (int, optional): The rank :math:`N_m`.  Defaults to None, in which case
-            this function estimates the rank.
-        subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra of shape
-            :math:`(N_m, N_k)`.  When it is given, this function holds the spectra fixed and
-            computes only the maps.  Defaults to None.
-        spectra (str, optional): The method for estimating the spectra.  'mle' gives the
-            maximum likelihood estimate.  'unconstrained' removes the bias that the constraint
-            W >= 0 causes at low dose.  'support' selects which components are present in each
-            pixel, and it requires ``dose``.  Defaults to 'mle'.
-        dose (float, optional): The open beam counts per pixel and bin.  Only 'support' uses
-            it.  Defaults to None.
-        penalty (str or float, optional): The penalty per component that 'support' uses.  It
-            is either a multiple of log(N_k) or 'auto'.  Defaults to 'auto'.
+        data (numpy.ndarray or torch.Tensor): The data, with the :math:`N_k` spectral bins on
+            the last axis and the pixels on the other axes, for example (views, rows, cols).
+            A NaN or infinite transmission counts as zero counts.  A negative transmission is
+            clipped to zero.
+        dataset_input_type (str, optional): 'attenuation' or 'transmission'.  Defaults to
+            'transmission'.
+        num_materials (int, optional): The number of spectra :math:`N_m`.  Defaults to None,
+            which estimates it from the data.
+        spectra (numpy.ndarray or torch.Tensor, optional): Fixed spectra ``H`` of shape
+            :math:`(N_m, N_k)`.  When given, only the maps ``W`` are computed.  Defaults to None.
         max_steps (int, optional): The maximum number of solver iterations.  Defaults to 1000.
         rel_tol (float, optional): The solver stops when the relative change in the loss falls
             below this value.  Defaults to 1e-8.
-        max_rank (int, optional): The largest rank that the rank estimate considers.  Defaults
-            to 6.
-        device (str, optional): The torch device.  Defaults to None, which uses CUDA when it is
+        max_num_est_materials (int, optional): Only used when ``num_materials`` is not given.
+            The estimate tries 1 to this many materials.  Defaults to 6.
+        device (str, optional): The torch device.  Defaults to None, which uses CUDA when
             available and the CPU otherwise.
-        compile_mode (str, optional): 'auto', 'on', or 'off'.  The value sets whether this
-            function uses torch.compile.  Defaults to 'auto'.
-        mode (str, optional): 'full', 'stream', or 'auto'.  'stream' processes the pixels in
-            chunks.  Defaults to 'auto'.
-        chunk_pixels (int, optional): The number of pixels in each chunk when streaming.
-            Defaults to None, in which case this function sets it from the available memory.
-        max_passes (int, optional): The number of passes over the chunks when streaming.
-            Defaults to 5.
-        sample_mask (numpy.ndarray or torch.Tensor, optional): A boolean array that is True
-            where the sample may be.  It must broadcast to the leading axes of the data.  An
-            image of shape (rows, cols) applies to every view, and an array of shape (views,
-            rows, cols) gives each view its own region.  This function sets W to zero outside
-            the mask and fits only the pixels inside it.  All views share the spectra.  The rank
-            estimate uses every pixel.  Defaults to None.
-        check_mask (bool, optional): When it is True and ``sample_mask`` is given, this
-            function also fits the pixels outside the mask, and it warns when more of them hold
-            attenuation than noise explains.  Defaults to False.
-        verbose (int, optional): 0 prints nothing, 1 prints a summary, and 2 also prints the
-            rank search.  Defaults to 1.
+        mode (str, optional): 'full' holds all pixels in device memory.  'stream' processes
+            the pixels in chunks.  'auto' chooses by the available memory.  When the data have
+            image axes and few counts, a streamed fit starts from spectra fitted to averaged
+            blocks of neighboring pixels.  Defaults to 'auto'.
+        max_passes (int, optional): The passes over the chunks in 'stream' mode.  Defaults
+            to 5.
+        sample_mask (numpy.ndarray or torch.Tensor, optional): A boolean array, True where the
+            sample may be.  Its shape is (rows, cols) for one region shared by all views, or
+            (views, rows, cols) for a region per view.  ``W`` is set to zero outside the mask
+            and fit only inside it.  Defaults to None.
+        open_beam (float, numpy.ndarray or torch.Tensor, optional): The open beam counts.  It
+            may be a 1-D array with one count per spectral bin, or a full open beam scan with the
+            :math:`N_k` bins on the last axis, for example (rows, cols, bins) or (scans, rows,
+            cols, bins).  A scan is averaged over all axes but the last.  Use it when the open
+            beam differs between bins.  Each bin's loss is then weighted by its open beam count
+            divided by the mean count, so that the loss is the Poisson negative log-likelihood of
+            the counts.  A scalar, or an array with the same count in every bin, gives every bin
+            the same weight.  The mean count also sets the size of the blocks of pixels that are
+            averaged to find the starting spectra.  Defaults to None, which gives every bin the
+            same weight and estimates the counts from the data.
+        verbose (int, optional): 0 prints nothing.  1 prints a summary.  2 also prints the
+            search for ``num_materials``.  Defaults to 1.
 
     Returns:
-        list: The list [subspace_data, subspace_basis, dataset_type].  subspace_data is ``W``.
-            Its axes are the leading axes of the data, followed by an axis of length :math:`N_m`.
-            subspace_basis is ``H``, with shape :math:`(N_m, N_k)`.  Both are float32.
-            dataset_type is the dataset_type of the input.
+        list: The list [maps, spectra].  maps is ``W``, with the pixel axes of the data followed
+            by an axis of length :math:`N_m`.  spectra is ``H``, with shape :math:`(N_m, N_k)`.
+            Both are float32, and ``W H`` is the attenuation at each pixel and bin.
     """
     import torch
     from ._device import _default_device
@@ -173,11 +171,12 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     _reject_unknown_keywords("dehydrate", kwargs)
     if mode not in ("auto", "full", "stream"):
         raise ValueError(f"mode must be 'auto', 'full' or 'stream', got {mode!r}")
-    if chunk_pixels is not None and int(chunk_pixels) < 1:
-        raise ValueError(f"chunk_pixels must be a positive number of pixels, got {chunk_pixels}")
     if int(max_passes) < 0:
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
-    T_all, shape = _to_transmission(data, dataset_type)
+    T_all, shape = _to_transmission(data, dataset_input_type)
+    open_beam = _open_beam_per_bin(open_beam, shape[-1])
+    weights = _bin_weights(open_beam, shape[-1])
+    dose = None if open_beam is None else float(np.mean(open_beam))
     device = _default_device(device)
     lead = shape[:-1]
     mask = _sample_mask(sample_mask, lead)
@@ -188,36 +187,67 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     else:
         T = np.ascontiguousarray(T_all[mask])
     pixels = f"{T.shape[0]}" if mask is None else f"{T.shape[0]} of {T_all.shape[0]} (sample_mask)"
-    if subspace_basis is not None:
+    if spectra is not None:
         from ._fit import _fit_fixed_basis
-        H = _check_basis(subspace_basis, shape[-1], num_materials, spectra)
-        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
-                                     rel_tol=rel_tol, compile_mode=compile_mode)
+        H = _check_basis(spectra, shape[-1], num_materials)
+        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol,
+                                     weights=weights)
         if verbose >= 1:
             print("dehydrate(): ")
-            print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given subspace_basis)")
+            print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given spectra)")
             print("   -Pixels: ", pixels, f"; maps for the given basis ({rep['chunks']} chunk(s))")
     else:
         note = f"rank {num_materials} given"
         if num_materials is None:
             num_materials, note, _ = _estimate_rank(T_all, spatial_shape=_spatial_shape(lead), device=device,
-                                                    max_rank=max_rank, verbose=max(0, verbose - 1))
-        W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, device=device, mode=mode,
-                         chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes),
-                         compile_mode=compile_mode)
+                                                    max_rank=max_num_est_materials,
+                                                    verbose=max(0, verbose - 1), weights=weights)
+        W, H, rep = _fit(T, int(num_materials), device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol,
+                         max_passes=int(max_passes), weights=weights, spatial_shape=_spatial_shape(lead),
+                         pool_T=None if mask is None else T_all, pool_mask=mask, dose=dose)
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
-            print("   -Pixels: ", pixels, f"; spectra: {spectra} ({solve})")
+            print("   -Pixels: ", pixels, f" ({solve})")
     if mask is not None:
-        if check_mask and not mask.all():
-            _check_outside(_to_host(T), W, np.ascontiguousarray(_to_host(T_all)[~mask]), H, dose, device, mode,
-                           chunk_pixels, max_steps, rel_tol, compile_mode, verbose)
         W_all = np.zeros((T_all.shape[0], W.shape[1]), dtype=np.float32)
         W_all[mask] = W
         W = W_all
-    return [W.reshape(*lead, H.shape[0]), H, dataset_type]
+    return [W.reshape(*lead, H.shape[0]), H]
+
+
+def _open_beam_per_bin(open_beam, bins):
+    """This function converts the ``open_beam`` of ``dehydrate`` to a float64 scalar or a 1-D
+    float64 array with one count per bin.  A full open beam scan is averaged over all axes but the
+    last.  It returns None when ``open_beam`` is None."""
+    if open_beam is None:
+        return None
+    import torch
+    if torch.is_tensor(open_beam):
+        t = open_beam.detach()
+        if t.ndim > 1:
+            t = t.reshape(-1, t.shape[-1]).mean(dim=0, dtype=torch.float64)
+        d = t.cpu().numpy().astype(np.float64)
+    else:
+        d = _to_host(open_beam)
+        d = d.reshape(-1, d.shape[-1]).mean(axis=0, dtype=np.float64) if d.ndim > 1 else d.astype(np.float64)
+    if d.ndim == 1 and d.shape[0] != bins:
+        raise ValueError(f"open_beam must have the {bins} spectral bins on its last axis; got shape "
+                         f"{tuple(open_beam.shape)}")
+    if not (np.isfinite(d).all() and (d > 0).all()):
+        raise ValueError("open_beam must be finite and positive in every bin")
+    return d
+
+
+def _bin_weights(open_beam, bins):
+    """This function converts the ``open_beam`` of ``dehydrate`` to the weight of each bin.  The
+    weight is the bin's open beam count divided by the mean count.  It returns None when every bin
+    has the same weight, so that the fit is then the unweighted fit."""
+    d = _open_beam_per_bin(open_beam, bins)
+    if d is None or d.ndim == 0 or (d == d[0]).all():
+        return None
+    return d / d.mean()
 
 
 def _sample_mask(sample_mask, lead):
@@ -240,65 +270,22 @@ def _sample_mask(sample_mask, lead):
     return np.ascontiguousarray(m).reshape(-1)
 
 
-def _check_outside(T_in, W_in, T_out, H, dose, device, mode, chunk_pixels, max_steps, rel_tol, compile_mode, verbose):
-    """This function checks whether the pixels outside ``sample_mask`` hold attenuation.
-
-    It fits each outside pixel to the spectra H and computes the gain in log likelihood over
-    W = 0, in counts.  It uses ``dose`` when it is given.  Otherwise it uses the effective dose of
-    the fit inside the mask, as the rank estimate does.  When the mask is correct, twice the gain
-    is at most a chi-square variable with rank degrees of freedom.  This function flags the pixels
-    above the _MASK_CHECK_LEVEL quantile of that variable, and it warns when the flagged share
-    exceeds _MASK_CHECK_WARN.  It returns the flagged share."""
-    import torch
-    from scipy.stats import chi2
-    from ._fit import _fit_fixed_basis
-    from ._loss import _nnal_prep, _nnal_rowwise
-    from .outputs import _CHUNK_ELEMENTS
-    from .rank import _loss_and_residual
-    if dose is None:
-        resid = _loss_and_residual(torch.from_numpy(T_in), torch.from_numpy(W_in), torch.from_numpy(H))[1]
-        dose = 1.0 / max(resid, np.finfo(np.float64).tiny)
-    W_out, _, _ = _fit_fixed_basis(T_out, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
-                                   rel_tol=rel_tol, compile_mode=compile_mode)
-    R, K = H.shape
-    Hd = torch.as_tensor(H, device=device)
-    rows = max(1, _CHUNK_ELEMENTS // K)
-    gains = []
-    for i in range(0, T_out.shape[0], rows):
-        Tc = torch.from_numpy(T_out[i:i + rows]).to(device)
-        prep = _nnal_prep(Tc)
-        X = torch.from_numpy(W_out[i:i + rows]).to(device) @ Hd
-        gains.append((_nnal_rowwise(torch.zeros_like(X), Tc, prep, 1, dtype=torch.float64)
-                      - _nnal_rowwise(X, Tc, prep, 1, dtype=torch.float64)).cpu())
-    gain = float(dose) * torch.cat(gains).numpy()
-    share = float(np.mean(2 * gain > chi2.ppf(_MASK_CHECK_LEVEL, R)))
-    chance = 100 * (1 - _MASK_CHECK_LEVEL)
-    if verbose >= 1:
-        print(f"   -Outside the sample_mask: {T_out.shape[0]} pixels.  {100 * share:.3g}% hold more attenuation "
-              f"than noise explains, and {chance:.3g}% would by chance.")
-    if share > _MASK_CHECK_WARN:
-        warnings.warn(f"{100 * share:.3g}% of the pixels outside the sample_mask hold more attenuation than noise "
-                      f"explains, and {chance:.3g}% would by chance.  The sample may extend beyond the mask.")
-    return share
-
-
-def _check_basis(subspace_basis, bins, num_materials, spectra):
-    """This function checks ``subspace_basis`` against the data and returns it as a float32 array
+def _check_basis(spectra, bins, num_materials):
+    """This function checks the given ``spectra`` against the data and returns it as a float32 array
     of shape (rank, bins)."""
-    H = np.asarray(_to_host(subspace_basis), dtype=np.float32)
+    H = np.asarray(_to_host(spectra), dtype=np.float32)
     if H.ndim != 2 or H.shape[1] != bins:
-        raise ValueError(f"subspace_basis must have shape (rank, {bins}) for data with {bins} bins; got {H.shape}")
+        raise ValueError(f"spectra must have shape (num_materials, {bins}) for data with {bins} bins; got {H.shape}")
     if not np.isfinite(H).all() or (H < 0).any():
-        raise ValueError("subspace_basis must be finite and nonnegative")
+        raise ValueError("spectra must be finite and nonnegative")
     if num_materials is not None and int(num_materials) != H.shape[0]:
-        raise ValueError(f"num_materials={num_materials} disagrees with the {H.shape[0]} rows of subspace_basis")
-    if spectra != "mle":
-        raise ValueError(f"spectra={spectra!r} re-estimates the spectra, which a given subspace_basis holds fixed")
+        raise ValueError(f"num_materials={num_materials} disagrees with the {H.shape[0]} rows of spectra")
     return H
 
 
 def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs):
     """This function denoises hyperspectral data.  It calls ``dehydrate`` and then ``rehydrate``.
+    The spectral axis of the data is always the last axis.
 
     Args:
         data (numpy.ndarray or torch.Tensor): The data.  The last axis is the spectral axis.
@@ -311,34 +298,40 @@ def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs
         numpy.ndarray: The denoised float32 data, with the shape and dataset_type of the input.
     """
     _reject_unknown_keywords("hyper_denoise", {k: v for k, v in kwargs.items() if k in _L2_KEYWORDS})
-    return rehydrate(dehydrate(data, dataset_type=dataset_type, num_materials=num_materials, **kwargs))
+    return rehydrate(dehydrate(data, dataset_input_type=dataset_type, num_materials=num_materials, **kwargs),
+                     dataset_output_type=dataset_type)
 
 
-def rehydrate(dehydrated_data, hyperspectral_idx=None):
+def rehydrate(dehydrated, dataset_output_type="attenuation", hyperspectral_idx=None):
     """This function restores hyperspectral data from the output of ``dehydrate``.  It multiplies
-    the maps by the spectra, for all bins or for selected bins.  The method is described in
+    the maps by the spectra, for all bins or for selected bins.  The spectral axis of the
+    returned data is always the last axis.  The method is described in
     M. S. N. Chowdhury et al., "Fast Hyperspectral Neutron Tomography," IEEE TCI, vol. 11,
     pp. 663-677, 2025, doi:10.1109/TCI.2025.3567854.
 
     Args:
-        dehydrated_data: The list [subspace_data, subspace_basis, dataset_type].  subspace_data
-            holds the maps, with the component axis last.  subspace_basis holds the spectra,
-            with shape :math:`(N_s, N_k)`.  dataset_type is 'attenuation' or 'transmission'.
+        dehydrated: The list [maps, spectra] that ``dehydrate`` returns.  maps holds ``W``,
+            with the materials on the last axis.  spectra holds ``H``,
+            with shape :math:`(N_m, N_k)`.
+        dataset_output_type (str, optional): The quantity to return.  'attenuation' returns ``W H``.
+            'transmission' returns ``exp(-W H)``.  Defaults to 'attenuation'.
         hyperspectral_idx: The indices of the bins to restore.  Defaults to None, which
             restores all bins.
 
     Returns:
         numpy.ndarray: The restored data.  Its last axis holds the bins, and its other axes match
-            subspace_data.  The values are attenuation or transmission, as dataset_type says.
+            maps.
     """
-    [subspace_data, subspace_basis, dataset_type] = dehydrated_data
+    if dataset_output_type not in ("attenuation", "transmission"):
+        raise ValueError("'dataset_output_type' must be either 'attenuation' or 'transmission'.")
+    maps, spectra = dehydrated[0], dehydrated[1]
 
     if hyperspectral_idx is None:
-        rehydrated_data = subspace_data @ subspace_basis
+        rehydrated_data = maps @ spectra
     else:
-        rehydrated_data = subspace_data @ subspace_basis[:, hyperspectral_idx]
+        rehydrated_data = maps @ spectra[:, hyperspectral_idx]
 
-    if dataset_type == 'transmission':
+    if dataset_output_type == 'transmission':
         rehydrated_data = np.exp(-rehydrated_data)
 
     return rehydrated_data

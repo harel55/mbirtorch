@@ -3,7 +3,7 @@ Hyperspectral Dehydration & Rehydration
 ---------------------------------------
 
 This script shows the workflow for exporting, importing, and handling hyperspectral neutron datasets in HDF5 format.
-It showcases both dehydrated and rehydrated formats and the storage efficiency achieved with the dehydrated format.
+It writes and reads both a dehydrated file and a hyperspectral file, and it compares their sizes.
 """
 
 import os
@@ -21,60 +21,37 @@ def main():
     os.makedirs(output_path, exist_ok=True)
 
     # 1. Generate random sample dehydrated data
-    hsnt_dehydrated = [
-        np.random.rand(3, 64, 64, 5).astype(np.float32),  # subspace_data
-        np.random.rand(5, 1000).astype(np.float32),  # subspace_basis
-        "attenuation",  # dataset_type
-    ]
-    print("Dehydrated data shape:", hsnt_dehydrated[0].shape)
+    maps = np.random.rand(3, 64, 64, 5).astype(np.float32)
+    spectra = np.random.rand(5, 1000).astype(np.float32)
+    print("Maps shape:", maps.shape, " spectra shape:", spectra.shape)
 
     # 2. Rehydrate to get full hyperspectral data
-    hsnt_rehydrated = hsnt.rehydrate(hsnt_dehydrated)
-    print("Rehydrated data shape:", hsnt_rehydrated.shape)
+    hyperspectral = hsnt.rehydrate([maps, spectra])
+    print("Rehydrated data shape:", hyperspectral.shape)
 
-    # 3. Create metadata dictionaries
-    metadata_dehydrated = hsnt.create_hsnt_metadata(
-        dataset_name="hsnt_dehydrated",
-        dataset_type="attenuation",
-        dataset_modality="hyperspectral neutron",
-        wavelengths=None,
-        alu_unit="mm",
-        alu_value=1.0,
-        dataset_geometry="parallel",
-        angles=np.array([0, 45, 90]),
-        delta_det_channel=0.5,
-        delta_det_row=0.5,
-        det_channel_offset=0.0,
-        source_detector_dist=1000.0,
-        source_iso_dist=500.0,
-    )
-
-    metadata_rehydrated = metadata_dehydrated.copy()
-    metadata_rehydrated["dataset_name"] = "hsnt_rehydrated"
-
-    # 4. Export datasets into separate files
+    # 3. Export the dehydrated and the hyperspectral data to separate files
     filename_dehydrated = os.path.join(output_path, "hsnt_dehydrated.h5")
-    hsnt.export_hsnt_data_hdf5(filename_dehydrated, hsnt_dehydrated, metadata_dehydrated)
+    hsnt.export_hsnt_data_hdf5(filename_dehydrated, [maps, spectra], name="hsnt_dehydrated")
 
-    filename_rehydrated = os.path.join(output_path, "hsnt_rehydrated.h5")
-    hsnt.export_hsnt_data_hdf5(filename_rehydrated, hsnt_rehydrated, metadata_rehydrated)
+    filename_hyperspectral = os.path.join(output_path, "hsnt_hyperspectral.h5")
+    hsnt.export_hsnt_data_hdf5(filename_hyperspectral, hyperspectral, "attenuation", name="hsnt_hyperspectral")
 
-    # 5. Import datasets back
-    dehydrated_imported, metadata_dehydrated_imported = hsnt.import_hsnt_data_hdf5(filename_dehydrated)
-    rehydrated_imported, metadata_rehydrated_imported = hsnt.import_hsnt_data_hdf5(filename_rehydrated)
+    # 4. Import both files back
+    dehydrated_imported, metadata_dehydrated = hsnt.import_hsnt_data_hdf5(filename_dehydrated)
+    hyperspectral_imported, metadata_hyperspectral = hsnt.import_hsnt_data_hdf5(filename_hyperspectral)
 
-    print("\nImported dehydrated data shape:", dehydrated_imported[0].shape)
-    print("--Imported metadata for dehydrated:", metadata_dehydrated_imported)
-    print("\nImported rehydrated data shape:", rehydrated_imported.shape)
-    print("--Imported metadata for rehydrated:", metadata_rehydrated_imported)
+    print("\nImported maps shape:", dehydrated_imported[0].shape)
+    print("--Imported metadata:", metadata_dehydrated)
+    print("\nImported hyperspectral data shape:", hyperspectral_imported.shape)
+    print("--Imported metadata:", metadata_hyperspectral)
 
-    # 6. Compare file sizes
+    # 5. Compare file sizes
     size_dehydrated = os.path.getsize(filename_dehydrated)
-    size_rehydrated = os.path.getsize(filename_rehydrated)
+    size_hyperspectral = os.path.getsize(filename_hyperspectral)
 
     print("\nDehydrated file size:", size_dehydrated, "bytes")
-    print("Rehydrated file size:", size_rehydrated, "bytes")
-    print("Compression ratio (rehydrated / dehydrated):", np.round(size_rehydrated / size_dehydrated, 3))
+    print("Hyperspectral file size:", size_hyperspectral, "bytes")
+    print("Size ratio (hyperspectral / dehydrated):", np.round(size_hyperspectral / size_dehydrated, 3))
 
 
 if __name__ == "__main__":

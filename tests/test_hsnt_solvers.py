@@ -1,5 +1,5 @@
 """Tests for the NNAL solvers in mbirtorch.hsnt: the maximum-likelihood fit, its stop and compiled kernels, the rank
-estimate, the spectra estimators and streaming.
+estimate and streaming.
 
 Self-contained: small random nonnegative factorizations with mixed pixels stand in for a phantom. Each test runs on
 every device of the repository's ``device`` fixture except MPS, which lacks the float64 the solvers accumulate in.
@@ -15,8 +15,7 @@ from mbirtorch.hsnt import _newton
 from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 from mbirtorch.hsnt._streaming import _stream_factorization
 from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization
-from mbirtorch.hsnt.spectra import (_auto_penalty, _empty_fit_loss, _guard_components, _select_supports,
-                                    _support_selected_spectra, _unconstrained_spectra)
+from mbirtorch.hsnt.rank import estimate_rank
 from hsnt_basis import material_basis
 
 
@@ -192,87 +191,10 @@ def test_compiled_and_eager_solves_agree():
 
 def test_rank_estimate_finds_the_rank_with_pooling(dev):
     """The sphere phantom has rank 3 at full resolution and pooled.  (A rank estimated from attenuation data is run
-    by the dehydrate call in test_hsnt_cli.py.)"""
+    by the dehydrate call in test_hsnt_library.py.)"""
     T = _sphere_problem(dev).reshape(48, 48, -1)
-    n, _, detail = hsnt.estimate_rank(T, "transmission", max_rank=5, device=dev, pool=2)
+    n, _, detail = estimate_rank(T, "transmission", max_rank=5, device=dev, pool=2)
     assert n == 3 and detail["rank_full"] == 3 and detail["pool_block"] == 2 and detail["pooled"]["pixels"] == 24 * 24
-
-
-def test_spectra_estimators(dev):
-    """The unconstrained estimate keeps W >= 0. Support selection holds the coefficients off its supports at zero,
-    and with no penalty keeps at least as many. A component selected almost nowhere reverts to the maximum-likelihood
-    treatment."""
-    T, _, _ = _problem(dev)
-    W, H, _ = _mle(T)
-    Wu, Hu, _ = _unconstrained_spectra(T, W, H)
-    Ws, Hs, support, _ = _support_selected_spectra(T, W, H, dose=10.0)
-    assert Wu.min() >= 0 and Hu.shape == H.shape and Ws.min() >= 0 and Hs.min() >= 0
-    assert bool((Ws[~support] == 0).all())
-    Wz, Hz, support_z, _ = _support_selected_spectra(T, W, H, dose=10.0, penalty=0.0)
-    assert support_z.sum() >= support.sum() and Wz.min() >= 0 and bool((Wz[~support_z] == 0).all())
-    P = 5000
-    guard = torch.rand(P, 3, device=dev) > 0.5
-    guard[:, 1] = False
-    guard[:3, 1] = True
-    W_mle, W0 = torch.rand(P, 3, device=dev), torch.zeros(P, 3, device=dev)
-    with pytest.warns(UserWarning):
-        weak = _guard_components(guard, W_mle, W0)
-    assert weak.tolist() == [False, True, False] and bool(guard[:, 1].all()) and torch.equal(W0[:, 1], W_mle[:, 1])
-
-
-def _enumerated_supports(T, W, H, dose, lam):
-    """The reference search: every subset of the R materials, fitted by a constrained W solve."""
-    R = H.shape[0]
-    prep = _nnal_prep(T)
-    rowwise = _newton._kernels("off")[2]
-    subsets = [list(c) for r in range(1, R + 1) for c in itertools.combinations(range(R), r)]
-    f0 = _empty_fit_loss(T, prep)
-    crit, fits, W_sub = [f0 * dose], [f0], []
-    for S in subsets:
-        Ws = _newton.solve_W(T, H[S].contiguous(), W[:, S].contiguous(), 100, 1e-12)
-        f = rowwise(Ws @ H[S], T, prep, 1, dtype=torch.float64)
-        crit.append(f * dose + lam * len(S))
-        fits.append(f)
-        W_sub.append(Ws)
-    best = torch.stack(crit, 1).argmin(1)
-    W0 = torch.zeros_like(W)
-    for j, S in enumerate(subsets):
-        m = (best == j + 1).nonzero().squeeze(1)
-        W0[m[:, None], torch.tensor(S, device=T.device)[None, :]] = W_sub[j][m]
-    return W0 > 0, torch.stack(fits, 1).gather(1, best[:, None]).squeeze(1)
-
-
-def _dense_rank5(dev, dose=1000.0):
-    """Rank 5 at high dose, every material in every sample pixel; the enumeration's criterion and supports."""
-    T, _, _ = _problem(dev, P=512, K=100, R=5, dose=dose, alpha=1.0, absent=0.0)
-    W, H, _ = _nnal_factorization(T, 5, max_steps=200, rel_tol=1e-8, compile_mode="off")
-    lam = 2 * np.log(T.shape[1])
-    s_enum, f_enum = _enumerated_supports(T, W, H, dose, lam)
-    return T, W, H, (dose * f_enum + lam * s_enum.sum(1)).sum().item(), s_enum
-
-
-def test_branch_and_bound_matches_the_enumeration(dev):
-    """Branch and bound reproduces the exhaustive search's supports on nearly every pixel of the test problem at the
-    same criterion, at rank 3 and on dense rank-5 mixtures. 'auto' is the penalty it names."""
-    T, _, _ = _problem(dev, dose=10.0)
-    W, H, _ = _mle(T)
-    lam = 2 * np.log(T.shape[1])
-    s_enum, f_enum = _enumerated_supports(T, W, H, 10.0, lam)
-    s_bb, W_bb, f_bb = _select_supports(T, W, H, dose=10.0, penalty=2.0)
-
-    def criterion(s, f):
-        return (10.0 * f + lam * s.sum(1)).sum().item()
-
-    assert (s_bb == s_enum).all(1).double().mean() > 0.95
-    assert criterion(s_bb, f_bb) <= criterion(s_enum, f_enum) * (1 + 2e-3)
-    assert W_bb.min() >= 0 and bool((W_bb[~s_bb] == 0).all()) and s_bb.dtype == torch.bool
-    # At rank 5 on dense mixtures, where a third of the pixels keep all five components, it matches as well.
-    T5, W5, H5, crit_enum5, s_enum5 = _dense_rank5(dev)
-    s5, _, f5 = _select_supports(T5, W5, H5, dose=1000.0, penalty=2.0)
-    assert (s5.sum(1) == 5).double().mean() > 0.2 and (s5 == s_enum5).all(1).double().mean() > 0.95
-    assert (1000.0 * f5 + 2 * np.log(T5.shape[1]) * s5.sum(1)).sum().item() <= crit_enum5 * (1 + 1e-4)
-    s_auto = _select_supports(T, W, H, dose=10.0, penalty="auto")[0]
-    assert torch.equal(s_auto, _select_supports(T, W, H, dose=10.0, penalty=_auto_penalty(T.mean(1), 10.0))[0])
 
 
 def test_streaming_matches_the_full_solve(dev):
@@ -283,3 +205,81 @@ def test_streaming_matches_the_full_solve(dev):
     W_chunks, H, passes = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev)
     W = torch.cat([w.to(dev) for w in W_chunks])
     assert passes >= 1 and W.min() >= 0 and _loss(W, H, T) <= 1.01 * _loss(Wm, Hm, T)
+
+
+def _block_problem(dose, seed=0, views=2, side=64, K=200):
+    """This function returns two views of rectangular blocks of three materials on air, as a numpy transmission T and
+    its image shape (views, rows, cols).  Neighboring pixels share their materials, as in a radiograph."""
+    rng = np.random.default_rng(seed)
+    lam = np.linspace(1.5, 4.5, K)
+    H = np.stack([0.3 + 0.08 * lam + 0.25 * (lam > e) * np.exp(-(lam - e)) for e in (2.0, 2.9, 3.6)])
+    D = np.zeros((views, side, side, 3))
+    for v in range(views):
+        for i in range(3):
+            cy, cx = rng.integers(side // 5, 4 * side // 5, 2)
+            h, w = rng.integers(side // 6, side // 3, 2)
+            D[v, max(0, cy - h // 2):cy + h // 2, max(0, cx - w // 2):cx + w // 2, i] = rng.uniform(0.6, 1.4)
+    T = (rng.poisson(dose * np.exp(-D.reshape(-1, 3) @ H)) / dose).astype(np.float32)
+    return T, (views, side, side)
+
+
+def test_a_streamed_fit_at_low_counts_starts_from_averaged_blocks():
+    """At 3 counts per bin a streamed fit of data with image axes starts from spectra fitted to blocks of neighboring
+    pixels averaged to about 64 counts per bin (the averaged start of the PNF estimate), and it ends at a lower loss
+    than from the old start on random single pixels (by 80 nats here).  At 100 counts per bin the blocks are single
+    pixels, so the start and the fit are unchanged."""
+    from mbirtorch.hsnt._fit import _fit
+    kw = dict(device="cpu", mode="stream", chunk_pixels=2048, max_passes=20, warmup_pixels=1024, compile_mode="off")
+    T, shape = _block_problem(3.0)
+    _, _, avg = _fit(T, 3, spatial_shape=shape, **kw)
+    _, _, sub = _fit(T, 3, spatial_shape=shape, start="subset", **kw)
+    assert avg["start"]["kind"] == "averaged" and avg["start"]["block"] > 1
+    assert avg["loss_mle"] < sub["loss_mle"]
+    T, shape = _block_problem(100.0)
+    W, H, rep = _fit(T, 3, spatial_shape=shape, **kw)
+    W1, H1, _ = _fit(T, 3, start="subset", **kw)
+    assert rep["start"]["kind"] == "subset" and rep["start"]["block"] == 1
+    assert np.array_equal(H, H1) and np.array_equal(W, W1)
+
+
+def test_the_averaged_start_pools_only_inside_the_sample_mask_and_a_tensor_on_its_device():
+    """With a sample mask, the averaged start fits only the blocks that lie wholly inside the mask.  A tensor is
+    pooled on its own device to the same averages as the numpy path."""
+    from mbirtorch.hsnt._fit import _averaged_start, _pooled
+    from mbirtorch.hsnt.rank import _pool_pixels
+    T, shape = _block_problem(3.0)
+    assert np.allclose(_pooled(torch.from_numpy(T), shape, 5), _pool_pixels(T, shape, 5), atol=1e-6)
+    mask = np.zeros(shape, bool)
+    mask[:, 10:40, 10:40] = True
+    chunks = [torch.from_numpy(T[mask.reshape(-1)])]
+    _, info = _averaged_start(chunks, T, shape, 3, 1024, "cpu", "off", [chunks[0].shape[0]], pool_mask=mask.reshape(-1))
+    b = info["block"]
+    whole = _pool_pixels(mask.reshape(-1, 1).astype(np.float32), shape, b)[:, 0]
+    assert info["kind"] == "averaged" and b > 1 and info["pixels"] == int((whole == 1).sum()) < whole.size
+
+
+def test_open_beam_weights(dev):
+    """Weights of 1 change nothing.  Per-bin weights give the derivatives of the weighted loss, and a weighted fit of
+    counts drawn with a varying open beam has a lower Poisson negative log-likelihood than the unweighted fit."""
+    T, _, _ = _problem(dev, P=1024, K=120, dose=20.0, seed=3, dtype=torch.float64)
+    ones = torch.ones(1, T.shape[1], dtype=T.dtype, device=dev)
+    W, H, _ = _nnal_factorization(T, 3, compile_mode="off")
+    W1, H1, _ = _nnal_factorization(T, 3, compile_mode="off", weights=ones)
+    assert torch.equal(W, W1) and torch.equal(H, H1)
+
+    # The derivatives of the weighted loss match autograd.
+    w = torch.linspace(0.3, 1.7, T.shape[1], dtype=T.dtype, device=dev)[None, :]
+    X = (W @ H).detach().requires_grad_(True)
+    stable_nnal(X, T, _nnal_prep(T, w)).backward()
+    G, _ = stable_nnal_derivatives(X.detach(), T, _nnal_prep(T, w))
+    assert torch.allclose(X.grad, G, rtol=1e-10, atol=1e-12)
+
+    # Counts drawn with the open beam 20 * w: the weighted fit is the better fit of their likelihood.
+    _, Wt, Ht = _problem(dev, P=1024, K=120, dose=20.0, seed=3, dtype=torch.float64, noisy=False)
+    g = torch.Generator(device=dev).manual_seed(5)
+    I0 = 20.0 * w
+    Tw = torch.poisson(I0 * torch.exp(-(Wt @ Ht)), generator=g) / I0
+    nll = lambda W_, H_: float((I0 * (torch.exp(-(W_ @ H_)) + Tw * (W_ @ H_))).sum())
+    Wu, Hu, _ = _nnal_factorization(Tw, 3, compile_mode="off")
+    Ww, Hw, _ = _nnal_factorization(Tw, 3, compile_mode="off", weights=w)
+    assert nll(Ww, Hw) < nll(Wu, Hu)
