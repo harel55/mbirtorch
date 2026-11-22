@@ -133,8 +133,12 @@ def _per_bin(phi_pairs, ok, K, phi):
 def measure_noise(T, d, shape, excluded=None, tiles=(1, 1)):
     """The dispersion and the inflation of the transmission T (rays, bins) at dose d (bins,), measured on its air
     rays (air_rays; shape and excluded as there). Use it before a fit: the dose divided by the dispersion, and the
-    inflation for the contamination thresholds. Returns noise_statistics' dict."""
-    return noise_statistics(T, d, air_rays(T, shape, excluded, tiles), shape)
+    inflation for the contamination thresholds. Returns noise_statistics' dict, with each image's number of air rays
+    (air_rays_per_view; audit item 7: an image without air rays is normalized by its brightest sample rays)."""
+    air = air_rays(T, shape, excluded, tiles)
+    out = noise_statistics(T, d, air, shape)
+    out['air_rays_per_view'] = np.asarray(air, bool).reshape(shape[0], -1).sum(1).tolist()
+    return out
 
 
 def view_levels(T, air, shape, tiles=(1, 1)):
