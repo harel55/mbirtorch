@@ -441,6 +441,24 @@ class Hybrid2:
         lb[self.kap_sl[0]:self.kap_sl[1]] = 0.0
         self.lb = torch.as_tensor(lb, **f64); self.ub = torch.as_tensor(ub, **f64)
 
+    def set_dec(self, r, alpha, beta):
+        """Each reflection of material r sees its own lattice strain (user 2026-11-22: elastic anisotropy): the edge e
+        moves by alpha_e eps + beta_e tau, with eps the strain along the beam and tau the strain's trace, from the
+        diffraction elastic constants (alpha 1, beta 0 for an elastically isotropic material). The fit then carries each
+        ray's mean trace in eps's columns R..2R (TomoFit.rays)."""
+        self.mats[r]["alpha"] = torch.as_tensor(alpha, dtype=torch.float64, device=self.dev)
+        self.mats[r]["beta"] = torch.as_tensor(beta, dtype=torch.float64, device=self.dev)
+
+    def _lattice_strain(self, r, eps):
+        """Material r's strain per edge (Pc, n_e or 1) from eps (Pc, R), or (Pc, 2R) with each ray's mean trace in
+        columns R..2R; and each edge's factor on the strain's spread (alpha, or 1)."""
+        m = self.mats[r]; e_r = eps[:, r:r + 1]
+        if "alpha" not in m:
+            return e_r, 1.0
+        al, be = m["alpha"].to(eps.dtype), m["beta"].to(eps.dtype)
+        tau = eps[:, self.R + r:self.R + r + 1] if eps.shape[1] == 2 * self.R else torch.zeros_like(e_r)
+        return al[None, :] * e_r + be[None, :] * tau, al[None, :]
+
     def set_tabulated(self, r, nonbragg=None):
         """Use a tabulated non-Bragg cross-section (fine grid, Kf) for material r (user 2026-11-22: the physical
         non-Bragg part): its smooth part becomes c0 x the table's shape + c1 x lambda / lambda_ref (absorption beyond the
@@ -477,8 +495,9 @@ class Hybrid2:
                 out.append(x * x * ((step * shape) @ h) + smooth)
             else:
                 dt = self.dt
-                off, ee = self._edge_offsets(e, eps[:, r:r + 1])
-                step = edge_step(off, self.hf, None if sd is None else (ee * sd[:, r:r + 1].to(dt))[:, :, None])
+                e_r, af = self._lattice_strain(r, eps)
+                off, ee = self._edge_offsets(e, e_r)
+                step = edge_step(off, self.hf, None if sd is None else (ee * af * sd[:, r:r + 1].to(dt))[:, :, None])
                 shape = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]       # 1 + t (lam - ee) / ee
                 shape = shape * self.linked_shape(self.lamf.to(dt)[None, None, :], ee[:, :, None], h.to(dt)[None, :, None],
                                                   m["mult"].to(dt)[None, :, None], xp).to(dt)
@@ -497,8 +516,9 @@ class Hybrid2:
             dt = self.dt
             a = g[sl["a"]]; t = g[sl["t"][0]:sl["t"][1]].to(dt)
             x = (self.lamf / self.lam_ref).to(dt)
-            off, ee = self._edge_offsets(2.0 * a / torch.sqrt(m["ns"]), eps[:, r:r + 1])
-            step = edge_step(off, self.hf, None if sd is None else (ee * sd[:, r:r + 1].to(dt))[:, :, None])
+            e_r, af = self._lattice_strain(r, eps)
+            off, ee = self._edge_offsets(2.0 * a / torch.sqrt(m["ns"]), e_r)
+            step = edge_step(off, self.hf, None if sd is None else (ee * af * sd[:, r:r + 1].to(dt))[:, :, None])
             shape = 1 - t[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
             return x * x * step * shape
 
@@ -1121,22 +1141,32 @@ class FitB:
         return G, Fw, C, gg + gp, Fg + Hp
 
     def ray_jacobian(self, sl, cache):
-        """d m / d (W, U) of the rays sl, (Pc, K, 2R), and the mean m (Pc, K)."""
+        """d m / d (W, U) of the rays sl, (Pc, K, 2R), and the mean m (Pc, K). With each ray's mean trace in eps's columns
+        R..2R (elastic anisotropy, Hybrid2.set_dec): d m / d (W, U, U_tr), (Pc, K, 3R), U_tr the projected trace."""
         M = self.M; R = M.R
         T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
         mus = M.spectra(self.g, eps, self._views(sl), self._texture(self.g), self._sd(sl)).to(M.dt)  # (Pc, R, Kf)
-        cols_w, cols_u = [], []
+        cols_w, cols_u, cols_t = [], [], []
+        packed = eps.shape[1] == 2 * R                                                # each ray's mean trace in R..2R
+        spec = lambda e_: M.spectra(self.g, e_, self._views(sl), self._texture(self.g), self._sd(sl))
         for r in range(R):
             tg = torch.zeros_like(eps); tg[:, r] = 1
-            _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, self._views(sl), self._texture(self.g), self._sd(sl)), (eps.double(),), (tg.double(),))
+            _, dmu = torch.func.jvp(spec, (eps.double(),), (tg.double(),))
             dmu = dmu[:, r].to(M.dt)                                                  # d mu_r / d eps, (Pc, Kf)
-            # X = sum_r W_r mu_r(U_r / W_r): dX/dU_r = mu_r', dX/dW_r (U fixed) = mu_r - eps_r mu_r'
-            cols_w.append(-s * M.apply_band(E * (mus[:, r] - eps[:, r:r + 1] * dmu), Rb)
-                          - torch.einsum('jk,pj,j->pk', self.f, beta, kap[:, r]))
+            # X = sum_r W_r mu_r(U_r / W_r, Ut_r / W_r): dX/dU_r = mu_r', dX/dUt_r = mu_r^t',
+            # dX/dW_r (U, Ut fixed) = mu_r - eps_r mu_r' - tau_r mu_r^t'
+            colw = mus[:, r] - eps[:, r:r + 1] * dmu
+            if packed:
+                tt = torch.zeros_like(eps); tt[:, R + r] = 1
+                _, dmt = torch.func.jvp(spec, (eps.double(),), (tt.double(),))
+                dmt = dmt[:, r].to(M.dt)
+                colw = colw - eps[:, R + r:R + r + 1] * dmt
+                cols_t.append(-s * M.apply_band(E * dmt, Rb))
+            cols_w.append(-s * M.apply_band(E * colw, Rb) - torch.einsum('jk,pj,j->pk', self.f, beta, kap[:, r]))
             cols_u.append(-s * M.apply_band(E * dmu, Rb))
-        return torch.stack(cols_w + cols_u, 2), m
+        return torch.stack(cols_w + cols_u + cols_t, 2), m
 
     def texture_curve(self, sl, r, eps=None):
         """Material r's derivative of the spectrum with respect to a ray's mean texture term A = sum_j Y_j cbar_j,

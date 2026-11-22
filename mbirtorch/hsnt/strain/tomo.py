@@ -600,17 +600,29 @@ class TomoFit:
         self.sync()
 
     # ---- projections
-    def _fwd(self, V, VE):
-        """W (P, R) and the view-weighted U (P, R) from a density-like and a (density x strain)-like volume."""
+    def _fwd(self, V, VE, trace=False):
+        """W (P, R) and the view-weighted U (P, R) from a density-like and a (density x strain)-like volume; with
+        trace=True also the projected trace Ut (P, R) (elastic anisotropy: each reflection's strain depends on it)."""
         n, R, C = V.shape[0], self.R, self.C
         out = self.proj.fwd(torch.cat([V, VE.reshape(n, n, n, R * C)], -1))
-        return out[:, :R], (out[:, R:].reshape(-1, R, C) * self.w_ray[:, None, :]).sum(-1)
+        S = out[:, R:].reshape(-1, R, C)
+        U = (S * self.w_ray[:, None, :]).sum(-1)
+        return (out[:, :R], U, S[..., :3].sum(-1)) if trace else (out[:, :R], U)
 
-    def _back(self, gW, gU):
-        """The adjoint of _fwd: volumes (n, n, n, R) and (n, n, n, R, C)."""
+    def _back(self, gW, gU, gT=None):
+        """The adjoint of _fwd: volumes (n, n, n, R) and (n, n, n, R, C); gT the gradient with respect to the
+        projected trace, or None."""
         P, R, C = gW.shape[0], self.R, self.C
-        b = self.proj.back(torch.cat([gW, (gU[:, :, None] * self.w_ray[:, None, :]).reshape(P, R * C)], 1))
+        gS = gU[:, :, None] * self.w_ray[:, None, :]
+        if gT is not None:
+            gS = gS + gT[:, :, None] * torch.as_tensor([1.0] * 3 + [0.0] * (C - 3), device=gT.device, dtype=gT.dtype)
+        b = self.proj.back(torch.cat([gW, gS.reshape(P, R * C)], 1))
         return b[..., :R], b[..., R:].reshape(*b.shape[:3], R, C)
+
+    @property
+    def anisotropic(self):
+        """True when a material's reflections see their own lattice strains (model.Hybrid2.set_dec)."""
+        return self.C >= 3 and any("alpha" in m for m in self.fit.M.mats)
 
     def set_texture_basis(self, k):
         """A smooth texture field (shape_model 'cubic4', Hybrid2 texture_basis = k^3): each coefficient is a tensor
@@ -748,11 +760,18 @@ class TomoFit:
             M2 = M2.reshape(-1, R, len(iu))
             w = self.w_ray
             ww = torch.stack([(1.0 if c == d else 2.0) * w[:, c] * w[:, d] for c, d in iu], -1)  # (P, 21)
-            W, eps = self.fit.W, self.fit.eps
+            W, eps = self.fit.W, self.fit.eps[:, :R]
             m2 = torch.where(W > EPS_W_MIN, (M2 * ww[:, None, :]).sum(-1) / W.clamp_min(EPS_W_MIN), torch.zeros_like(W))
             self.fit.eps_sd = (m2 - eps ** 2).clamp_min(0).sqrt()
 
     def rays(self, V, E):
+        """Each ray's projected density W (P, R) and mean strain along the beam eps (P, R); with elastic anisotropy eps
+        (P, 2R) also carries each ray's mean strain trace in columns R..2R."""
+        if self.anisotropic:
+            W, U, Ut = self._fwd(V, V[..., None] * E, trace=True)
+            U = torch.cat([U, Ut], 1); W2 = torch.cat([W, W], 1)
+            eps = torch.where(W2 > EPS_W_MIN, U / W2.clamp_min(EPS_W_MIN), torch.zeros_like(U))
+            return W.clamp_min(0), eps
         W, U = self._fwd(V, V[..., None] * E)
         eps = torch.where(W > EPS_W_MIN, U / W.clamp_min(EPS_W_MIN), torch.zeros_like(U))
         return W.clamp_min(0), eps
@@ -1227,19 +1246,22 @@ class TomoFit:
         self.sync()
         cache = fit._state(fit.g)
         P = fit.T.shape[0]
-        G = torch.zeros(P, 2 * R, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, 2 * R, 2 * R, device=fit.T.device, dtype=torch.float64)
+        nc = 3 * R if self.anisotropic else 2 * R                                   # (W, U) and, anisotropic, U_tr
+        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
         devs = []
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
         fit.remember_data_loss(all_sum_float(sum(devs), fit.T.device))          # the deviance at this synced state
         G, F = G.float(), F.float()
+        Ffull, F = F, F[:, :2 * R, :2 * R].contiguous()            # the preconditioners use the (W, U) part
+        gT = G[:, 2 * R:] if self.anisotropic else None
         V, E = self.V, self.E
         mask = self._eq_mask() if self.elastic is not None else None
         eq = (lambda X: self.eq_w * torch.func.vjp(lambda Y: self._eq_residual(Y, mask), X)[1](self._eq_residual(X, mask))[0]) \
             if self.elastic is not None else (lambda X: torch.zeros_like(X))
-        bGW, bGU = self._back(G[:, :R], G[:, R:])
+        bGW, bGU = self._back(G[:, :R], G[:, R:2 * R], gT)
         self._wts = wts = self._dens_wts(V)
         gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         swts = self._strain_wts(E); cwts = self._strain_wts(E, curvature=True)          # gradient; curvature
@@ -1262,9 +1284,9 @@ class TomoFit:
         self.last_diagonal = (dV_, dE_)                                            # for AndersonMixing's scale
 
         def H_data(xV, xE):                                                        # the data's curvature alone
-            zW, zU = self._fwd(xV, E * xV[..., None] + V[..., None] * xE)
-            y = torch.einsum('pab,pb->pa', F, torch.cat([zW, zU], 1))
-            bW, bU = self._back(y[:, :R], y[:, R:])
+            z = self._fwd(xV, E * xV[..., None] + V[..., None] * xE, trace=self.anisotropic)
+            y = torch.einsum('pab,pb->pa', Ffull, torch.cat(z, 1))
+            bW, bU = self._back(y[:, :R], y[:, R:2 * R], y[:, 2 * R:] if self.anisotropic else None)
             return bW + (E * bU).sum(-1), V[..., None] * bU
 
         def H_full(xV, xE):
@@ -1600,11 +1622,14 @@ class TomoFit:
         self.sync()
         cache = fit._state(fit.g)
         P = fit.T.shape[0]
-        G = torch.zeros(P, 2 * R, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, 2 * R, 2 * R, device=fit.T.device, dtype=torch.float64)
+        nc = 3 * R if self.anisotropic else 2 * R
+        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache)
+        # the mounts move the (W, U) projections; the trace's share (anisotropy, small) is left to the line search
+        G, F = G[:, :2 * R].contiguous(), F[:, :2 * R, :2 * R].contiguous()
         n = self.V.shape[0]
         vols = torch.cat([self.V, (self.V[..., None] * self.E).reshape(n, n, n, R * C)], -1)
         bounds = np.cumsum([0] + proj.counts)
@@ -1673,11 +1698,14 @@ class TomoFit:
         self.sync()
         cache = fit._state(fit.g)
         P = fit.T.shape[0]
-        G = torch.zeros(P, 2 * R, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, 2 * R, 2 * R, device=fit.T.device, dtype=torch.float64)
+        nc = 3 * R if self.anisotropic else 2 * R
+        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache)
+        # the mounts move the (W, U) projections; the trace's share (anisotropy, small) is left to the line search
+        G, F = G[:, :2 * R].contiguous(), F[:, :2 * R, :2 * R].contiguous()
         n = self.V.shape[0]
         vols = torch.cat([self.V, (self.V[..., None] * self.E).reshape(n, n, n, R * C)], -1)
         bounds = np.cumsum([0] + proj.counts)
@@ -1804,6 +1832,8 @@ class TomoFit:
         decrease). cross='ray' keeps the cross information per ray (memory ~ rays x 2R x n_global) and applies it on
         the projections the volume block already makes; cross='volume' back-projects it into one volume pair per global
         parameter (memory ~ n_global x voxels x R (1 + C)), the first implementation, kept for comparison."""
+        if self.anisotropic:
+            raise NotImplementedError('joint_step: its cross terms use (W, U) only, not the trace of elastic anisotropy')
         fit, R, C = self.fit, self.R, self.C
         M = fit.M
         self.sync()
@@ -1925,7 +1955,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
            init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
-           tables=None, height_sd=HEIGHT_PRIOR_SD):
+           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1966,7 +1996,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     None or a dict of tabulated cross-sections (e.g. NCrystal): 'ns' and 'jumps' (each reflection family's edge jump),
     'wl' and 'nonbragg' (the non-Bragg cross-section). Its smooth part then follows the table's non-Bragg shape plus an
     absorption term (model.Hybrid2.set_tabulated), and its edge heights stay near the table's times one scale, with
-    relative standard deviation height_sd (FitB.height_prior)."""
+    relative standard deviation height_sd (FitB.height_prior). dec (user 2026-11-22: elastic anisotropy): per material
+    None or (alpha, beta) per reflection, each reflection's lattice strain alpha eps + beta tr(strain) from the
+    diffraction elastic constants (Hybrid2.set_dec); it needs the strain-tensor weights."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -2034,6 +2066,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     if kernel_values is not None:                       # a calibrated kernel, held fixed
         kv = torch.as_tensor(np.asarray(kernel_values, dtype=np.float64), device=device)
         g[M.res_sl[0]:M.res_sl[1]] = kv; M.lb[M.res_sl[0]:M.res_sl[1]] = kv; M.ub[M.res_sl[0]:M.res_sl[1]] = kv
+    for r, dc in enumerate(dec or []):
+        if dc is not None:
+            M.set_dec(r, *dc)
     h_tab = {}
     for r, tb in enumerate(tables or []):
         if tb is None:

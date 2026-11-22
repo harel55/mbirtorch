@@ -1003,3 +1003,50 @@ def test_tabulated_spectrum():
     fit.height_prior = dict(targets={0: t}, sd=0.05)
     g3 = g2.clone(); g3[sl['h'][0]] *= 1.1
     assert float(fit.spline_penalty(g3)) - float(fit.spline_penalty(g2)) > 1.0
+
+
+def test_elastic_anisotropy():
+    """Each reflection's own lattice strain (Hybrid2.set_dec): the ray Jacobian's columns for the mean strain and the
+    mean trace equal automatic derivatives of the model, and a volume step on data from an anisotropic model with
+    three series lowers the loss."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    from mbirtorch.hsnt.strain.geometry import series_weights
+    fit = _small_fit_cubic4()
+    M = fit.M; ne = len(M.mats[0]['ns'])
+    al = torch.linspace(0.8, 1.3, ne, dtype=torch.float64); be = torch.linspace(-0.1, 0.06, ne, dtype=torch.float64)
+    M.set_dec(0, al, be)
+    P = fit.T.shape[0]; gen = torch.Generator().manual_seed(5)
+    fit.eps = torch.cat([fit.eps, 2e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)], 1)   # mean traces
+    sl = slice(0, 16); cache = fit._state(fit.g)
+    Jac, m = fit.ray_jacobian(sl, cache)
+    W, eps = fit.W[sl], fit.eps[sl]
+    U, Ut = W * eps[:, :1], W * eps[:, 1:]
+    f = lambda W_, U_, Ut_: fit.mean(sl, W=W_, eps=torch.cat([U_ / W_, Ut_ / W_], 1), cache=cache)[0]
+    for k, tang in enumerate(((1, 0, 0), (0, 1, 0), (0, 0, 1))):
+        t = [torch.full_like(W, float(v)) for v in tang]
+        _, dm = torch.func.jvp(f, (W, U, Ut), tuple(t))
+        assert torch.allclose(Jac[..., k], dm, rtol=1e-6, atol=1e-8 * float(dm.abs().max()))
+    # a volume step with three series and an anisotropic model
+    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    dev = pr.fwd(torch.zeros(N, N, N, 2)).device
+    wts = series_weights([(m_[0] if isinstance(m_[0], str) else tuple(m_[0][:3]), a_) for m_, a_ in [(mm, mm[1]) for mm in MOUNTS]])
+    lam = np.linspace(2.0, 4.4, 80)
+    M2 = Hybrid2(lam, np.full_like(lam, 200.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
+                 device=dev, two_scale=True)
+    ne2 = len(M2.mats[0]['ns']); M2.set_dec(0, torch.linspace(0.8, 1.3, ne2), torch.linspace(-0.1, 0.06, ne2))
+    g = torch.zeros(M2.n_global, dtype=torch.float64, device=dev); s2 = M2.slices[0]
+    g[s2['a']] = 2.8665; g[s2['h'][0]:s2['h'][1]] = 0.3; g[s2['c'][0]] = 0.2
+    Pn = sum(pr.counts); kw = dict(device=dev)
+    V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
+    E_true = 1.5e-3 * torch.randn(N, N, N, 1, 6, generator=torch.Generator().manual_seed(6)).to(dev) * (V[..., None] > 0)
+    fit2 = FitB(M2, torch.ones(Pn, M2.K, **kw), g, torch.ones(Pn, 1, **kw), torch.zeros(1, M2.K, **kw),
+                eps=torch.zeros(Pn, 1, **kw), chunk=512)
+    tf = TomoFit(fit2, pr, V, E_true.clone(), weights=wts)
+    assert tf.anisotropic
+    tf.sync()
+    with torch.no_grad():
+        fit2.T = torch.cat([fit2.mean(s_)[0] for s_ in fit2.chunks()])                # noiseless data at the truth
+    tf.E = torch.zeros_like(E_true); tf.sync()
+    l0 = tf.data_loss(); tf.volume_step(); l1 = tf.data_loss()
+    assert l1 < l0
