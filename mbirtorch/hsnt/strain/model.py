@@ -158,6 +158,23 @@ def edge_step(off, hf, width=None):
     return sharp.index_put((near,), (G(o) - G(o - hf)) / hf)
 
 
+def edge_step_slopes(off, hf, width=None):
+    """The derivatives of edge_step(off, hf, width) with respect to off and to width, as edge_step evaluates it (the
+    sharp step's slope 1 / hf inside the bin, the spread step's within EDGE_SPREAD_REACH widths of the edge)."""
+    d_off = ((off > 0) & (off < hf)).to(off.dtype) / hf
+    d_w = torch.zeros_like(off)
+    if width is None:
+        return d_off, d_w
+    w = torch.as_tensor(width, dtype=off.dtype, device=off.device).clamp_min(1e-12 * hf).expand_as(off)
+    near = (w > EDGE_SPREAD_MIN * hf) & (off > -EDGE_SPREAD_REACH * w) & (off < hf + EDGE_SPREAD_REACH * w)
+    o, ww = off[near], w[near]
+    Phi = lambda u: 0.5 * torch.erfc(-u / (ww * math.sqrt(2)))
+    phi = lambda u: torch.exp(-0.5 * (u / ww) ** 2) / math.sqrt(2 * math.pi)
+    d_off = d_off.index_put((near,), (Phi(o) - Phi(o - hf)) / hf)
+    d_w = d_w.index_put((near,), (phi(o) - phi(o - hf)) / hf)
+    return d_off, d_w
+
+
 def deviance_terms(m, T, d, open_beam_obs=None):
     """Each ray and bin's share of the negative log-likelihood (up to a constant) of the transmission T at the model m,
     with d the counts at T = 1. Without open_beam_obs the counts are Poisson. With open_beam_obs (n, the open beam's
@@ -520,14 +537,15 @@ class Hybrid2:
                 out.append((x * x).to(dt) * torch.einsum('pek,e->pk', step * shape, h.to(dt)) + smooth.to(dt))
         return torch.stack(out, 0) if eps is None else torch.stack(out, 1)
 
-    def _ray_spectrum(self, g, r, eps, views, sd, x, smooth):
+    def _ray_spectrum(self, g, r, eps, views, sd, x, smooth, with_da=False):
         """Material r's spectra (Pc, Kf) under per-ray dilations eps, equal to spectra's per-edge sum but without
         per-edge arrays over all fine bins. Each edge has a window: the bins its rays' edges reach (their spread over the
         rays, plus EDGE_SPREAD_REACH widths of the strain's spread). Below the window every ray's edge is fully present,
         and there the sum over edges is a few matrix products (the slope is linear in 1 / edge and the cubic4 factor in
         the ray's texture term). Within the window the edges are summed bin by bin. Returns None, so that spectra sums
         every bin, for a shape model linked to the heights (extinction, texture) or when a ray's cubic4 factor could
-        reach CUBIC4_FLOOR."""
+        reach CUBIC4_FLOOR. with_da=True also returns the spectra's derivative with respect to the lattice parameter a
+        (Pc, Kf), in closed form: every edge moves in proportion to a."""
         if self.shape_model in ("extinction", "texture"):
             return None
         m, sl = self.mats[r], self.slices[r]; dt = self.dt
@@ -578,14 +596,58 @@ class Hybrid2:
         # the windows, bin by bin as in spectra
         lw = lam[idx]                                                                    # (n_e, wb)
         off = (e[:, None] - lw + 0.5 * self.hf).to(dt)[None] + (e[None, :] * e_r.double()).to(dt)[:, :, None]
-        step = edge_step(off, self.hf, None if width is None else width[:, :, None])
-        shape = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
+        w3 = None if width is None else width[:, :, None]
+        step = edge_step(off, self.hf, w3)
+        shape0 = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
+        shape = shape0
         if A is not None:
-            fac = 1 + (m["k4"][:, None] * p4.gather(1, idx)).to(dt)[None] * A.to(dt)[:, None, None]
-            shape = shape * fac.clamp_min(CUBIC4_FLOOR)
+            fac_raw = 1 + (m["k4"][:, None] * p4.gather(1, idx)).to(dt)[None] * A.to(dt)[:, None, None]
+            fac = fac_raw.clamp_min(CUBIC4_FLOOR)
+            shape = shape0 * fac
         win = (h.to(dt)[None, :, None] * step * shape) * valid.to(dt)[None]
         out = out.index_add(1, idx.reshape(-1), win.reshape(win.shape[0], -1))
-        return (x * x).to(dt)[None, :] * out + smooth.to(dt)[None, :]
+        mu = (x * x).to(dt)[None, :] * out + smooth.to(dt)[None, :]
+        if not with_da:
+            return mu
+        with torch.no_grad():
+            a = g[sl["a"]].detach()
+            qa = -q.detach() / a.to(dt)                                                  # d(1 / edge) / da
+            dout = qa @ Bq.detach().to(dt)
+            hd, td = h.detach(), t.detach()
+            if A is not None:
+                k4 = m["k4"]; Ad = A.detach().to(dt)
+                inside = (self.lamf[None, :] / e.detach()[:, None]) < 1
+                dp4 = (140 * st ** 3 - 60 * st) / 8 * (-st / a) * inside                     # d P4(lambda / e) / da
+                dC1 = ((1 - td) * hd * k4) @ (below * dp4)
+                dBqA = ((td * hd * k4)[:, None] * lam[None, :] * below * dp4)
+                dout = dout + Ad[:, None] * dC1.to(dt)[None, :] + (Ad[:, None] * qa) @ BqA.detach().to(dt) \
+                    + (Ad[:, None] * q.detach()) @ dBqA.to(dt)
+            s_off, s_w = edge_step_slopes(off.detach(), self.hf, None if w3 is None else w3.detach())
+            ad = a.to(dt)
+            dstep = s_off * (ee.detach() / ad)[:, :, None]                                   # the edge moves by edge / a
+            if w3 is not None:
+                dstep = dstep + s_w * (w3.detach() / ad)                                     # and its spread with it
+            dshape = td.to(dt)[None, :, None] * lw.to(dt)[None] * qa[:, :, None]             # t lambda d(1 / edge) / da
+            dwin = dstep * shape0.detach() + step.detach() * dshape
+            if A is not None:
+                dp4w = dp4.gather(1, idx).to(dt)
+                dfac = (m["k4"][:, None].to(dt) * dp4w)[None] * Ad[:, None, None] * (fac_raw.detach() > CUBIC4_FLOOR).to(dt)
+                dwin = dwin * fac.detach() + step.detach() * shape0.detach() * dfac
+            dwin = (hd.to(dt)[None, :, None] * dwin) * valid.to(dt)[None]
+            dout = dout.index_add(1, idx.reshape(-1), dwin.reshape(dwin.shape[0], -1))
+        return mu, (x * x).to(dt)[None, :] * dout
+
+    def spectra_da(self, g, eps, r, views=None, sd=None):
+        """Material r's per-ray spectra and their derivative with respect to its lattice parameter a, both (Pc, Kf), in
+        closed form; None when the windowed sum does not apply (see _ray_spectrum)."""
+        if self.dense_spectra:
+            return None
+        sl = self.slices[r]
+        x = self.lamf / self.lam_ref
+        c = g[sl["c"][0]:sl["c"][1]]; s_ = g[sl["s"][0]:sl["s"][1]]
+        nbs = self.nb_shape[r] if getattr(self, "nb_shape", None) is not None and self.nb_shape[r] is not None else 1.0
+        smooth = c[0] * nbs + c[1] * x + self.B.double() @ s_
+        return self._ray_spectrum(g, r, eps, views, sd, x, smooth, with_da=True)
 
     def edge_terms(self, g, eps, r, sd=None):
         """Material r's edge terms under per-pixel dilations eps (Pc, R): (Pc, n_edges, Kf) in the model's dtype, each the
@@ -1485,6 +1547,11 @@ class FitB:
                     if r not in terms:
                         terms[r] = M.edge_terms(self.g, eps, r, self._sd(sl))
                     dm = terms[r][:, i - slr["h"][0]]
+                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                elif eps is not None and i == slr["a"] and \
+                        (mu_da := M.spectra_da(self.g, eps, r, self._views(sl), self._sd(sl))) is not None:
+                    # the lattice parameter: its closed-form derivative (every edge moves in proportion to a)
+                    dm = mu_da[1]
                     out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
                 elif eps is not None and i < M.slices[r]["c"][0]:
                     # an edge parameter (a, h, t, x) under per-pixel strain: its derivative moves with each pixel's

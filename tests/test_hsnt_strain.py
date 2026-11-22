@@ -890,6 +890,14 @@ def test_ray_spectrum_matches_dense(case, spread):
     tang = torch.randn_like(eps)
     jv = [torch.func.jvp(lambda ee: run(dense, g, ee), (eps,), (tang,))[1] for dense in (False, True)]
     assert torch.allclose(jv[0], jv[1], rtol=0, atol=1e-8 * float(jv[1].abs().max()))
+    # the closed-form derivative with respect to the lattice parameter equals forward-mode differentiation of the dense sum
+    tg = torch.zeros_like(g); tg[sl['a']] = 1.0
+    M.dense_spectra = True
+    _, d_ref = torch.func.jvp(lambda gg: M.spectra(gg, eps, views, sd=sd)[:, 0], (g,), (tg,))
+    M.dense_spectra = False
+    mu_da = M.spectra_da(g, eps, 0, views, sd)
+    assert torch.allclose(mu_da[0], b[:, 0], rtol=0, atol=1e-10 * float(b.abs().max()))
+    assert torch.allclose(mu_da[1], d_ref, rtol=0, atol=1e-8 * float(d_ref.abs().max()))
     if case == 'views':                      # given texture factors (a phantom's true textures) are used as given
         tex = [1 + 0.3 * torch.rand(8, ne, M.Kf, generator=gen, dtype=torch.float64)]
         M.dense_spectra = False; a = M.spectra(g, eps, views, tex=tex, sd=sd)
