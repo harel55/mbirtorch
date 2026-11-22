@@ -1997,8 +1997,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     'wl' and 'nonbragg' (the non-Bragg cross-section). Its smooth part then follows the table's non-Bragg shape plus an
     absorption term (model.Hybrid2.set_tabulated), and its edge heights stay near the table's times one scale, with
     relative standard deviation height_sd (FitB.height_prior). dec (user 2026-11-22: elastic anisotropy): per material
-    None or (alpha, beta) per reflection, each reflection's lattice strain alpha eps + beta tr(strain) from the
-    diffraction elastic constants (Hybrid2.set_dec); it needs the strain-tensor weights."""
+    None, (alpha, beta) per reflection, or a function of the reflections' h^2 + k^2 + l^2 returning them; each
+    reflection's lattice strain alpha eps + beta tr(strain) from the diffraction elastic constants (Hybrid2.set_dec);
+    it needs the strain-tensor weights."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -2067,6 +2068,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         kv = torch.as_tensor(np.asarray(kernel_values, dtype=np.float64), device=device)
         g[M.res_sl[0]:M.res_sl[1]] = kv; M.lb[M.res_sl[0]:M.res_sl[1]] = kv; M.ub[M.res_sl[0]:M.res_sl[1]] = kv
     for r, dc in enumerate(dec or []):
+        if callable(dc):                                # a function of the material's reflections (h^2 + k^2 + l^2)
+            dc = dc(M.mats[r]['ns'].cpu().numpy())
         if dc is not None:
             M.set_dec(r, *dc)
     h_tab = {}
