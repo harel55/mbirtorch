@@ -933,6 +933,35 @@ def test_ray_spectrum_matches_dense(case, spread):
     M.dense_spectra = False
 
 
+@pytest.mark.parametrize('known', [None, 0, 1])
+def test_warmup_searches_unknown_materials(known):
+    """warmup finds the lattice type and parameter of every material nothing is given about (here fcc Ni and bcc Fe),
+    and, when one material is given by its spectrum, finds the other one instead of the given one again."""
+    from mbirtorch.hsnt.strain.tomo import Projector, warmup
+    from mbirtorch.hsnt.strain.bragg import BraggSpectrum
+    torch.manual_seed(0)
+    n = 12; th = np.linspace(0, np.pi, 9, endpoint=False)
+    proj = Projector(n, th, 2, 0.0, False)
+    lam = np.linspace(1.5, 5.0, 500)
+    mats = [('fcc', 3.524), ('bcc', 2.8665)]
+    mu = []
+    for lt, a in mats:
+        m = BraggSpectrum(lam, lattice=lt, a_range=(a * 0.999, a * 1.001), resolution=(0.002, 0.0))
+        p_ = torch.zeros(m.n_params, dtype=torch.float64); p_[0] = a; p_[1:1 + m.n_edges] = 1.0; p_[1 + m.n_edges] = 0.3
+        mu.append(m(p_).detach().numpy())
+    mu = 0.08 * np.stack(mu) / np.stack(mu).mean(1, keepdims=True)
+    V = torch.zeros(n, n, n, 2); V[2:6, 3:9, 3:9, 0] = 1; V[6:10, 3:9, 3:9, 1] = 1
+    T = torch.poisson(1e5 * torch.exp(-(proj.fwd(V).double() @ torch.as_tensor(mu)))) / 1e5
+    lat = [None, None]; a0 = [None, None]; init = None
+    if known is not None:
+        lat[known] = mats[known][0]; a0[known] = mats[known][1]
+        init = [None, None]; init[known] = mu[known]
+    _, info = warmup(T.float(), lam, np.full(lam.size, 1e5), lat, a0, proj, device='cpu', init_spectra=init,
+                     d0_from_data=True, noise=None, normalize=False)
+    for (lt, a), (lt_f, a_f) in zip(mats, info['found']):
+        assert lt_f == lt and abs(a_f / a - 1) < 1e-3
+
+
 def test_fine_projector_set_mount():
     """A FineProjector whose mount is changed in place projects like one built with that mount, series by series, and
     reports the mount in voxels of the detector grid."""

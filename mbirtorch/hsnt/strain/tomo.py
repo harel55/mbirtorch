@@ -1943,6 +1943,7 @@ class TomoFit:
         return float('nan'), 0.0
 
 
+UNTYPED_PAIR_COST = 1.0          # warmup: the pairing cost of a material with no given type (above any typed one's lattice mismatch)
 INIT_SPECTRA_RESOLUTION = (0.005, 0.0)   # warmup with init_spectra: the kernel's starting relative width (the Ti rods' 0.02 A at 4 A)
 
 
@@ -1956,8 +1957,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
            init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
            tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None):
-    """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
-    within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
+    """The pipeline's start: returns a TomoFit. Each material (an entry of lattices and a0) is one of three kinds. With a
+    starting spectrum (a row of init_spectra, e.g. a known material's table), it starts from that spectrum at its a0.
+    With a lattice type and a0 only, warm_start searches its lattice parameter within a0 * (1 +- a_range). With
+    lattice type None (and a0 None), nothing is assumed: warm_start searches its type among the cubic types and its
+    parameter over its full range, among all R materials, and found components that match a given material are left
+    out. init_spectra may be None or hold None for the materials to search. The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
     spectrum is pinned at one wavelength to its warm-up value, which removes the density-spectrum scale trade-off.
     normalize=True (the default) removes it instead by the volume fractions: each material's full level (full_level) is
@@ -2029,32 +2034,52 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         Wk, H0 = hsnt.dehydrate(T[ray_mask.to(T.device)], 'transmission', num_materials=R, device=dev, verbose=0,
                                    open_beam=open_beam)
         W0 = np.zeros((T.shape[0], R), dtype=Wk.dtype); W0[keep] = Wk.reshape(-1, R)
-    lats = [(lt, (a * (1 - a_range), a * (1 + a_range))) for lt, a in zip(lattices, a0)]
+    # each material: a given starting spectrum (init_spectra row), a given lattice type and parameter (searched within
+    # a0 * (1 +- a_range)), or nothing (lattice type None: its type and parameter searched over every cubic type)
+    given = [None] * R if init_spectra is None else [None if sp is None else np.asarray(sp, dtype=np.float64) for sp in init_spectra]
+    lats = [None if lt is None else (lt, (a * (1 - a_range), a * (1 + a_range))) for lt, a in zip(lattices, a0)]
     # with the rays split over processes, the first process's spectra start every process (the same model everywhere);
     # each process keeps its own H0 to express its maps in that model's spectra
     H0_local = H0
     H0, = broadcast_objects([H0])
-    if init_spectra is not None:
-        # given starting spectra (e.g. tabulated, one row per lattice, on lam): no search; each material starts at its a0
-        found = lats; thetas = [torch.tensor([float(a)], dtype=torch.float64) for a in a0]; resolution = INIT_SPECTRA_RESOLUTION
-    else:
+    found = list(lats)
+    thetas = [None if a is None else torch.tensor([float(a)], dtype=torch.float64) for a in a0]
+    resolution = INIT_SPECTRA_RESOLUTION
+    search = [r for r in range(R) if given[r] is None]
+    if search:
+        typed = [lats[r] for r in search]
         out = [None]
         if rank() == 0:
-            th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=R, lattices=lats, device=device)
+            if all(t is not None for t in typed):     # only lattice parameters to find, each within its given range
+                th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=len(search), lattices=typed, device=device)
+            else:                                     # some types unknown: search every cubic type for all R materials
+                th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=R, device=device)
             out = [([t.cpu() for t in th_], fd_, res_)]
-        thetas, found, resolution = broadcast_objects(out)[0]
-        # warm_start orders its components by its own criterion: pair each given lattice with the found component of the
-        # same type and the nearest lattice parameter
+        th_s, fd_s, resolution = broadcast_objects(out)[0]
+        # a component that is a given material (its type, its parameter within a_range) is that material, not a new one
+        given_lats = [(lattices[r], float(a0[r])) for r in range(R) if given[r] is not None]
+        keep = [j for j, ((lf, _), th) in enumerate(zip(fd_s, th_s))
+                if not any(lf == lt and abs(float(th[0]) / a - 1) <= a_range for lt, a in given_lats)]
+        fd_s = [fd_s[j] for j in keep]; th_s = [th_s[j] for j in keep]
+        if len(fd_s) < len(search):
+            raise ValueError(f'the search found {len(fd_s)} crystalline materials of the {len(search)} sought: {fd_s}')
+        # warm_start orders its components by its own criterion: pair each typed material with the found component of
+        # its type and nearest lattice parameter, and the untyped ones with the rest
         from scipy.optimize import linear_sum_assignment
-        cost = np.array([[abs(float(th[0]) / a - 1) if lf == lt else np.inf for (lf, _), th in zip(found, thetas)]
-                         for lt, a in zip(lattices, a0)])
-        assert len(found) == R and np.isfinite(cost).any(axis=1).all(), (found, lattices)
-        _, order = linear_sum_assignment(np.where(np.isfinite(cost), cost, 1e9))
-        found = [found[j] for j in order]; thetas = [thetas[j] for j in order]
-        assert all(np.isfinite(cost[i, j]) for i, j in enumerate(order)), (found, lattices)
+        cost = np.array([[UNTYPED_PAIR_COST if t is None else (abs(float(th[0]) / float(a0[r]) - 1) if lf == t[0] else np.inf)
+                          for (lf, _), th in zip(fd_s, th_s)] for r, t in zip(search, typed)])
+        rows_i, order = linear_sum_assignment(np.where(np.isfinite(cost), cost, 1e9))
+        assert all(np.isfinite(cost[i, j]) for i, j in zip(rows_i, order)), (fd_s, typed)
+        for i, j in zip(rows_i, order):
+            r = search[i]; thetas[r] = th_s[j]; a_f = float(th_s[j][0])
+            found[r] = fd_s[j] if typed[i] is not None else (fd_s[j][0], (a_f * (1 - a_range), a_f * (1 + a_range)))
+            if lats[r] is None:
+                lats[r] = found[r]
+    lattices = [f[0] for f in found]
+    a0 = [float(th[0]) if a is None else a for a, th in zip(a0, thetas)]
     targets = []
     for r_, ((lt, ar), th) in enumerate(zip(found, thetas)):
-        tgt = (np.asarray(init_spectra[r_], dtype=np.float64) if init_spectra is not None else
+        tgt = (given[r_] if given[r_] is not None else
                BraggSpectrum(lam, lattice=lt, a_range=ar, resolution=resolution)(th.cpu()).detach().numpy())
         targets.append(tgt / max(np.abs(tgt).mean(), 1e-12) * float(np.abs(H0).mean()))
     targets = np.stack(targets)
