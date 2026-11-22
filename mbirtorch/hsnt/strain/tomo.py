@@ -461,8 +461,8 @@ class TomoFit:
     material, with standard deviation EQUILIBRIUM_SD of the divergence of stress / Young's modulus per voxel."""
 
     def __init__(self, fit, proj, V, E, weights=None, smooth_sd=STRAIN_SMOOTH_SD, density_smooth=False, elastic=None,
-                 eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='jacobi', density_prior='qggmrf',
-                 voxel_scale=1.0, traction=False, mask_method='max', mask_freeze=False, fraction=False,
+                 eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, support=False, precond='fft', density_prior='qggmrf',
+                 voxel_scale=1.0, traction=False, mask_method='median', mask_freeze=True, fraction=False,
                  eq_stencil='corner', normalize=False, strain_prior='qggmrf', smooth_order=1):
         """traction=True adds traction-free faces to the equilibrium prior: on the voxels at the sample's
         free faces, the traction sigma . n / Young's modulus (n the outward normal) has the equilibrium prior's standard
@@ -475,8 +475,8 @@ class TomoFit:
         at any binning.
         mask_method: how the material's own voxels are found (for the equilibrium prior's interior and faces, the strain
         recentring and the density prior's scale): 'max' (density above half the maximum; a few overshooting voxels at
-        the faces can leave it nearly empty), 'median' (density above MASK_MEDIAN_REL of the typical density), or 'otsu'
-        (density above Otsu's threshold of its histogram). mask_freeze=True computes the mask once,
+        the faces can leave it nearly empty), 'median' (the default: density above MASK_MEDIAN_REL of the typical density), or 'otsu'
+        (density above Otsu's threshold of its histogram). mask_freeze=True (the default) computes the mask once,
         from the starting volume, so the objective stays the same from one iteration to the next.
         fraction=True: V is each material's volume fraction, bounded by 0 and VOLUME_FRACTION_MAX (the material's full
         attenuation is carried by its spectrum; see warmup), so a voxel cannot hold more than all of a material; call
@@ -1891,9 +1891,9 @@ INIT_SPECTRA_RESOLUTION = (0.005, 0.0)   # warmup with init_spectra: the kernel'
 
 def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_DEGREE, n_contam=2, chunk=1024, a_range=0.01,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
-           eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
+           eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='fft',
            density_prior='qggmrf', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
-           smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, normalize=True, free_lattice=True,
+           smooth_sd=STRAIN_SMOOTH_SD, mask_method='median', mask_freeze=True, fraction=False, normalize=True, free_lattice=True,
            strain_prior='qggmrf', smooth_order=1,
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
