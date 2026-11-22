@@ -725,7 +725,7 @@ class FitB:
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
         beam, each ray's expected counts at T = 1 from the current estimate of its pixel's open beam."""
         ob = self.shared_open_beam
-        d = self.M.d if ob is None else ob["s"][sl, None] * ob["b"][ob["pix"][sl]]
+        d = self.M.d if ob is None else (ob["s"][sl, None] * ob["b"][ob["pix"][sl]]).to(self.M.d.dtype)
         if self.ray_weight is None:
             return d
         return (d if d.dim() == 2 else d[None, :]) * self.ray_weight[sl, None]
