@@ -808,6 +808,39 @@ def test_cubic4_global_grad():
     assert bool((torch.diagonal(F) > 0).all())
 
 
+def test_texture_field_global_grad():
+    """With a texture field (two basis functions, each ray its own weights) the gradient by automatic differentiation
+    (global_grad) equals global_system's for the heights and the texture coefficients, whose derivatives
+    global_system forms in closed form."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    lam = np.linspace(2.0, 4.4, 300)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64, shape_model='cubic4', texture_basis=2)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    gen = torch.Generator().manual_seed(3)
+    g[sl['x'][0]:sl['x'][1]] = 0.05 * torch.randn(sl['x'][1] - sl['x'][0], generator=gen, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
+    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64), eps=eps, chunk=16)
+    fit.ray_view = torch.arange(P) % 8
+    q = torch.rand(P, generator=gen, dtype=torch.float64)
+    fit.tex_Q = [torch.stack([q, 1 - q], 1)]
+    fit.eps_sd = 2e-4 * torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
+    idx = list(range(sl['h'][0], sl['h'][1])) + list(range(sl['x'][0], sl['x'][1]))
+    g1, F = fit.global_system(idx)
+    g2 = fit.global_grad(idx)
+    assert torch.allclose(g1, g2, rtol=1e-5, atol=1e-7 * float(g1.abs().max()))
+    assert bool((torch.diagonal(F) > 0).all())
+
+
 def test_fine_projector_set_mount():
     """A FineProjector whose mount is changed in place projects like one built with that mount, series by series, and
     reports the mount in voxels of the detector grid."""

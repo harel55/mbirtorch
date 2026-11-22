@@ -129,6 +129,7 @@ CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a trunca
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
 VIEW_TEXTURES = ("cubic4",)      # shape models whose spectra depend on the view
 EDGE_SPREAD_MIN = 1e-3           # edge_step: an edge spread below this share of a fine bin is a sharp step
+EDGE_SPREAD_REACH = 8.0          # edge spread: bins farther than this many widths from an edge take the sharp step's share
 SHAPE_MODELS = (None, "extinction", "texture", "cubic4")   # the shape models Hybrid2 accepts
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
 CONTAM_POWER_ITERS = 30      # power iterations for the largest curvature (the inner step size) of that step
@@ -147,9 +148,13 @@ def edge_step(off, hf, width=None):
     sharp = (off / hf).clamp(0, 1)
     if width is None:
         return sharp
-    w = torch.as_tensor(width, dtype=off.dtype, device=off.device).clamp_min(1e-12 * hf)
-    G = lambda u: u * 0.5 * torch.erfc(-u / (w * math.sqrt(2))) + w * torch.exp(-0.5 * (u / w) ** 2) / math.sqrt(2 * math.pi)
-    return torch.where(w > EDGE_SPREAD_MIN * hf, (G(off) - G(off - hf)) / hf, sharp)
+    w = torch.as_tensor(width, dtype=off.dtype, device=off.device).clamp_min(1e-12 * hf).expand_as(off)
+    # only bins within EDGE_SPREAD_REACH widths of the edge differ from the sharp step: elsewhere the share is 0 or 1 to
+    # the dtype's precision, so the error functions are evaluated there alone
+    near = (w > EDGE_SPREAD_MIN * hf) & (off > -EDGE_SPREAD_REACH * w) & (off < hf + EDGE_SPREAD_REACH * w)
+    o, ww = off[near], w[near]
+    G = lambda u: u * 0.5 * torch.erfc(-u / (ww * math.sqrt(2))) + ww * torch.exp(-0.5 * (u / ww) ** 2) / math.sqrt(2 * math.pi)
+    return sharp.index_put((near,), (G(o) - G(o - hf)) / hf)
 
 
 def deviance_terms(m, T, d, open_beam_obs=None):
@@ -1168,15 +1173,18 @@ class FitB:
             cols_u.append(-s * M.apply_band(E * dmu, Rb))
         return torch.stack(cols_w + cols_u + cols_t, 2), m
 
-    def texture_curve(self, sl, r, eps=None):
+    def texture_curve(self, sl, r, eps=None, terms=None, fac=None):
         """Material r's derivative of the spectrum with respect to a ray's mean texture term A = sum_j Y_j cbar_j,
         (Pc, Kf) in the model's dtype: sum over edges of height x k4 x P4(sin theta) x the edge term, where the factor is
-        above its floor. With a texture field or per-voxel texture, d mu_r / d cbar_j = Y_j(view) times this curve."""
+        above its floor. With a texture field or per-voxel texture, d mu_r / d cbar_j = Y_j(view) times this curve.
+        terms and fac: the rays' edge terms (Hybrid2.edge_terms) and texture factors, when already computed."""
         M = self.M; slr = M.slices[r]
         eps = self.eps[sl] if eps is None else eps
         tq = self._views(sl)
-        terms = M.edge_terms(self.g, eps, r, self._sd(sl))
-        fac = M.texture_factor_rays(self.g, r, tq.views, tq.Q[r])
+        if terms is None:
+            terms = M.edge_terms(self.g, eps, r, self._sd(sl))
+        if fac is None:
+            fac = M.texture_factor_rays(self.g, r, tq.views, tq.Q[r])
         e_ = 2.0 * self.g[slr["a"]] / torch.sqrt(M.mats[r]["ns"])
         st = (M.lamf[None, :] / e_[:, None]).clamp(0.0, 1.0)
         p4 = ((35 * st ** 4 - 30 * st ** 2 + 3) / 8).to(M.dt)
@@ -1355,16 +1363,29 @@ class FitB:
             if i < M.res_sl[0]:                                                      # a material parameter
                 r = next(rr for rr, slc in enumerate(M.slices) if slc["a"] <= i < slc["s"][1])
                 slr = M.slices[r]
-                if M.tex_nb > 1 and eps is not None and slr["x"][0] <= i < slr["x"][1]:
+                field = M.tex_nb > 1 and eps is not None and self._views(sl) is not None
+                if field and ("E", r) not in terms:
+                    # a texture field or per-voxel texture: the rays' edge terms and texture factors, computed once and
+                    # shared by the heights and the texture parameters
+                    tq = self._views(sl)
+                    terms[("E", r)] = M.edge_terms(self.g, eps, r, self._sd(sl))
+                    terms[("F", r)] = M.texture_factor_rays(self.g, r, tq.views, tq.Q[r])
+                if field and slr["x"][0] <= i < slr["x"][1]:
                     # texture field: m depends on beta_jb through the factor 1 + k4 P4 sum_j Y_j cbar_j, so dm/dbeta_jb =
                     # Y_j(view) Q_b x sum_e h_e k4_e P4_e x (edge term) (the floor's clamp is ignored)
                     if ("G", r) not in terms:
                         tq = self._views(sl)
-                        terms[("G", r)] = self.texture_curve(sl, r, eps)
+                        terms[("G", r)] = self.texture_curve(sl, r, eps, terms[("E", r)], terms[("F", r)])
                         terms[("YQ", r)] = (M._harmonics_views()[tq.views].to(M.dt), tq.Q[r].to(M.dt))
                     j, b = divmod(i - slr["x"][0], M.tex_nb)
                     Y, Q = terms[("YQ", r)]
                     dm = terms[("G", r)] * (Y[:, j] * Q[:, b])[:, None]
+                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                elif field and slr["h"][0] <= i < slr["h"][1]:
+                    # a height under a texture field: its edge term times the rays' texture factor (cubic4 links no
+                    # other shape to the heights), in place of a derivative of the whole spectrum per height
+                    e_ = i - slr["h"][0]
+                    dm = terms[("E", r)][:, e_] * terms[("F", r)][:, e_]
                     out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
                 elif tex is not None and dtex is not None and eps is not None and (
                         slr["h"][0] <= i < slr["h"][1] or slr["x"][0] <= i < slr["x"][1]):
