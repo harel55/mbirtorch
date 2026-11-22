@@ -981,3 +981,25 @@ def test_edge_spread():
     keep = W[:, 0] > 1e-3
     var = (m2 / W.clamp_min(1e-12) - (m1 / W.clamp_min(1e-12)) ** 2)[keep, 0]
     assert torch.allclose(fit.eps_sd[keep, 0] ** 2, var.clamp_min(0), rtol=1e-3, atol=1e-10)
+
+
+def test_tabulated_spectrum():
+    """A tabulated material (Hybrid2.set_tabulated): its smooth part is c0 x the table's non-Bragg shape + c1 lambda /
+    lambda_ref with the spline fixed at zero; the height prior (FitB.height_prior) is zero at heights proportional to
+    the table and grows with relative deviations."""
+    fit = _small_fit_cubic4()
+    M = fit.M; sl = M.slices[0]
+    nb = 1.0 + 0.5 * torch.linspace(0, 1, M.Kf, dtype=torch.float64) ** 2
+    M.set_tabulated(0, nonbragg=nb)
+    assert float(M.ub[sl['s'][0]:sl['s'][1]].abs().max()) == 0.0
+    g = fit.g.clone(); g[sl['h'][0]:sl['h'][1]] = 0.0; g[sl['s'][0]:sl['s'][1]] = 0.0
+    g[sl['c'][0]] = 2.0; g[sl['c'][0] + 1] = 0.0
+    assert torch.allclose(M.spectra(g)[0], 2.0 * nb / nb[M.Kf // 2], rtol=1e-12)
+    ne = sl['h'][1] - sl['h'][0]; t = torch.linspace(1.0, 2.0, ne, dtype=torch.float64)
+    fit.height_prior = dict(targets={0: t}, sd=0.05)
+    g2 = fit.g.clone(); g2[sl['h'][0]:sl['h'][1]] = 3.0 * t
+    base = float(fit.spline_penalty(g2)); fit.height_prior = None; base -= float(fit.spline_penalty(g2))
+    assert abs(base) < 1e-9
+    fit.height_prior = dict(targets={0: t}, sd=0.05)
+    g3 = g2.clone(); g3[sl['h'][0]] *= 1.1
+    assert float(fit.spline_penalty(g3)) - float(fit.spline_penalty(g2)) > 1.0

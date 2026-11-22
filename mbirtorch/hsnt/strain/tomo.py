@@ -445,6 +445,7 @@ def _otsu_threshold(x):
     return lo + (k + 1) * (hi - lo) / OTSU_BINS
 
 
+HEIGHT_PRIOR_SD = 0.05           # tabulated edge heights: their relative standard deviation about the table times a scale
 TEXTURE_SMOOTH_SD = 0.1          # per-voxel texture: the standard deviation of a coefficient's step between neighbouring voxels
 TEXTURE_RIDGE_SD = 1.0           # per-voxel texture: each coefficient's standard deviation about 0 (a random powder)
 TEXTURE_CG_ITERS = 20            # per-voxel texture: conjugate-gradient iterations of each texture step
@@ -1923,7 +1924,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            strain_prior='qggmrf', smooth_order=1,
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
-           init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True):
+           init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
+           tables=None, height_sd=HEIGHT_PRIOR_SD):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1960,7 +1962,11 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     x open beam. The likelihood profiles each pixel's true open beam out (FitB.set_shared_open_beam), which is exact;
     use it instead of open_beam_obs when the raw open beam is at hand. edge_spread=True (the default; user 2026-11-22:
     properly summed edges) sums each ray's edges over its strain spread along the beam (TomoFit.refresh_spread)
-    instead of placing one edge at the ray's mean strain."""
+    instead of placing one edge at the ray's mean strain. tables (user 2026-11-22: the physical spectrum): per material
+    None or a dict of tabulated cross-sections (e.g. NCrystal): 'ns' and 'jumps' (each reflection family's edge jump),
+    'wl' and 'nonbragg' (the non-Bragg cross-section). Its smooth part then follows the table's non-Bragg shape plus an
+    absorption term (model.Hybrid2.set_tabulated), and its edge heights stay near the table's times one scale, with
+    relative standard deviation height_sd (FitB.height_prior)."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -2028,6 +2034,14 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     if kernel_values is not None:                       # a calibrated kernel, held fixed
         kv = torch.as_tensor(np.asarray(kernel_values, dtype=np.float64), device=device)
         g[M.res_sl[0]:M.res_sl[1]] = kv; M.lb[M.res_sl[0]:M.res_sl[1]] = kv; M.ub[M.res_sl[0]:M.res_sl[1]] = kv
+    h_tab = {}
+    for r, tb in enumerate(tables or []):
+        if tb is None:
+            continue
+        M.set_tabulated(r, nonbragg=np.interp(M.lamf.cpu().numpy(), tb['wl'], tb['nonbragg']))
+        jump = dict(zip([int(round(v)) for v in tb['ns']], [float(v) for v in tb['jumps']]))
+        ns_ = M.mats[r]['ns'].cpu().numpy(); e_ = 2 * a0[r] / np.sqrt(ns_)
+        h_tab[r] = np.array([jump.get(int(round(v)), 0.0) for v in ns_]) * (M.lam_ref / e_) ** 2
     mu_bar = float(np.mean(targets))
     for j in range(M.J):
         for r in range(M.R):
@@ -2057,6 +2071,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     V = x.clamp_min(0)
     fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask)
+    if h_tab:
+        fit.height_prior = dict(targets=h_tab, sd=height_sd)
     if shared_open_beam is not None:                  # exact: each pixel's open beam profiled out (open_beam_obs not used)
         ob = np.asarray(shared_open_beam['open_beam'], dtype=np.float64)
         ob = ob / (phi if noise == 'measure' else 1.0)                      # counts divided by their dispersion, as the dose

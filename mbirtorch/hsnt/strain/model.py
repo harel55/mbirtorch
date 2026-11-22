@@ -441,6 +441,18 @@ class Hybrid2:
         lb[self.kap_sl[0]:self.kap_sl[1]] = 0.0
         self.lb = torch.as_tensor(lb, **f64); self.ub = torch.as_tensor(ub, **f64)
 
+    def set_tabulated(self, r, nonbragg=None):
+        """Use a tabulated non-Bragg cross-section (fine grid, Kf) for material r (user 2026-11-22: the physical
+        non-Bragg part): its smooth part becomes c0 x the table's shape + c1 x lambda / lambda_ref (absorption beyond the
+        table, e.g. from alloying), and the free spline is fixed at zero."""
+        if getattr(self, "nb_shape", None) is None:
+            self.nb_shape = [None] * self.R
+        if nonbragg is not None:
+            t = torch.as_tensor(nonbragg, dtype=torch.float64, device=self.dev)
+            self.nb_shape[r] = t / float(t[self.Kf // 2])
+            s0, s1 = self.slices[r]["s"]
+            self.lb[s0:s1] = 0.0; self.ub[s0:s1] = 0.0
+
     # -- spectra and their parameter derivatives
     def spectra(self, g, eps=None, views=None, tex=None, sd=None):
         """mu (R, Kf), float64; or (Pc, R, Kf) in the model's dtype with per-pixel dilations eps (Pc, R): the edge
@@ -456,7 +468,8 @@ class Hybrid2:
             xp = g[sl["x"][0]:sl["x"][1]]
             c = g[sl["c"][0]:sl["c"][1]]; s = g[sl["s"][0]:sl["s"][1]]
             e = 2.0 * a / torch.sqrt(m["ns"])
-            smooth = c[0] + c[1] * x + self.B.double() @ s
+            nbs = self.nb_shape[r] if getattr(self, "nb_shape", None) is not None and self.nb_shape[r] is not None else 1.0
+            smooth = c[0] * nbs + c[1] * x + self.B.double() @ s
             if eps is None:
                 step = ((e[None, :] - (self.lamf[:, None] - 0.5 * self.hf)) / self.hf).clamp(0, 1)
                 shape = 1 + t[None, :] * (self.lamf[:, None] - e[None, :]) / e[None, :]          # (Kf, n_e)
@@ -898,7 +911,9 @@ class FitB:
         """The spline's smoothness and magnitude penalty; with ``kappa_prior`` (a standard deviation) a weak prior on the
         contamination's attenuation toward 0; and, when ``scale_anchor`` is set, a stiff quadratic pin of
         each material's spectrum at one fine-grid index: (index, targets (R,), weight). The pin removes the scale that
-        maps and spectra otherwise trade freely (X = W mu is unchanged by mu -> s mu, W -> W / s)."""
+        maps and spectra otherwise trade freely (X = W mu is unchanged by mu -> s mu, W -> W / s). With ``height_prior``
+        (dict: 'targets' {material: tabulated heights}, 'sd' a relative standard deviation), a prior holding each
+        material's edge heights near its table times one common scale."""
         tot = 0.0
         scale = getattr(self, "spline_scale", None)
         for r, sl in enumerate(self.M.slices):
@@ -912,6 +927,16 @@ class FitB:
             # component is small, where the data say little about it
             kap = g[self.M.kap_sl[0]:self.M.kap_sl[1]]
             tot = tot + 0.5 * (kap * kap).sum() / kp ** 2
+        hp = getattr(self, "height_prior", None)
+        if hp is not None:
+            # tabulated edge heights (user 2026-11-22: the physical heights): each material's heights stay close to
+            # its table's times one common scale (profiled out), with relative standard deviation hp['sd']
+            for r, tgt in hp["targets"].items():
+                sl = self.M.slices[r]; h = g[sl["h"][0]:sl["h"][1]]
+                t = torch.as_tensor(tgt, dtype=h.dtype, device=h.device); live = t > 0
+                ratio = h[live] / t[live]
+                k = (ratio * t[live] ** 2).sum() / (t[live] ** 2).sum()             # the scale (least squares on h)
+                tot = tot + 0.5 * (((h[live] - k * t[live]) / (hp["sd"] * k.clamp_min(1e-30) * t[live])) ** 2).sum()
         anchor = getattr(self, "scale_anchor", None)
         if anchor is not None:
             k, targets, weight = anchor                  # weight: one number, or one per material
@@ -1576,11 +1601,14 @@ def ls_init_material(M, g, r, target, a0):
         e = 2 * a0 / np.sqrt(M.mats[r]['ns'].cpu().numpy())
         step = np.clip((e[None, :] - (lamf[:, None] - 0.5 * hf)) / hf, 0, 1)
         ne = len(e)
-        Dfine = np.concatenate([(x * x)[:, None] * step, np.ones((M.Kf, 1)), x[:, None], M.B.double().cpu().numpy()], 1)
+        nbs = getattr(M, "nb_shape", None)
+        c0col = np.ones((M.Kf, 1)) if nbs is None or nbs[r] is None else nbs[r].cpu().numpy()[:, None]
+        Bs = M.B.double().cpu().numpy() if nbs is None or nbs[r] is None else np.zeros_like(M.B.double().cpu().numpy())
+        Dfine = np.concatenate([(x * x)[:, None] * step, c0col, x[:, None], Bs], 1)
         A = Rt @ Dfine
         sol = lsq_linear(A, np.asarray(target, dtype=np.float64),
                          bounds=(np.concatenate([np.zeros(ne), -np.inf * np.ones(2 + M.n_smooth)]), np.inf))
-        g[sl['s'][0]:sl['s'][1]] = torch.as_tensor(sol.x[ne + 2:])
+        g[sl['s'][0]:sl['s'][1]] = 0.0 if not (nbs is None or nbs[r] is None) else torch.as_tensor(sol.x[ne + 2:])
         rms = float(np.sqrt(np.mean((A @ sol.x - target) ** 2)))
         g[sl['h'][0]:sl['h'][1]] = torch.as_tensor(sol.x[:ne])
         g[sl['c'][0]:sl['c'][1]] = torch.as_tensor(sol.x[ne:ne + 2])
