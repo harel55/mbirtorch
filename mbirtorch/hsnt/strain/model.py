@@ -125,6 +125,8 @@ LATTICE_COARSE_STEP = 5e-4   # relative spacing of its coarse grid: about a Brag
 LATTICE_TOL = 1e-6           # relative tolerance of its golden-section refinement
 GOLDEN = (math.sqrt(5) - 1) / 2   # the golden section's ratio
 CUBIC4_BOUND = 1.0               # cubic4: the bound on each degree-4 texture coefficient
+KERNEL_LAG_SE = 1.0              # a free resolution kernel moves only on the global step's Fisher iterations once its last
+                                 # move was below this many standard errors (RMS); before that, on every step
 P4_MIN = -3.0 / 7.0                # the smallest value of the Legendre polynomial P4 (at x^2 = 3/7)
 CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a truncated expansion can go negative)
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
@@ -904,9 +906,11 @@ class FitB:
         self.history = []
         # fisher_every > 1: the global step recomputes its Fisher information only every this many calls and uses the
         # gradient alone in between (about 3 times cheaper; the steps are still accepted only if the loss falls).
-        # Not with a free resolution kernel, whose band enters the gradient without derivatives.
+        # A free resolution kernel, whose band enters that gradient without derivatives, moves only on the Fisher steps
+        # (with all other parameters), and on every step while its last move exceeds KERNEL_LAG_SE.
         self.fisher_every = 1
         self._fisher = None
+        self.last_kernel_step_se = float('inf')   # the resolution kernel's last move, RMS in standard errors
         # contamination_newton: the contamination step takes a full Newton step on the atom coefficients
         # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
         self.contamination_newton = False
@@ -1577,7 +1581,7 @@ class FitB:
         if not idx:
             return self.loss(), damping
         if system is None:
-            system = self._lagged_system(idx)
+            idx, *system = self._lagged_system(idx)
         grad, F = system
         g0 = self.g.clone()
         l0 = self.loss()
@@ -1613,6 +1617,10 @@ class FitB:
                 if lf is not None and lf[0] == list(idx):
                     Fd = lf[1]
                 self.last_step_se = math.sqrt(max(float(moved @ (Fd[live][:, live] @ moved)), 0.0) / len(moved)) if len(moved) else 0.0
+                kern = (idx_t[live] >= M.res_sl[0]) & (idx_t[live] < M.res_sl[1])
+                if bool(kern.any()):                         # the kernel's own move, with each parameter's Fisher scale
+                    dF = torch.diagonal(Fd[live][:, live])[kern]
+                    self.last_kernel_step_se = math.sqrt(max(float((moved[kern] ** 2 * dF).mean()), 0.0))
                 self.g = g_new
                 self.remember_data_loss(d1)
                 return l1, max(lam_ / 3, 1e-9)
@@ -1621,17 +1629,27 @@ class FitB:
         return l0, lam_
 
     def _lagged_system(self, idx):
-        """The global step's gradient and Fisher information: both recomputed every fisher_every calls (and whenever the
-        free parameters change), the gradient alone in between with the last Fisher information."""
+        """The global step's parameters, gradient and Fisher information. Both are recomputed every fisher_every calls
+        (and whenever the parameters change); in between, the gradient alone with the last Fisher information. A free
+        resolution kernel moves only on the recomputing calls (the gradient in between holds its band fixed), and every
+        call recomputes while the kernel's last move exceeds KERNEL_LAG_SE standard errors."""
         M = self.M
-        res_free = any(M.res_sl[0] <= i < M.res_sl[1] for i in idx)
+        res = [k for k, i in enumerate(idx) if M.res_sl[0] <= i < M.res_sl[1]]
         lag = self._fisher
-        if self.fisher_every <= 1 or res_free or lag is None or lag[0] != idx or lag[2] % self.fisher_every == 0:
+        due = self.fisher_every <= 1 or lag is None or lag[0] != idx or lag[2] % self.fisher_every == 0
+        if res and not self.last_kernel_step_se < KERNEL_LAG_SE:
+            due = True
+        if due:
             grad, F = self.global_system(idx)
             self._fisher = (list(idx), F, 1)
-            return grad, F
+            return idx, grad, F
         self._fisher = (lag[0], lag[1], lag[2] + 1)
-        return self.global_grad(idx), lag[1]
+        if not res:
+            return idx, self.global_grad(idx), lag[1]
+        keep = [k for k in range(len(idx)) if k not in set(res)]
+        sub = [idx[k] for k in keep]
+        kt = torch.as_tensor(keep, device=lag[1].device)
+        return sub, self.global_grad(sub), lag[1][kt][:, kt]
 
     def global_grad(self, idx):
         """The gradient of the loss (with the spline penalty) for the global parameters idx, by automatic

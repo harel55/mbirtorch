@@ -451,6 +451,32 @@ def test_global_grad_matches_global_system():
     assert torch.allclose(g1, g2, rtol=1e-6, atol=1e-8 * float(g1.abs().max()))
 
 
+def test_kernel_moves_on_fisher_steps():
+    """With fisher_every > 1 and a free resolution kernel, the kernel moves on every global step while its moves are
+    large, and afterwards only on the steps that recompute the Fisher information; the loss never rises."""
+    from mbirtorch.hsnt.strain import model as mdl
+    fit = _small_fit()
+    M = fit.M
+    fit.fisher_every = 3
+    res = list(range(M.res_sl[0], M.res_sl[1]))
+    loss = [fit.loss()]
+    moved, recomputed = [], []
+    for k in range(9):
+        g0 = fit.g.clone()
+        # the first three steps as if the kernel were still moving, the rest as if it had settled
+        fit.last_kernel_step_se = (2.0 if k < 3 else 0.5) * mdl.KERNEL_LAG_SE
+        l, _ = fit.global_step()
+        loss.append(float(l))
+        moved.append(bool((fit.g[res] != g0[res]).any()))
+        recomputed.append(fit._fisher[2] == 1)
+    assert all(b <= a + 1e-9 * abs(a) for a, b in zip(loss, loss[1:]))
+    for k in range(3, 9):
+        if not recomputed[k]:
+            assert not moved[k]                                          # the kernel is held between Fisher steps
+    assert recomputed[:3] == [True, True, True]                         # a moving kernel recomputes every step
+    assert not all(recomputed[3:])
+
+
 def test_contamination_newton_kkt():
     """The contamination Newton step's inner solution meets the optimality conditions of its model: zero gradient where
     a coefficient is positive, gradient >= 0 where it is held at 0."""
