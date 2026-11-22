@@ -483,7 +483,8 @@ class Hybrid2:
         """mu (R, Kf), float64; or (Pc, R, Kf) in the model's dtype with per-pixel dilations eps (Pc, R): the edge
         positions are computed in float64, the per-pixel arrays (pixels x edges x bins) in the model's dtype. With
         shape_model 'cubic4' and views (Pc,) (each pixel's view), each pixel's edges carry its view's texture factor
-        (texture_factor; tex: the factors per material, already computed at g); without views the spectra are a random
+        (texture_factor; tex: given factors per material (views, edges, Kf), e.g. a phantom's true textures, which
+        are then summed over every bin); without views the spectra are a random
         powder's. sd (Pc, R): each ray's spread of strain along the beam; each edge is then the sum of the ray's shifted
         edges (edge_step)."""
         x = self.lamf / self.lam_ref
@@ -501,7 +502,7 @@ class Hybrid2:
                 shape = shape * self.linked_shape(self.lamf[:, None], e[None, :], h[None, :], m["mult"][None, :], xp)
                 out.append(x * x * ((step * shape) @ h) + smooth)
             else:
-                fast = None if self.dense_spectra else self._ray_spectrum(g, r, eps, views, sd, x, smooth)
+                fast = None if self.dense_spectra or tex is not None else self._ray_spectrum(g, r, eps, views, sd, x, smooth)
                 if fast is not None:
                     out.append(fast)
                     continue
@@ -979,6 +980,11 @@ class FitB:
         self._tex_cache = (g, g._version, tex)
         return tex
 
+    def _spectra_tex(self, g):
+        """The texture factors to pass to Hybrid2.spectra: the cached ones when spectra sums every bin, else None (the
+        windowed sum computes each ray's texture term from g itself)."""
+        return self._texture(g) if self.M.dense_spectra else None
+
     def _views(self, sl):
         """The views of the rays sl, or None (a view-dependent spectrum needs them; see Hybrid2.texture_factor). With a
         texture field, a RayTexture that also carries the rays' basis weights (tex_Q, set by TomoFit.sync)."""
@@ -998,7 +1004,7 @@ class FitB:
         if eps is None and self.eps is not None:
             eps = self.eps[sl]
         mu, Rb, kap = self._state(g) if cache is None else cache
-        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(g, eps, self._views(sl), self._texture(g), self._sd(sl)).to(M.dt))
+        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(g, eps, self._views(sl), self._spectra_tex(g), self._sd(sl)).to(M.dt))
         E = torch.exp(-X)
         n = M.apply_band(E, Rb)
         beta = torch.exp(-W @ kap.T)
@@ -1225,10 +1231,10 @@ class FitB:
         T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
-        mus = M.spectra(self.g, eps, self._views(sl), self._texture(self.g), self._sd(sl)).to(M.dt)  # (Pc, R, Kf)
+        mus = M.spectra(self.g, eps, self._views(sl), self._spectra_tex(self.g), self._sd(sl)).to(M.dt)  # (Pc, R, Kf)
         cols_w, cols_u, cols_t = [], [], []
         packed = eps.shape[1] == 2 * R                                                # each ray's mean trace in R..2R
-        spec = lambda e_: M.spectra(self.g, e_, self._views(sl), self._texture(self.g), self._sd(sl))
+        spec = lambda e_: M.spectra(self.g, e_, self._views(sl), self._spectra_tex(self.g), self._sd(sl))
         for r in range(R):
             tg = torch.zeros_like(eps); tg[:, r] = 1
             _, dmu = torch.func.jvp(spec, (eps.double(),), (tg.double(),))

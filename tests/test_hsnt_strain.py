@@ -890,6 +890,12 @@ def test_ray_spectrum_matches_dense(case, spread):
     tang = torch.randn_like(eps)
     jv = [torch.func.jvp(lambda ee: run(dense, g, ee), (eps,), (tang,))[1] for dense in (False, True)]
     assert torch.allclose(jv[0], jv[1], rtol=0, atol=1e-8 * float(jv[1].abs().max()))
+    if case == 'views':                      # given texture factors (a phantom's true textures) are used as given
+        tex = [1 + 0.3 * torch.rand(8, ne, M.Kf, generator=gen, dtype=torch.float64)]
+        M.dense_spectra = False; a = M.spectra(g, eps, views, tex=tex, sd=sd)
+        M.dense_spectra = True; b = M.spectra(g, eps, views, tex=tex, sd=sd)
+        assert torch.allclose(a, b, rtol=0, atol=1e-12 * float(b.abs().max()))
+        assert not torch.allclose(a, M.spectra(g, eps, views, sd=sd))
     M.dense_spectra = False
 
 
