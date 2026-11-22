@@ -669,6 +669,7 @@ class TomoFit:
         gradients on the normal equations, then a line search on the data loss plus the texture prior. Each ray's
         Fisher information in its mean coefficients is (Y Y^T) x B, with Y the view's degree-4 harmonics and B
         (materials x materials) from each material's texture curve (FitB.texture_curve). Returns the objective's change."""
+        self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         fit = self.fit; M = fit.M; nt = len(self.tex_r)
         if nt == 0:
             return 0.0
@@ -1198,6 +1199,7 @@ class TomoFit:
     # ---- the Gauss-Newton step
     def volume_step(self):
         """One Gauss-Newton step on (V, E). Returns the step's Newton decrement per volume parameter (noise units)."""
+        self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         fit, R, C = self.fit, self.R, self.C
         self.sync()
         cache = fit._state(fit.g)
@@ -1569,6 +1571,7 @@ class TomoFit:
         the sample frame); every series' offset moves. Derivatives by central differences of the series' projections
         (MOUNT_FD), steps capped at MOUNT_MAX_STEP, then a backtracking line search on the loss. Returns the accepted
         changes per series."""
+        self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         proj, fit, R, C = self.proj, self.fit, self.R, self.C
         refine_rigid = list(range(1, len(proj.parts))) if refine_rigid is None else list(refine_rigid)
         self.sync()
@@ -1641,6 +1644,7 @@ class TomoFit:
         (default: all). The projector must support set_view_offsets (and set_view_angles), and the rays must not be split
         over processes. The strain's beam-direction weights keep the nominal angles. offsets=False refines the angles
         alone. Returns the accepted offsets and angles per series."""
+        self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         proj, fit, R, C = self.proj, self.fit, self.R, self.C
         series = list(range(len(proj.parts))) if series is None else list(series)
         self.sync()
@@ -1897,7 +1901,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            strain_prior='qggmrf', smooth_order=1,
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
-           init_spectra=None, texture_voxels=None, open_beam_obs=None):
+           init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1928,7 +1932,11 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     noise='measure'. open_beam_obs: the open beam's counts over the sample's at T = 1, when each transmission was divided
     by a measured open beam. The likelihood then includes the open beam's counting noise (model.deviance_terms), and the
     dispersion measured on the air rays (T = 1) is divided by 1 + 1 / open_beam_obs, so that it keeps only the
-    detector's own share. None treats the open beam as exact."""
+    detector's own share. None treats the open beam as exact. shared_open_beam: one measured open beam shared by every
+    view, as a dict with 'open_beam' (detector pixels, K) its counts, 'pixel' (rays,) each ray's detector pixel and
+    'exposure' (rays,) each ray's view exposure relative to the open beam; T must then be the sample counts over exposure
+    x open beam. The likelihood profiles each pixel's true open beam out (FitB.set_shared_open_beam), which is exact;
+    use it instead of open_beam_obs when the raw open beam is at hand."""
     from mbirtorch import hsnt
     noise_info = None
     if noise == 'measure':
@@ -1937,7 +1945,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool(),
                                    detector_tiles)
         phi = np.asarray(noise_info['dispersion_per_bin']) if per_bin_dispersion else noise_info['dispersion']
-        if open_beam_obs is not None:                 # the air rays' variance includes the open beam's: keep the detector's
+        if shared_open_beam is not None:              # the air rays' variance includes the open beam's: keep the detector's
+            open_beam_obs = 1.0 / float(np.mean(np.asarray(shared_open_beam['exposure'], dtype=np.float64)))
+        if open_beam_obs is not None:
             phi = phi / (1 + 1 / open_beam_obs)
             noise_info['detector_dispersion'] = float(np.mean(phi)); noise_info['open_beam_obs'] = float(open_beam_obs)
         d = np.asarray(d, dtype=np.float64) / phi; inflation = noise_info['inflation']
@@ -2023,7 +2033,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     V = x.clamp_min(0)
     fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask)
-    fit.open_beam_obs = open_beam_obs
+    if shared_open_beam is not None:                  # exact: each pixel's open beam profiled out (open_beam_obs not used)
+        ob = np.asarray(shared_open_beam['open_beam'], dtype=np.float64)
+        ob = ob / (phi if noise == 'measure' else 1.0)                      # counts divided by their dispersion, as the dose
+        fit.set_shared_open_beam(ob, shared_open_beam['pixel'], shared_open_beam['exposure'])
+    else:
+        fit.open_beam_obs = open_beam_obs
     if shape_model == 'cubic4':                                                    # each view's beam, each ray's view
         from .geometry import directions_from_weights
         assert weights is not None, 'a view-dependent texture needs the strain-tensor weights (they hold the beam directions)'

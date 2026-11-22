@@ -908,3 +908,35 @@ def test_open_beam_likelihood():
     var = (S / O).var(0)
     var_model = mt / dd * (1 + mt / n)                          # 1 / (weight / d^2)
     assert torch.allclose(var, var_model, rtol=0.03)
+
+
+def test_shared_open_beam():
+    """One noisy open beam shared by every view (FitB.set_shared_open_beam): at the current state the Poisson bound's
+    residual equals the derivative of the exact profile likelihood (the open beam profiled out), and pixel and global
+    steps on the bound never raise the exact deviance (majorize-minimize)."""
+    fit = _small_fit_cubic4()
+    P, K = fit.T.shape; pix = torch.arange(P) // 8                        # 5 detector pixels, each seen in 8 views
+    gen = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        m_true = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    b_true = 50.0 * torch.ones(5, K, dtype=torch.float64); s_ = 0.9 + 0.2 * torch.rand(P, generator=gen, dtype=torch.float64)
+    O = torch.poisson(b_true, generator=gen).clamp_min(1.0)
+    S = torch.poisson(s_[:, None] * b_true[pix] * m_true, generator=gen)
+    fit.T = (S / (s_[:, None] * O[pix])).to(fit.T.dtype)
+    fit.set_shared_open_beam(O, pix, s_)
+    # the bound's residual is the exact profile likelihood's derivative at the current state
+    with torch.no_grad():
+        mm = torch.cat([fit.mean(s)[0] for s in fit.chunks()]).clamp_min(1e-12)
+    mv = mm.clone().requires_grad_(True)
+    A = torch.zeros(5, K, dtype=torch.float64).index_add(0, pix, s_[:, None] * mv)
+    nll = ((O + torch.zeros(5, K, dtype=torch.float64).index_add(0, pix, S)) * torch.log1p(A)).sum() - (S * torch.log(mv)).sum()
+    g_exact = torch.autograd.grad(nll, mv)[0]
+    g_bound = torch.cat([fit.residual(s, fit.T[s], mm[s]) for s in fit.chunks()])
+    assert torch.allclose(g_bound, g_exact, rtol=1e-6, atol=1e-8 * float(g_exact.abs().max()))
+    # majorize-minimize: the exact deviance does not rise
+    d0 = fit.open_beam_deviance()
+    devs = [d0]
+    for _ in range(3):
+        fit.pixel_step(); fit.global_step()
+        devs.append(fit.open_beam_deviance())
+    assert all(b <= a * (1 + 1e-9) for a, b in zip(devs, devs[1:])) and devs[-1] < d0

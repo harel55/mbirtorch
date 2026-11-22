@@ -704,6 +704,7 @@ class FitB:
         self.eps = None if eps is None else eps.clone()
         self.ray_view = None             # (rays,) each ray's view, for a view-dependent spectrum (cubic4)
         self.open_beam_obs = None        # the open beam's counts over the sample's at T = 1 (None: an exact open beam)
+        self.shared_open_beam = None     # set_shared_open_beam: one measured open beam shared by every view
         self.tex_Q = None                # texture field: per material, the rays' basis weights (rays, nb) (TomoFit.sync)
         self.chunk = chunk
         self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
@@ -721,10 +722,85 @@ class FitB:
         self.last_step_se = float('inf')      # the last global step's RMS in standard errors (global_step)
 
     def dose(self, sl):
-        """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask."""
+        """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
+        beam, each ray's expected counts at T = 1 from the current estimate of its pixel's open beam."""
+        ob = self.shared_open_beam
+        d = self.M.d if ob is None else ob["s"][sl, None] * ob["b"][ob["pix"][sl]]
         if self.ray_weight is None:
-            return self.M.d
-        return self.M.d[None, :] * self.ray_weight[sl, None]
+            return d
+        return (d if d.dim() == 2 else d[None, :]) * self.ray_weight[sl, None]
+
+    # -- one measured open beam shared by every view (user 2026-11-22: the exact model). Each detector pixel p and bin k
+    # has open-beam counts O ~ Poisson(b) and, in view v, sample counts S_v = s_v O T_v ~ Poisson(s_v b m_v), with b the
+    # true open beam (a nuisance) and s_v the view's exposure relative to the open beam. Profiling b out gives
+    # b = (O + sum_v S_v) / (1 + sum_v s_v m_v) and the negative log-likelihood
+    # (O + sum_v S_v) log(1 + sum_v s_v m_v) - sum_v S_v log m_v. The log is concave, so its tangent at the current state
+    # bounds it from above: the bound is a Poisson likelihood with dose s_v b and counts S_v (transmission T O / b).
+    # refresh_open_beam moves the bound to the current state; minimising the bound never raises the exact objective
+    # (majorize-minimize), and its fixed point is the exact optimum.
+    def set_shared_open_beam(self, open_beam, pixel, exposure):
+        """Use a measured open beam shared by every view. open_beam (pixels, K): its counts per detector pixel and bin
+        (divided by the counts' dispersion, like the dose); pixel (rays,) long: each ray's detector pixel; exposure
+        (rays,): each ray's view exposure relative to the open beam. self.T must be the measured transmission, the
+        sample counts over exposure x open beam."""
+        dev = self.T.device
+        O = torch.as_tensor(open_beam, device=dev, dtype=torch.float64)
+        pix = torch.as_tensor(pixel, device=dev, dtype=torch.long)
+        s_ = torch.as_tensor(exposure, device=dev, dtype=torch.float64)
+        self.T_measured = self.T
+        S_sum = torch.zeros_like(O)                                             # sum over the views of the sample counts
+        for sl in self.chunks():
+            S = self.T[sl].double() * s_[sl, None] * O[pix[sl]]
+            if self.ray_weight is not None:
+                S = S * self.ray_weight[sl, None]
+            S_sum.index_add_(0, pix[sl], S)
+        self.shared_open_beam = dict(O=O, pix=pix, s=s_, S_sum=S_sum, b=O.clone())
+        self.refresh_open_beam()
+
+    def refresh_open_beam(self):
+        """Moves the Poisson bound of the shared open beam's likelihood to the current state: the open beam's estimate b
+        per pixel and bin, each ray's dose s_v b, and the transmission T O / b. A no-op without a shared open beam."""
+        ob = self.shared_open_beam
+        if ob is None:
+            return
+        key = tuple((t, t._version if torch.is_tensor(t) else None)
+                    for t in (self.g, self.W, self.eps, self.f, self.ray_weight) + tuple(self.tex_Q or ()))
+        old = ob.get("key")
+        if old is not None and len(old) == len(key) and all(a[0] is b[0] and a[1] == b[1] for a, b in zip(old, key)):
+            return                                                              # the state has not changed
+        ob["key"] = key
+        A = torch.zeros_like(ob["O"])                                          # sum over the views of s_v m_v
+        cache = self._state(self.g)
+        with torch.no_grad():
+            for sl in self.chunks():
+                m = self.mean(sl, cache=cache)[0].double() * ob["s"][sl, None]
+                if self.ray_weight is not None:
+                    m = m * self.ray_weight[sl, None]
+                A.index_add_(0, ob["pix"][sl], m)
+        ob["b"] = (ob["O"] + ob["S_sum"]) / (1 + A)
+        ob["A"] = A
+        ratio = (ob["O"] / ob["b"].clamp_min(1e-12))
+        T = torch.empty_like(self.T_measured)
+        for sl in self.chunks():
+            T[sl] = (self.T_measured[sl].double() * ratio[ob["pix"][sl]]).to(T.dtype)
+        self.T = T
+
+    def open_beam_deviance(self):
+        """The exact deviance of the shared open beam's likelihood at the current state (b profiled out): twice the sum
+        over the counts y (the open beam's and the views') of y log(y / its fitted mean). It equals the deviance of the
+        Poisson bound right after refresh_open_beam, plus the open beam's own term."""
+        ob = self.shared_open_beam
+        self.refresh_open_beam()
+        xlogy = lambda y, mu: torch.where(y > 0, y * torch.log(y.clamp_min(1e-300) / mu.clamp_min(1e-300)), torch.zeros_like(y))
+        tot = float(xlogy(ob["O"], ob["b"]).sum())
+        cache = self._state(self.g)
+        with torch.no_grad():
+            for sl in self.chunks():
+                d = self.dose(sl)
+                mu = self.mean(sl, cache=cache)[0].double() * d
+                y = self.T[sl].double() * d
+                tot += float(xlogy(y, mu).sum())
+        return 2 * tot
 
     # -- the likelihood. With open_beam_obs set (the open beam's counts over the sample's at T = 1), the transmission was
     # divided by a measured open beam, whose counting noise makes each count's variance d m (1 + m / n): the residual
@@ -892,6 +968,7 @@ class FitB:
     # -- maps (and strain): per-pixel projected Newton
     def pixel_step(self):
         M = self.M; R = M.R
+        self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         cache = self._state(self.g); mu, Rb, kap = cache
         for sl in self.chunks():
             T = self.T[sl]; W = self.W[sl]
@@ -1063,6 +1140,7 @@ class FitB:
         widths), so that step overshoots and is halved repeatedly, and the contamination converges slowly. With
         contamination_newton, the step minimizes the full quadratic model in all atoms of all components (the bin-wise
         Fisher information, including the coupling between the components) by FISTA, then takes the same line search."""
+        self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         M = self.M; J = M.J
         if not J:
             return
@@ -1154,6 +1232,7 @@ class FitB:
     # -- contamination: per bin, projected Newton with the L1 threshold
     def contamination_step(self):
         M = self.M; J = M.J
+        self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         if not J:
             return
         cache = self._state(self.g)
@@ -1248,6 +1327,7 @@ class FitB:
 
     def global_step(self, damping=1e-3, which=None, max_tries=8, system=None):
         """system: (grad, F) already computed at the current state for these indices, to reuse."""
+        self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         M = self.M
         idx = list(range(M.n_global)) if which is None else list(which)
         idx = [i for i in idx if float(M.ub[i]) > float(M.lb[i])]                     # fixed parameters stay out
