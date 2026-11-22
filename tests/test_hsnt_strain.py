@@ -880,3 +880,31 @@ def test_volume_step_retries_with_zero_mean_step():
     assert tf.zero_mean_step
     tf.loss = lambda mask=None: -math.inf                     # no step can lower this: every pass is a retry
     tf.volume_step()
+
+
+def test_open_beam_likelihood():
+    """With a measured open beam (open_beam_obs n), the likelihood is the negative binomial's: it tends to the Poisson
+    deviance as n grows; FitB.residual is the deviance's derivative; FitB.weight is the inverse of the variance of
+    transmissions divided by a noisy open beam (simulated), times the counts squared."""
+    from mbirtorch.hsnt.strain.model import deviance_terms
+    gen = torch.Generator().manual_seed(3)
+    m = 0.2 + 0.8 * torch.rand(2000, dtype=torch.float64, generator=gen)
+    T = m * (1 + 0.05 * torch.randn(2000, dtype=torch.float64, generator=gen))
+    d = 400.0
+    assert torch.allclose(deviance_terms(m, T, d, 1e9), deviance_terms(m, T, d), rtol=1e-5, atol=1e-6)
+    fit = _small_fit_cubic4()
+    fit.open_beam_obs = 1.1
+    sl = slice(0, 16)
+    with torch.no_grad():
+        mm = fit.mean(sl)[0].clamp_min(1e-12)
+    Tm = fit.T[sl]
+    mv = mm.clone().requires_grad_(True)
+    g_auto = torch.autograd.grad(fit.deviance_terms(sl, mv, Tm).sum(), mv)[0]
+    assert torch.allclose(fit.residual(sl, Tm, mm), g_auto, rtol=1e-8, atol=1e-10)
+    # a noisy open beam: T = S / O with S ~ Poisson(d m), O ~ Poisson(n d) / n
+    n, dd, mt = 1.1, 400.0, torch.tensor([0.25, 0.6, 1.0], dtype=torch.float64)
+    S = torch.poisson((dd * mt).expand(200000, 3).contiguous(), generator=gen)
+    O = torch.poisson(torch.full((200000, 3), n * dd, dtype=torch.float64), generator=gen) / n
+    var = (S / O).var(0)
+    var_model = mt / dd * (1 + mt / n)                          # 1 / (weight / d^2)
+    assert torch.allclose(var, var_model, rtol=0.03)

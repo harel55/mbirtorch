@@ -137,10 +137,17 @@ LEGENDRE_DEGREE = 8          # the smooth part's polynomial degree (the spline's
 LEGENDRE_CURVATURE = 1e-2    # the smooth part's curvature penalty weight relative to FitB.ridge (q79 used 1.1e-2)
 
 
-def deviance_terms(m, T, d):
+def deviance_terms(m, T, d, open_beam_obs=None):
+    """Each ray and bin's share of the negative log-likelihood (up to a constant) of the transmission T at the model m,
+    with d the counts at T = 1. Without open_beam_obs the counts are Poisson. With open_beam_obs (n, the open beam's
+    counts over the sample's at T = 1) the transmission was divided by a measured open beam, and the counts are negative
+    binomial with variance d m (1 + m / n): the Poisson term m - T becomes (T + n) log(1 + (T - m) / (m + n))."""
     m = m.clamp_min(1e-12)
     tlogt = torch.where(T > 0, T * torch.log(T.clamp_min(1e-30)), torch.zeros_like(T))
-    return d * (m - T - T * torch.log(m) + tlogt)
+    if open_beam_obs is None:
+        return d * (m - T - T * torch.log(m) + tlogt)
+    n = open_beam_obs
+    return d * (tlogt - T * torch.log(m) - (T + n) * torch.log1p((T - m) / (m + n)))
 
 
 def _l1_threshold(Fi0, dispersion, z):
@@ -696,6 +703,7 @@ class FitB:
         self.inflation = float(inflation)
         self.eps = None if eps is None else eps.clone()
         self.ray_view = None             # (rays,) each ray's view, for a view-dependent spectrum (cubic4)
+        self.open_beam_obs = None        # the open beam's counts over the sample's at T = 1 (None: an exact open beam)
         self.tex_Q = None                # texture field: per material, the rays' basis weights (rays, nb) (TomoFit.sync)
         self.chunk = chunk
         self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
@@ -717,6 +725,29 @@ class FitB:
         if self.ray_weight is None:
             return self.M.d
         return self.M.d[None, :] * self.ray_weight[sl, None]
+
+    # -- the likelihood. With open_beam_obs set (the open beam's counts over the sample's at T = 1), the transmission was
+    # divided by a measured open beam, whose counting noise makes each count's variance d m (1 + m / n): the residual
+    # and the Fisher weight of the Poisson likelihood are multiplied by n / (m + n) (deviance_terms).
+    def _open_beam_factor(self, mm):
+        n = getattr(self, "open_beam_obs", None)
+        return None if n is None else n / (mm + n)
+
+    def deviance_terms(self, sl, m, T):
+        """Each ray and bin's share of the negative log-likelihood of the rays sl at the model m."""
+        return deviance_terms(m, T, self.dose(sl), getattr(self, "open_beam_obs", None))
+
+    def residual(self, sl, T, mm):
+        """The likelihood's derivative with respect to the model mm (clamped away from 0) for the rays sl."""
+        r = self.dose(sl) * (1 - T / mm)
+        q = self._open_beam_factor(mm)
+        return r if q is None else r * q
+
+    def weight(self, sl, mm):
+        """The likelihood's Fisher information with respect to the model mm for the rays sl."""
+        w = self.dose(sl) / mm
+        q = self._open_beam_factor(mm)
+        return w if q is None else w * q
 
     def chunks(self):
         P = self.T.shape[0]
@@ -843,7 +874,7 @@ class FitB:
             for sl in self.chunks():
                 Ws = None if W is None else W[sl]; es = None if eps is None else eps[sl]
                 m = self.mean(sl, g, Ws, f, es, cache)[0]
-                tot += float(deviance_terms(m, self.T[sl], self.dose(sl)).sum(dtype=torch.float64))
+                tot += float(self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64))
         tot = all_sum_float(tot, self.T.device)
         if current:
             self.remember_data_loss(tot)
@@ -878,14 +909,14 @@ class FitB:
                     dX = W[:, r:r + 1] * dmu[:, r].to(M.dt)
                     cols.append(-s * M.apply_band(E * dX, Rb))
             Jac = torch.stack(cols, 2)
-            grad = torch.einsum('pk,pkn->pn', self.dose(sl) * (1 - T / mm), Jac).double()
-            F = torch.einsum('pk,pka,pkb->pab', self.dose(sl) / mm, Jac, Jac).double()
+            grad = torch.einsum('pk,pkn->pn', self.residual(sl, T, mm), Jac).double()
+            F = torch.einsum('pk,pka,pkb->pab', self.weight(sl, mm), Jac, Jac).double()
             V = W if self.eps is None else torch.cat([W, self.eps[sl]], 1)
             nonneg = torch.zeros(V.shape[1], dtype=torch.bool, device=V.device); nonneg[:R] = True
 
             def row_loss(Vn):
                 Wn = Vn[:, :R]; en = None if self.eps is None else Vn[:, R:]
-                return deviance_terms(self.mean(sl, W=Wn, eps=en, cache=cache)[0], T, self.dose(sl)).sum(1, dtype=torch.float64)
+                return self.deviance_terms(sl, self.mean(sl, W=Wn, eps=en, cache=cache)[0], T).sum(1, dtype=torch.float64)
             V = _projected_newton_mixed(V, grad, F, row_loss, nonneg)
             self.W[sl] = V[:, :R]
             if self.eps is not None:
@@ -899,10 +930,10 @@ class FitB:
         M = self.M
         Jac, m = self.ray_jacobian(sl, cache)
         mm = m.clamp_min(1e-12); T = self.T[sl]
-        grad = torch.einsum('pk,pkn->pn', self.dose(sl) * (1 - T / mm), Jac).double()
-        F = torch.einsum('pk,pka,pkb->pab', self.dose(sl) / mm, Jac, Jac).double()
+        grad = torch.einsum('pk,pkn->pn', self.residual(sl, T, mm), Jac).double()
+        F = torch.einsum('pk,pka,pkb->pab', self.weight(sl, mm), Jac, Jac).double()
         if deviance is not None:
-            deviance.append(float(deviance_terms(m, T, self.dose(sl)).sum(dtype=torch.float64)))
+            deviance.append(float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64)))
         return grad, F
 
     def global_derivatives(self, idx):
@@ -955,7 +986,7 @@ class FitB:
             Jw, m = self.ray_jacobian(sl, cache)                                      # (Pc, K, 2R)
             Jg, _ = self.global_jacobian(sl, cache, idx, dmu, dRb)                     # (n, Pc, K)
             mm = m.clamp_min(1e-12); T = self.T[sl]
-            r_ = self.dose(sl) * (1 - T / mm); w_ = self.dose(sl) / mm
+            r_ = self.residual(sl, T, mm); w_ = self.weight(sl, mm)
             G[sl] = torch.einsum('pk,pkn->pn', r_, Jw).double()
             Fw[sl] = torch.einsum('pk,pka,pkb->pab', w_, Jw, Jw).double()
             C[sl] = torch.einsum('pk,pka,npk->pan', w_, Jw, Jg)
@@ -1001,7 +1032,7 @@ class FitB:
 
     def ray_loss(self, sl, W, eps, cache):
         """Deviance of each ray in sl at maps W and strains eps (no penalties)."""
-        return deviance_terms(self.mean(sl, W=W, eps=eps, cache=cache)[0], self.T[sl], self.dose(sl)).sum(1, dtype=torch.float64)
+        return self.deviance_terms(sl, self.mean(sl, W=W, eps=eps, cache=cache)[0], self.T[sl]).sum(1, dtype=torch.float64)
 
     # -- contamination on a multiscale dictionary: f_j = A c_j, c >= 0, each atom switched on by its own score test
     def build_atoms(self, widths=(1, 8, 32, 128)):
@@ -1047,15 +1078,15 @@ class FitB:
                 T = self.T[sl]
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
-                dev += float(deviance_terms(m, T, self.dose(sl)).sum(dtype=torch.float64))
+                dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
                 Dm = beta[:, None, :] - n[:, :, None]
-                grad += torch.einsum('pk,pkj->kj', self.dose(sl) * (1 - T / mm), Dm).double()
-                Fx += torch.einsum('pk,pka,pkb->kab', self.dose(sl) / mm, Dm, Dm).double()
+                grad += torch.einsum('pk,pkj->kj', self.residual(sl, T, mm), Dm).double()
+                Fx += torch.einsum('pk,pka,pkb->kab', self.weight(sl, mm), Dm, Dm).double()
                 # the price of a unit share: the score's standard deviation at f = 0 against a fixed reference
                 # contrast, a fully penetrating contaminant (beta = 1), so a contaminant that imitates the neutrons
                 # (beta near n, a vanishing score variance) is not free
-                Fi0 += (self.dose(sl) / n.clamp_min(1e-12) * (1 - n) ** 2).sum(0).double()[:, None].expand(-1, J)
-                pear += float((self.dose(sl) * (T - m) ** 2 / mm).sum(dtype=torch.float64))
+                Fi0 += (self.weight(sl, n.clamp_min(1e-12)) * (1 - n) ** 2).sum(0).double()[:, None].expand(-1, J)
+                pear += float((self.weight(sl, mm) * (T - m) ** 2).sum(dtype=torch.float64))
         all_sum(grad); all_sum(Fx); all_sum(Fi0); pear = all_sum_float(pear, M.dev); dev = all_sum_float(dev, M.dev)
         self.remember_data_loss(dev)
         Fd = torch.diagonal(Fx, dim1=1, dim2=2)
@@ -1114,7 +1145,7 @@ class FitB:
         cache = self._state(self.g); dv = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                dv += float(deviance_terms(self.mean(sl, f=f, cache=cache)[0], self.T[sl], self.dose(sl)).sum(dtype=torch.float64))
+                dv += float(self.deviance_terms(sl, self.mean(sl, f=f, cache=cache)[0], self.T[sl]).sum(dtype=torch.float64))
         return all_sum_float(dv, self.T.device)
 
     def loss_c(self, c):
@@ -1136,10 +1167,10 @@ class FitB:
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
                 Dm = beta[:, None, :] - n[:, :, None]                                  # (Pc, K, J)
-                grad += torch.einsum('pk,pkj->kj', self.dose(sl) * (1 - T / mm), Dm).double()
-                F += torch.einsum('pk,pka,pkb->kab', self.dose(sl) / mm, Dm, Dm).double()
-                Fi0 += torch.einsum('pk,pkj->kj', self.dose(sl) / n.clamp_min(1e-12), Dm * Dm).double()
-                pear += float((self.dose(sl) * (T - m) ** 2 / mm).sum(dtype=torch.float64))
+                grad += torch.einsum('pk,pkj->kj', self.residual(sl, T, mm), Dm).double()
+                F += torch.einsum('pk,pka,pkb->kab', self.weight(sl, mm), Dm, Dm).double()
+                Fi0 += torch.einsum('pk,pkj->kj', self.weight(sl, n.clamp_min(1e-12)), Dm * Dm).double()
+                pear += float((self.weight(sl, mm) * (T - m) ** 2).sum(dtype=torch.float64))
         all_sum(grad); all_sum(F); all_sum(Fi0); pear = all_sum_float(pear, M.dev)
         self.dispersion = pear / self.n_points
         self.lam1 = _l1_threshold(Fi0, self.dispersion * self.inflation, self.z).T.to(M.dt)
@@ -1148,7 +1179,7 @@ class FitB:
         def per_bin_loss(fT):
             tot = torch.zeros(M.K, device=M.dev, dtype=torch.float64)
             for sl in self.chunks():
-                tot += deviance_terms(self.mean(sl, f=fT.T, cache=cache)[0], self.T[sl], self.dose(sl)).sum(0, dtype=torch.float64)
+                tot += self.deviance_terms(sl, self.mean(sl, f=fT.T, cache=cache)[0], self.T[sl]).sum(0, dtype=torch.float64)
             all_sum(tot)
             return tot + (self.lam1 * fT.T).sum(0).double()
         self.f = _projected_newton_rows(self.f.T.contiguous(), grad, F, per_bin_loss, cap=(0, CONTAM_MAX_SHARE)).T.contiguous()
@@ -1292,7 +1323,7 @@ class FitB:
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
             m = self.mean(sl, g=gp, cache=cache)[0]
-            dv = deviance_terms(m, self.T[sl], self.dose(sl)).sum(dtype=torch.float64)
+            dv = self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64)
             grad += torch.autograd.grad(dv, gp)[0]; dev += float(dv)
         all_sum(grad)
         self.remember_data_loss(all_sum_float(dev, self.T.device))
@@ -1340,9 +1371,9 @@ class FitB:
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
             Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb, dtex)
             mm = m.clamp_min(1e-12); T = self.T[sl]
-            grad += torch.einsum('pk,npk->n', self.dose(sl) * (1 - T / mm), Jg).double()
-            F += torch.einsum('pk,apk,bpk->ab', self.dose(sl) / mm, Jg, Jg).double()
-            dev += float(deviance_terms(m, T, self.dose(sl)).sum(dtype=torch.float64))
+            grad += torch.einsum('pk,npk->n', self.residual(sl, T, mm), Jg).double()
+            F += torch.einsum('pk,apk,bpk->ab', self.weight(sl, mm), Jg, Jg).double()
+            dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
             del Jg
         all_sum(grad); all_sum(F)
         self.remember_data_loss(all_sum_float(dev, self.T.device))
