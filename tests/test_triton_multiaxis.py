@@ -18,17 +18,17 @@ the degenerate parallel-beam case; the sweep and the strong constant tilt each
 move the footprint, the clip bound and the mass-conserving amplitude.  Two more
 variants move the contract without touching elevation: a nonzero det_row_offset
 shifts the row anchor off the grid, and a wide voxel_row_aspect raises
-psf_radius from 1 to 2, lengthening both tap loops.
+det_channel_radius and det_row_radius from 1 to 2, lengthening both tap loops.
 
 The FORWARD kernel adds a class of its own: COVERAGE.  It inverts the
 slice-to-row map instead of mirroring the torch body's scatter, so it has to
 enumerate the recon slices that reach each detector row, and at a tilted view
-more of them reach one row than the 2 * psf_radius + 1 taps the back kernel
+more of them reach one row than the 2 * det_row_radius + 1 taps the back kernel
 uses.  The bound that sets the enumeration is checked directly against a brute
 force count of the contributing slices (a CPU test, so it runs everywhere), and
-a thin-slice shape where that bound provably exceeds psf_radius carries the
+a thin-slice shape where that bound provably exceeds det_row_radius carries the
 parity statement on a GPU.  The five variants below do NOT reach that case --
-each of them needs one slice tap on each side, which psf_radius already covers
+each of them needs one slice tap on each side, which det_row_radius already covers
 -- so the coverage tests use their own shapes and say so.
 
 One more class sits beside those.  Each wrapper rounds a width up to a multiple
@@ -105,7 +105,7 @@ def _ma_model(shape=(6, 12, 12), elevation="sweep", row_aspect=1.0,
 
     ``slice_aspect`` thins the voxel slice pitch against the detector row
     pitch, which is what lowers the slice-to-row slope below the point where
-    psf_radius still covers the forward kernel's slice enumeration.  It is not
+    det_row_radius still covers the forward kernel's slice enumeration.  It is not
     part of the variant sweep; only the forward coverage tests set it."""
     num_views = shape[0]
     azimuth = np.linspace(0, np.pi, num_views, endpoint=False)
@@ -184,7 +184,9 @@ def test_multiaxis_back_kernel_parity(variant, coeff_power, tol):
     assert bool(kernel_out.isfinite().all())
     rel = _rel_max(kernel_out, reference)
     print(f"multiaxis back triton parity ({variant}, "
-          f"coeff_power={coeff_power}, psf_radius={args['psf_radius']}): "
+          f"coeff_power={coeff_power}, "
+          f"det_channel_radius={args['det_channel_radius']}, "
+          f"det_row_radius={args['det_row_radius']}): "
           f"rel_max = {rel:.2e}")
     assert rel <= tol
 
@@ -300,7 +302,7 @@ def test_multiaxis_back_kernel_pixel_padding(num_pixels):
 # The shape the forward COVERAGE tests use.  A thin voxel slice pitch against
 # the detector row pitch lowers the slice-to-row slope without touching the
 # vertical footprint, which is exactly what makes more slices reach one row
-# than psf_radius counts.  It is deliberately not one of the VARIANTS: those
+# than det_row_radius counts.  It is deliberately not one of the VARIANTS: those
 # sweep the contract for the parity gates, and every one of them happens to
 # need a single slice tap on each side.
 THIN_SLICE_SHAPE = dict(elevation="tilt", slice_aspect=0.5)
@@ -378,8 +380,8 @@ def test_multiaxis_forward_slice_tap_radius_covers_every_contributing_slice(
     reach, slope, w_p_r, args = _slice_reach(model)
     radius = _multiaxis_slice_tap_radius(w_p_r, slope)
     print(f"multiaxis forward slice-tap coverage ({variant}): "
-          f"reach = {reach}, bound = {radius}, psf_radius = "
-          f"{args['psf_radius']}")
+          f"reach = {reach}, bound = {radius}, det_row_radius = "
+          f"{args['det_row_radius']}")
     assert radius >= reach
     # The bound is not free to grow without limit either.  Two statements of
     # that: it stays under the wrapper's cap, so these shapes launch the kernel
@@ -411,7 +413,7 @@ def test_multiaxis_forward_kernel_parity(variant):
     assert bool(kernel_out.isfinite().all())
     rel = _rel_max(kernel_out, reference)
     print(f"multiaxis forward triton parity ({variant}, "
-          f"psf_radius={args['psf_radius']}): rel_max = {rel:.2e}")
+          f"det_channel_radius={args['det_channel_radius']}): rel_max = {rel:.2e}")
     assert rel <= 1e-5
 
 

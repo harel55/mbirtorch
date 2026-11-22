@@ -321,9 +321,6 @@ class QGGMRFDenoiser(TomographyModel):
         # The identity forward model has no projectors.
         pass
 
-    def get_psf_radius(self):
-        raise NotImplementedError('get_psf_radius is not implemented for QGGMRFDenoiser.')
-
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """This method sets ``recon_shape`` equal to the input image shape."""
         sinogram_shape = self.get_params('sinogram_shape')

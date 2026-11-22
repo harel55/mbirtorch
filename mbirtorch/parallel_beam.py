@@ -42,37 +42,41 @@ def _parallel_hfan_math(pixel_indices, view_params_batch, num_rows, num_cols,
 def _parallel_forward_view_batch(values, pixel_indices, view_params_batch,
                                  num_rows, num_cols, num_channels,
                                  delta_det_channel, det_channel_offset,
-                                 delta_voxel, delta_voxel_row, psf_radius,
+                                 delta_voxel, delta_voxel_row, det_channel_radius,
+                                 det_row_radius, vox_slice_radius,
                                  slice_start=0, plan=None):
     """This function computes the parallel-beam forward projection of one batch of views.
 
-    Detector row r corresponds to reconstruction slice r.  The function ignores ``plan``.
+    Detector row r corresponds to reconstruction slice r.  The function ignores
+    ``det_row_radius``, ``vox_slice_radius``, and ``plan``.
     """
     assert slice_start == 0
     hfan_data = _parallel_hfan_math(
         pixel_indices, view_params_batch, num_rows, num_cols, num_channels,
         delta_det_channel, det_channel_offset, delta_voxel, delta_voxel_row)
-    block = fan_forward_batch(hfan_data, values, num_channels, psf_radius)
+    block = fan_forward_batch(hfan_data, values, num_channels, det_channel_radius)
     return block.permute(0, 2, 1)
 
 
 def _parallel_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                               num_rows, num_cols, num_channels,
                               delta_det_channel, det_channel_offset,
-                              delta_voxel, delta_voxel_row, psf_radius,
+                              delta_voxel, delta_voxel_row, det_channel_radius,
+                              det_row_radius, vox_slice_radius,
                               coeff_power=1, slice_start=0, band_slices=None,
                               plan=None):
     """This function computes the parallel-beam back projection of one batch of views.
 
     The function sums the result over the views in the batch.  The function is the adjoint of
-    :func:`_parallel_forward_view_batch`.  The function ignores ``plan``.
+    :func:`_parallel_forward_view_batch`.  The function ignores ``det_row_radius``,
+    ``vox_slice_radius``, and ``plan``.
     """
     assert slice_start == 0 and band_slices is None
     hfan_data = _parallel_hfan_math(
         pixel_indices, view_params_batch, num_rows, num_cols, num_channels,
         delta_det_channel, det_channel_offset, delta_voxel, delta_voxel_row)
     sino_T = sino_batch.permute(0, 2, 1).contiguous()
-    return fan_back_batch(sino_T, hfan_data, num_channels, psf_radius,
+    return fan_back_batch(sino_T, hfan_data, num_channels, det_channel_radius,
                           coeff_power=coeff_power, reduce_views=True)
 
 
@@ -132,17 +136,20 @@ class ParallelBeamModel(TomographyModel):
     # For this reason, mbirtorch pads such a call to two pixels before the compiled code.
     min_compiled_pixel_width = 2
 
-    def get_psf_radius(self):
-        """This method returns the integer radius of the PSF kernel.
+    def _get_psf_radii(self):
+        """This method returns the tap radii of the parallel-beam projector loops as
+        (det_channel_radius, det_row_radius, vox_slice_radius).
 
-        The radius is the largest number of detector channels on either side of the center
-        channel that a voxel projects onto.
+        The channel radius is the largest number of detector channels on either side of the
+        center channel that a voxel projects onto.  The row and slice radii are 0, because
+        detector row r corresponds to slice r.
         """
         delta_det_channel, delta_voxel, voxel_row_aspect = self.get_params(
             ['delta_det_channel', 'delta_voxel', 'voxel_row_aspect'])
         delta_voxel_row = voxel_row_aspect * delta_voxel
         max_footprint = max(delta_voxel, delta_voxel_row)
-        return int(np.ceil(np.ceil(max_footprint / delta_det_channel) / 2))
+        det_channel_radius = int(np.ceil(np.ceil(max_footprint / delta_det_channel) / 2))
+        return det_channel_radius, 0, 0
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """This method sets ``recon_shape`` and ``delta_voxel`` from the detector pitches and the
@@ -215,13 +222,16 @@ class ParallelBeamModel(TomographyModel):
             self.get_params(gp_names)
         num_channels = self.get_params('sinogram_shape')[2]
         recon_shape = self.get_params('recon_shape')
+        det_channel_radius, det_row_radius, vox_slice_radius = self._get_psf_radii()
         return dict(num_rows=recon_shape[0], num_cols=recon_shape[1],
                     num_channels=num_channels,
                     delta_det_channel=delta_det_channel,
                     det_channel_offset=det_channel_offset,
                     delta_voxel=delta_voxel,
                     delta_voxel_row=voxel_row_aspect * delta_voxel,
-                    psf_radius=self.get_psf_radius())
+                    det_channel_radius=det_channel_radius,
+                    det_row_radius=det_row_radius,
+                    vox_slice_radius=vox_slice_radius)
 
     def fbp_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         """

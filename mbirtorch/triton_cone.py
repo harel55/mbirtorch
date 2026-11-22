@@ -90,8 +90,8 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                       num_views, num_pixels, num_channels, num_rows, band_len,
                       slice_start, sino_view_stride,
                       delta_voxel_slice, slice_center, inv_sdd, num_rows_f,
-                      PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
-                      ACCUMULATE: tl.constexpr,
+                      DET_CHANNEL_RADIUS: tl.constexpr, DET_ROW_RADIUS: tl.constexpr,
+                      COEFF_POWER: tl.constexpr, ACCUMULATE: tl.constexpr,
                       BLOCK_P: tl.constexpr, BLOCK_L: tl.constexpr):
     """This function is the Triton back projection kernel.  Each Triton program computes
     one block of pixels and one block of slices of the output.
@@ -135,15 +135,15 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
         m_center = _tl_floor(m + 0.5)                        # Ties carry zero weight.
         # The center is clamped before the integer conversions in the tap loop, because
         # conversion from float to int is undefined outside the int32 range.
-        m_center = tl.minimum(tl.maximum(m_center, -1.0 - PSF_RADIUS),
-                              num_rows_f + PSF_RADIUS)
+        m_center = tl.minimum(tl.maximum(m_center, -1.0 - DET_ROW_RADIUS),
+                              num_rows_f + DET_ROW_RADIUS)
         v_det = pixel_mag[:, None] * (z_at_k[None, :] + z_offset)
         inv_cos_phi = _tl_sqrt(1.0 + (v_det * inv_sdd) * (v_det * inv_sdd))
         l_max_r = tl.minimum(w_p_r, 1.0)[:, None]
         sino_view_ptr = sino_ptr + v.to(tl.int64) * sino_view_stride
 
-        for tr in _tap_range(0, 2 * PSF_RADIUS + 1):
-            m_tap = m_center + (tr - PSF_RADIUS)
+        for tr in _tap_range(0, 2 * DET_ROW_RADIUS + 1):
+            m_tap = m_center + (tr - DET_ROW_RADIUS)
             m_tap_i = m_tap.to(tl.int32)
             w_row = tl.maximum((w_p_r[:, None] + 1.0) / 2.0
                                - _tl_abs(m - m_tap), 0.0)
@@ -155,10 +155,10 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
             m_row = tl.minimum(tl.maximum(m_tap_i, 0), num_rows - 1)
 
             row_vals = tl.zeros((BLOCK_P, BLOCK_L), dtype=tl.float32)
-            for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+            for tc in _tap_range(0, 2 * DET_CHANNEL_RADIUS + 1):
                 # The weight is zero where the tap is outside the detector.  Then the
                 # index is clamped into range.
-                n_tap = centers + (tc - PSF_RADIUS)
+                n_tap = centers + (tc - DET_CHANNEL_RADIUS)
                 w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                                     - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
                 w_chan = tl.minimum(w_chan, tl.minimum(w_p_c, 1.0)) * weight_scale
@@ -222,7 +222,8 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
                                  det_channel_offset, det_row_offset,
                                  recon_slice_offset, magnification,
                                  source_detector_dist, use_curved_detector,
-                                 psf_radius, bp_psf_radius, coeff_power=1,
+                                 det_channel_radius, det_row_radius,
+                                 vox_slice_radius, coeff_power=1,
                                  slice_start=0, band_slices=None, plan=None,
                                  accumulate_into=None):
     """This function computes the cone beam back projection of one batch of views with
@@ -231,7 +232,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     The function has the same signature and returns the same (P, band_slices) tensor.  Each
     call allocates a new output tensor, so the caller may add into it in place.  When the
     number of slices is not a multiple of 16, the output is a strided view.  torch.compile
-    does not compile this function.  The function ignores ``bp_psf_radius`` and ``plan``.
+    does not compile this function.  The function ignores ``vox_slice_radius`` and ``plan``.
 
     ``accumulate_into`` is None or the output of an earlier call with the same pixels and
     slices.  If it is given, the function adds this batch to it in place and returns it.
@@ -249,8 +250,8 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
             delta_voxel, delta_voxel_row, delta_voxel_slice, delta_det_channel,
             delta_det_row, det_channel_offset, det_row_offset,
             recon_slice_offset, magnification, source_detector_dist,
-            use_curved_detector, psf_radius, bp_psf_radius,
-            coeff_power=coeff_power, slice_start=slice_start,
+            use_curved_detector, det_channel_radius, det_row_radius,
+            vox_slice_radius, coeff_power=coeff_power, slice_start=slice_start,
             band_slices=band_slices, plan=plan)
         return block if accumulate_into is None else accumulate_into.add_(block)
 
@@ -284,8 +285,8 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     grid = (-(-num_pixels // block_p), -(-launch_band // block_l))
     inv_sdd = (0.0 if math.isinf(float(source_detector_dist))
                else 1.0 / float(source_detector_dist))
-    launch_key = ('back', sino_batch.device.index, int(psf_radius),
-                  int(coeff_power), target is not None, block_p, block_l,
+    launch_key = ('back', sino_batch.device.index, int(det_channel_radius),
+                  int(det_row_radius), int(coeff_power), target is not None, block_p, block_l,
                   int(num_views), int(num_pixels), int(num_channels),
                   int(num_rows_r), launch_band, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
@@ -300,7 +301,8 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
             int(num_channels) * int(num_rows_r),
             float(delta_voxel_slice), (int(num_slices) - 1) / 2.0, inv_sdd,
             float(num_rows_r),
-            PSF_RADIUS=int(psf_radius), COEFF_POWER=int(coeff_power),
+            DET_CHANNEL_RADIUS=int(det_channel_radius),
+            DET_ROW_RADIUS=int(det_row_radius), COEFF_POWER=int(coeff_power),
             ACCUMULATE=target is not None,
             BLOCK_P=block_p, BLOCK_L=block_l,
             num_warps=CONE_BACK_NUM_WARPS, num_stages=CONE_BACK_NUM_STAGES)
@@ -360,7 +362,8 @@ def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                          slice_start, out_view_stride,
                          delta_voxel_slice, slice_center, inv_sdd,
                          k_center_lo, k_center_hi,
-                         PSF_RADIUS: tl.constexpr, BP_PSF_RADIUS: tl.constexpr,
+                         DET_CHANNEL_RADIUS: tl.constexpr,
+                         VOX_SLICE_RADIUS: tl.constexpr,
                          BLOCK_P: tl.constexpr, BLOCK_R: tl.constexpr):
     """This function is the Triton forward projection kernel.  Each Triton program computes
     one block of pixels, one block of detector rows, and one view.
@@ -405,8 +408,8 @@ def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
     l_max_r = tl.minimum(w_p_r, 1.0)[:, None]
 
     det_col = tl.zeros((BLOCK_P, BLOCK_R), dtype=tl.float32)
-    for tk in _tap_range(0, 2 * BP_PSF_RADIUS + 1):
-        k_off = tk - BP_PSF_RADIUS
+    for tk in _tap_range(0, 2 * VOX_SLICE_RADIUS + 1):
+        k_off = tk - VOX_SLICE_RADIUS
         k_ind = k_center + k_off
         k_ind_i = k_ind.to(tl.int32)
         w_slice = tl.maximum((slope + 1.0) / 2.0 - _tl_abs(m_p + slope * k_off),
@@ -430,10 +433,10 @@ def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
 
     # This loop adds each channel tap into the output with one atomic add.
     out_view_ptr = out_ptr + v.to(tl.int64) * out_view_stride
-    for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+    for tc in _tap_range(0, 2 * DET_CHANNEL_RADIUS + 1):
         # This is the same trapezoid weight as in the back kernel.  The atomic mask skips
         # taps outside the detector.
-        n_tap = centers + (tc - PSF_RADIUS)
+        n_tap = centers + (tc - DET_CHANNEL_RADIUS)
         w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                             - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
         w_chan = tl.minimum(w_chan, tl.minimum(w_p_c, 1.0)) * weight_scale
@@ -454,15 +457,15 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
                                     det_channel_offset, det_row_offset,
                                     recon_slice_offset, magnification,
                                     source_detector_dist, use_curved_detector,
-                                    psf_radius, bp_psf_radius, slice_start=0,
-                                    plan=None):
+                                    det_channel_radius, det_row_radius,
+                                    vox_slice_radius, slice_start=0, plan=None):
     """This function computes the cone beam forward projection of one batch of views with
     Triton.  It replaces :func:`mbirtorch.cone_beam._cone_forward_view_batch`.
 
     The function has the same signature and returns the same (Vb, R, C) tensor.  ``values``
     has shape (P, L).  When L is less than num_slices, ``values`` holds the L slices that
     start at ``slice_start``.  The sum of the outputs over slice ranges that cover the volume
-    is the full projection.  The function ignores ``plan``.
+    is the full projection.  The function ignores ``det_row_radius`` and ``plan``.
     """
     if triton is None:
         raise RuntimeError('the Triton cone forward body was called without '
@@ -499,10 +502,10 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
                else 1.0 / float(source_detector_dist))
     # The kernel clamps the center slice to these bounds.  At the low bound, the highest
     # tap is slice_start - 1.  At the high bound, the lowest tap is slice_start + band_len.
-    bp = int(bp_psf_radius)
-    k_center_lo = float(int(slice_start) - bp - 1)
-    k_center_hi = float(int(slice_start) + band_len + bp)
-    launch_key = ('fwd', values.device.index, int(psf_radius), bp, block_p,
+    slice_radius = int(vox_slice_radius)
+    k_center_lo = float(int(slice_start) - slice_radius - 1)
+    k_center_hi = float(int(slice_start) + band_len + slice_radius)
+    launch_key = ('fwd', values.device.index, int(det_channel_radius), slice_radius, block_p,
                   block_r, int(num_views),
                   int(num_pixels), int(num_channels), launch_rows,
                   band_len, int(slice_start))
@@ -517,7 +520,7 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
             int(slice_start), int(num_channels) * launch_rows,
             float(delta_voxel_slice), (int(num_slices) - 1) / 2.0, inv_sdd,
             k_center_lo, k_center_hi,
-            PSF_RADIUS=int(psf_radius), BP_PSF_RADIUS=bp,
+            DET_CHANNEL_RADIUS=int(det_channel_radius), VOX_SLICE_RADIUS=slice_radius,
             BLOCK_P=block_p, BLOCK_R=block_r,
             num_warps=CONE_FWD_NUM_WARPS, num_stages=CONE_FWD_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)

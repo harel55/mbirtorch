@@ -159,8 +159,8 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
                              delta_det_channel, delta_det_row,
                              det_channel_offset, det_row_offset, recon_slice_offset,
                              magnification, source_detector_dist,
-                             use_curved_detector, psf_radius, bp_psf_radius,
-                             slice_start=0, plan=None):
+                             use_curved_detector, det_channel_radius, det_row_radius,
+                             vox_slice_radius, slice_start=0, plan=None):
     """This function computes the cone-beam forward projection of one batch of views.
 
     The output has shape (Vb, R, C).  ``values`` can hold only some of the slices.  In that case
@@ -201,7 +201,7 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
     m_p = slope * (k_center.to(_F32) - k_m)
 
     det_col = torch.zeros((vb, num_pixels, num_rows_r), dtype=_F32, device=dev)
-    for k_off in range(-bp_psf_radius, bp_psf_radius + 1):
+    for k_off in range(-vox_slice_radius, vox_slice_radius + 1):
         k_ind = k_center + k_off
         A = torch.clamp((slope + 1.0) / 2.0 - (m_p + slope * k_off).abs(), min=0.0)
         A = torch.minimum(A, L_max_r)
@@ -212,7 +212,7 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
         det_col = det_col + A * g
 
     acc = fan_forward_batch((n_p, centers, W_p_c, weight_scale), det_col,
-                            num_channels, psf_radius)
+                            num_channels, det_channel_radius)
     return acc.permute(0, 2, 1)
 
 
@@ -222,8 +222,8 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                           delta_voxel_row, delta_voxel_slice,
                           delta_det_channel, delta_det_row, det_channel_offset,
                           det_row_offset, recon_slice_offset, magnification,
-                          source_detector_dist, use_curved_detector, psf_radius,
-                          bp_psf_radius, coeff_power=1, slice_start=0,
+                          source_detector_dist, use_curved_detector, det_channel_radius,
+                          det_row_radius, vox_slice_radius, coeff_power=1, slice_start=0,
                           band_slices=None, plan=None):
     """This function computes the cone-beam back projection of one batch of views.
 
@@ -242,7 +242,7 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
 
     sino_T = sino_batch.permute(0, 2, 1).contiguous()
     det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
-                             num_channels, psf_radius,
+                             num_channels, det_channel_radius,
                              coeff_power=coeff_power, reduce_views=False)
 
     m0, W_p_r, z_offset = _cone_vertical_affine(
@@ -262,7 +262,7 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     L_max_r = torch.clamp(slope, max=1.0)
 
     out = torch.zeros((num_pixels, band_len), dtype=_F32, device=dev)
-    for m_off in range(-psf_radius, psf_radius + 1):
+    for m_off in range(-det_row_radius, det_row_radius + 1):
         mm = m_center + m_off
         L = torch.clamp((slope + 1.0) / 2.0 - (m_p - mm.to(_F32)).abs(), min=0.0)
         A = torch.minimum(L, L_max_r) / cos_phi
@@ -363,7 +363,7 @@ class ConeBeamModel(TomographyModel):
         (ddr, ddc, dro, dco, sdd, dv, vra, vsa, rso, curved) = self.get_params(gp_names)
         sinogram_shape = self.get_params('sinogram_shape')
         recon_shape = self.get_params('recon_shape')
-        psf_radius, bp_psf_radius = self.get_psf_radii()
+        det_channel_radius, det_row_radius, vox_slice_radius = self._get_psf_radii()
         return dict(num_rows_r=sinogram_shape[1], num_channels=sinogram_shape[2],
                     num_recon_rows=recon_shape[0], num_recon_cols=recon_shape[1],
                     num_slices=recon_shape[2], delta_voxel=dv,
@@ -372,7 +372,9 @@ class ConeBeamModel(TomographyModel):
                     det_channel_offset=dco, det_row_offset=dro,
                     recon_slice_offset=rso, magnification=self.get_magnification(),
                     source_detector_dist=sdd, use_curved_detector=curved,
-                    psf_radius=psf_radius, bp_psf_radius=bp_psf_radius)
+                    det_channel_radius=det_channel_radius,
+                    det_row_radius=det_row_radius,
+                    vox_slice_radius=vox_slice_radius)
 
     def _transient_cols(self, band_cols):
         # The cone-beam projection functions hold temporary arrays of shape (Vb, P, S) and
@@ -499,15 +501,13 @@ class ConeBeamModel(TomographyModel):
             warnings.warn('Cone angle is more than 45 degrees.  This will likely '
                           'produce recon artifacts.')
 
-    def get_psf_radii(self):
-        """This method returns the two integer PSF radii.  It does not set any attributes.
+    def _get_psf_radii(self):
+        """This method returns the tap radii of the cone-beam projector loops as
+        (det_channel_radius, det_row_radius, vox_slice_radius).
 
-        ``psf_radius`` is the radius in detector pixels at the largest magnification.
-        ``bp_psf_radius`` is the radius in voxels of one detector pixel at the smallest
-        magnification.
-
-        Returns:
-            tuple of int: (psf_radius, bp_psf_radius).
+        The channel and row radii are in detector pixels at the largest magnification.  The
+        channel radius uses only the in-plane voxel pitches.  The slice radius is in voxels of
+        one detector pixel at the smallest magnification.
         """
         (delta_det_row, delta_det_channel, source_detector_dist, recon_shape,
          delta_voxel, voxel_row_aspect, voxel_slice_aspect) = self.get_params(
@@ -529,15 +529,15 @@ class ConeBeamModel(TomographyModel):
             min_magnification = source_detector_dist / (source_to_iso_dist + half_xy_extent)
 
         max_voxel_pitch = max(delta_voxel, delta_voxel_row, delta_voxel_slice)
-        psf_radius = int(np.ceil(np.ceil(max_voxel_pitch * max_magnification / delta_det) / 2))
+        det_row_radius = int(np.ceil(np.ceil(max_voxel_pitch * max_magnification / delta_det)
+                                     / 2))
         min_voxel_pitch = min(delta_voxel, delta_voxel_row, delta_voxel_slice)
         max_voxels_per_detector = delta_det / (min_magnification * min_voxel_pitch)
-        bp_psf_radius = int(np.ceil(np.ceil(max_voxels_per_detector) / 2))
-        return psf_radius, bp_psf_radius
-
-    def get_psf_radius(self):
-        """This method returns the integer radius of the PSF in detector channels."""
-        return self.get_psf_radii()[0]
+        vox_slice_radius = int(np.ceil(np.ceil(max_voxels_per_detector) / 2))
+        max_in_plane_pitch = max(delta_voxel, delta_voxel_row)
+        det_channel_radius = int(np.ceil(np.ceil(max_in_plane_pitch * max_magnification
+                                                 / delta_det) / 2))
+        return det_channel_radius, det_row_radius, vox_slice_radius
 
     def pixel_magnification_bounds(self, support_radius=None):
         """This method returns the smallest and largest pixel magnification over the support.

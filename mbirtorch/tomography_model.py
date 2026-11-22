@@ -255,7 +255,15 @@ class TomographyModel(ParameterHandler):
         returns 1.0."""
         raise NotImplementedError
 
-    def get_psf_radius(self):
+    def _get_psf_radii(self):
+        """This method returns the three tap radii of the projector loops as integers, in the
+        order (det_channel_radius, det_row_radius, vox_slice_radius).
+
+        A radius is the number of cells on each side of the center that a loop visits, so the
+        loop visits 2 * radius + 1 cells.  ``det_channel_radius`` counts detector channels around
+        a voxel.  ``det_row_radius`` counts detector rows around a voxel.  ``vox_slice_radius``
+        counts recon slices around a detector row.  A radius that no loop of the geometry reads
+        is 0.  Each geometry implements this method."""
         raise NotImplementedError
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):

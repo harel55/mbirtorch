@@ -78,11 +78,13 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
                                   delta_voxel_row, delta_voxel_slice,
                                   delta_det_channel, delta_det_row,
                                   det_channel_offset, det_row_offset,
-                                  recon_slice_offset, psf_radius,
+                                  recon_slice_offset, det_channel_radius,
+                                  det_row_radius, vox_slice_radius,
                                   slice_start=0, plan=None):
     """This function returns the forward projection of one batch of views, with shape
     (Vb, R, C).  The argument ``values`` may hold a contiguous range of slices, with shape
-    (P, L), that starts at ``slice_start``.  The function ignores ``plan``.
+    (P, L), that starts at ``slice_start``.  The function ignores ``vox_slice_radius`` and
+    ``plan``.
     """
     azimuth = view_params_batch[:, 0]
     elevation = view_params_batch[:, 1]
@@ -110,7 +112,7 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
     W_b = W_p_r.unsqueeze(-1)
     L_max_b = L_max.unsqueeze(-1)
     det_col = torch.zeros((vb, num_pixels, num_rows_r), dtype=_F32, device=dev)
-    for m_off in range(-psf_radius, psf_radius + 1):
+    for m_off in range(-det_row_radius, det_row_radius + 1):
         m = m_center + m_off
         A = torch.clamp((W_b + 1.0) / 2.0 - (m_p - m.to(_F32)).abs(), min=0.0)
         A = torch.minimum(A, L_max_b)
@@ -118,7 +120,7 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
         det_col.scatter_add_(2, m.clamp(0, num_rows_r - 1), scaled_values * A)
 
     acc = fan_forward_batch((n_p, centers, W_p_c, weight_scale), det_col,
-                            num_channels, psf_radius)
+                            num_channels, det_channel_radius)
     return acc.permute(0, 2, 1)
 
 
@@ -128,11 +130,12 @@ def _multiaxis_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                                delta_voxel_row, delta_voxel_slice,
                                delta_det_channel, delta_det_row,
                                det_channel_offset, det_row_offset,
-                               recon_slice_offset, psf_radius, coeff_power=1,
+                               recon_slice_offset, det_channel_radius, det_row_radius,
+                               vox_slice_radius, coeff_power=1,
                                slice_start=0, band_slices=None, plan=None):
     """This function computes the back projection of one batch of views, summed over the
     views.  The result has shape (P, S), or (P, band_slices) when ``band_slices`` is given.
-    The function ignores ``plan``.
+    The function ignores ``vox_slice_radius`` and ``plan``.
     """
     azimuth = view_params_batch[:, 0]
     elevation = view_params_batch[:, 1]
@@ -144,7 +147,7 @@ def _multiaxis_back_view_batch(sino_batch, pixel_indices, view_params_batch,
 
     sino_T = sino_batch.permute(0, 2, 1).contiguous()                # (Vb, C, R)
     det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
-                             num_channels, psf_radius,
+                             num_channels, det_channel_radius,
                              coeff_power=coeff_power, reduce_views=False)
 
     m0, slope, W_p_r, L_max, scaling = _multiaxis_vertical_terms(
@@ -161,7 +164,7 @@ def _multiaxis_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     L_max_b = L_max.unsqueeze(-1)
     scale_pow = (scaling ** coeff_power).unsqueeze(-1)               # (Vb, 1, 1)
     out = torch.zeros((num_pixels, band_len), dtype=_F32, device=dev)
-    for m_off in range(-psf_radius, psf_radius + 1):
+    for m_off in range(-det_row_radius, det_row_radius + 1):
         mm = m_center + m_off
         A = torch.clamp((W_b + 1.0) / 2.0 - (m_p - mm.to(_F32)).abs(), min=0.0)
         A = torch.minimum(A, L_max_b)
@@ -256,6 +259,7 @@ class MultiAxisParallelModel(TomographyModel):
         (ddr, ddc, dro, dco, dv, vra, vsa, rso) = self.get_params(gp_names)
         sinogram_shape = self.get_params('sinogram_shape')
         recon_shape = self.get_params('recon_shape')
+        det_channel_radius, det_row_radius, vox_slice_radius = self._get_psf_radii()
         return dict(num_rows_r=sinogram_shape[1], num_channels=sinogram_shape[2],
                     num_recon_rows=recon_shape[0], num_recon_cols=recon_shape[1],
                     num_slices=recon_shape[2], delta_voxel=dv,
@@ -263,7 +267,9 @@ class MultiAxisParallelModel(TomographyModel):
                     delta_det_channel=ddc, delta_det_row=ddr,
                     det_channel_offset=dco, det_row_offset=dro,
                     recon_slice_offset=rso,
-                    psf_radius=self.get_psf_radius())
+                    det_channel_radius=det_channel_radius,
+                    det_row_radius=det_row_radius,
+                    vox_slice_radius=vox_slice_radius)
 
     def _transient_cols(self, band_cols):
         # The projectors hold (Vb, P, S) and (Vb, P, R) temporary arrays for any slice range.
@@ -287,9 +293,11 @@ class MultiAxisParallelModel(TomographyModel):
             raise ValueError("Each view requires exactly 2 angles: "
                              "[azimuth, elevation].")
 
-    def get_psf_radius(self):
-        """This method returns the integer radius of the psf kernel.  The radius is the larger
-        of the horizontal and vertical radii over all views."""
+    def _get_psf_radii(self):
+        """This method returns the tap radii of the multiaxis projector loops as
+        (det_channel_radius, det_row_radius, vox_slice_radius).  The channel and row radii both
+        equal the larger of the horizontal and vertical radii over all views.  The slice radius
+        is 0, because no loop reads it."""
         (delta_det_channel, delta_det_row, delta_voxel, voxel_row_aspect,
          voxel_slice_aspect) = self.get_params(
             ['delta_det_channel', 'delta_det_row', 'delta_voxel',
@@ -313,7 +321,8 @@ class MultiAxisParallelModel(TomographyModel):
         vertical_footprint = max(z_edge, in_plane_edge)
         psf_radius_v = int(np.ceil(np.ceil(vertical_footprint / delta_det_row) / 2))
 
-        return max(psf_radius_u, psf_radius_v)
+        radius = max(psf_radius_u, psf_radius_v)
+        return radius, radius, 0
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """This method sets the reconstruction shape to the largest box that projects onto the

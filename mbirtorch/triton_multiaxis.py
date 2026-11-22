@@ -83,7 +83,8 @@ def _multiaxis_back_kernel(n_p_ptr, centers_ptr, m0_ptr,
                            num_views, num_pixels, num_channels, num_rows,
                            band_len, slice_start, num_slices,
                            sino_view_stride, num_rows_f,
-                           PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
+                           DET_CHANNEL_RADIUS: tl.constexpr,
+                           DET_ROW_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
                            ACCUMULATE: tl.constexpr,
                            BLOCK_P: tl.constexpr, BLOCK_L: tl.constexpr):
     """This function is the Triton back projection kernel.  Each program computes one block of
@@ -132,12 +133,12 @@ def _multiaxis_back_kernel(n_p_ptr, centers_ptr, m0_ptr,
         m_center = _tl_floor(m + 0.5)                        # Ties carry zero weight.
         # The center is clamped before the conversions to int in the tap loop,
         # because float to int conversion is undefined outside the int32 range.
-        m_center = tl.minimum(tl.maximum(m_center, -1.0 - PSF_RADIUS),
-                              num_rows_f + PSF_RADIUS)
+        m_center = tl.minimum(tl.maximum(m_center, -1.0 - DET_ROW_RADIUS),
+                              num_rows_f + DET_ROW_RADIUS)
         sino_view_ptr = sino_ptr + v.to(tl.int64) * sino_view_stride
 
-        for tr in _tap_range(0, 2 * PSF_RADIUS + 1):
-            m_tap = m_center + (tr - PSF_RADIUS)
+        for tr in _tap_range(0, 2 * DET_ROW_RADIUS + 1):
+            m_tap = m_center + (tr - DET_ROW_RADIUS)
             m_tap_i = m_tap.to(tl.int32)
             # In the vertical trapezoid rule, the footprint sets the width, and l_max_r caps it.
             # A tap outside the detector gets weight zero, and its index is then clamped.
@@ -153,9 +154,9 @@ def _multiaxis_back_kernel(n_p_ptr, centers_ptr, m0_ptr,
             m_row = tl.minimum(tl.maximum(m_tap_i, 0), num_rows - 1)
 
             row_vals = tl.zeros((BLOCK_P, BLOCK_L), dtype=tl.float32)
-            for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+            for tc in _tap_range(0, 2 * DET_CHANNEL_RADIUS + 1):
                 # A tap outside the detector gets weight zero, and its index is then clamped.
-                n_tap = centers + (tc - PSF_RADIUS)
+                n_tap = centers + (tc - DET_CHANNEL_RADIUS)
                 w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                                     - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
                 w_chan = tl.minimum(w_chan, clip_c) * weight_scale
@@ -188,7 +189,8 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
                                       delta_voxel_row, delta_voxel_slice,
                                       delta_det_channel, delta_det_row,
                                       det_channel_offset, det_row_offset,
-                                      recon_slice_offset, psf_radius,
+                                      recon_slice_offset, det_channel_radius,
+                                      det_row_radius, vox_slice_radius,
                                       coeff_power=1, slice_start=0,
                                       band_slices=None, plan=None,
                                       accumulate_into=None):
@@ -198,7 +200,7 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
     it has the same signature.  It returns a new array of shape (P, band_len) on each call, so
     the caller can add into the array in place.  If band_len is not a multiple of 16, the
     returned array is a strided view.  torch.compile does not compile this function.  The
-    function ignores ``plan``.
+    function ignores ``vox_slice_radius`` and ``plan``.
 
     ``accumulate_into`` is None or the output of an earlier call with the same pixels and
     slices.  If it is given, the function adds this batch to it in place and returns it.
@@ -214,7 +216,8 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
             num_channels, num_recon_rows, num_recon_cols, num_slices,
             delta_voxel, delta_voxel_row, delta_voxel_slice, delta_det_channel,
             delta_det_row, det_channel_offset, det_row_offset,
-            recon_slice_offset, psf_radius, coeff_power=coeff_power,
+            recon_slice_offset, det_channel_radius, det_row_radius,
+            vox_slice_radius, coeff_power=coeff_power,
             slice_start=slice_start, band_slices=band_slices, plan=plan)
         return block if accumulate_into is None else accumulate_into.add_(block)
 
@@ -256,8 +259,9 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
     block_l = _tile_size(MULTIAXIS_BACK_BLOCK_L, launch_band,
                          MULTIAXIS_BACK_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-launch_band // block_l))
-    launch_key = ('maback', sino_batch.device.index, int(psf_radius),
-                  int(coeff_power), target is not None, block_p, block_l,
+    launch_key = ('maback', sino_batch.device.index, int(det_channel_radius),
+                  int(det_row_radius), int(coeff_power), target is not None,
+                  block_p, block_l,
                   int(num_views), int(num_pixels), int(num_channels),
                   int(num_rows_r), launch_band, int(slice_start),
                   int(num_slices))
@@ -270,7 +274,8 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
             int(num_views), int(num_pixels), int(num_channels),
             int(num_rows_r), launch_band, int(slice_start), int(num_slices),
             int(num_channels) * int(num_rows_r), float(num_rows_r),
-            PSF_RADIUS=int(psf_radius), COEFF_POWER=int(coeff_power),
+            DET_CHANNEL_RADIUS=int(det_channel_radius),
+            DET_ROW_RADIUS=int(det_row_radius), COEFF_POWER=int(coeff_power),
             ACCUMULATE=target is not None,
             BLOCK_P=block_p, BLOCK_L=block_l,
             num_warps=MULTIAXIS_BACK_NUM_WARPS,
@@ -333,7 +338,7 @@ def _multiaxis_forward_kernel(n_p_ptr, centers_ptr, m0_ptr,
                               out_row_stride, out_view_stride,
                               band_len, slice_start, num_slices,
                               slope_floor, k_center_lo, k_center_hi,
-                              PSF_RADIUS: tl.constexpr,
+                              DET_CHANNEL_RADIUS: tl.constexpr,
                               SLICE_RADIUS: tl.constexpr,
                               BLOCK_P: tl.constexpr, BLOCK_R: tl.constexpr):
     """This function is the Triton forward projection kernel.  Each program computes one block of
@@ -406,10 +411,10 @@ def _multiaxis_forward_kernel(n_p_ptr, centers_ptr, m0_ptr,
 
     # Each channel tap adds its contribution to the output with one atomic add.
     out_view_ptr = out_ptr + v.to(tl.int64) * out_view_stride
-    for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+    for tc in _tap_range(0, 2 * DET_CHANNEL_RADIUS + 1):
         # This applies the trapezoid rule in the channel direction.  The atomic add
         # mask excludes taps outside the detector.
-        n_tap = centers + (tc - PSF_RADIUS)
+        n_tap = centers + (tc - DET_CHANNEL_RADIUS)
         w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                             - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
         w_chan = tl.minimum(w_chan, clip_c) * weight_scale
@@ -430,7 +435,8 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
                                          delta_voxel_slice, delta_det_channel,
                                          delta_det_row, det_channel_offset,
                                          det_row_offset, recon_slice_offset,
-                                         psf_radius, slice_start=0, plan=None):
+                                         det_channel_radius, det_row_radius,
+                                         vox_slice_radius, slice_start=0, plan=None):
     """This function forward projects one batch of views with the Triton kernel.
 
     The function replaces :func:`mbirtorch.multiaxis_parallel._multiaxis_forward_view_batch`,
@@ -440,7 +446,8 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
     start at ``slice_start``.  The sum of the outputs over a set of slice ranges that covers all
     slices equals the full projection.  If the slice tap radius is larger than
     ``MULTIAXIS_FWD_MAX_SLICE_RADIUS``, the function calls the torch version instead.  The
-    function ignores ``plan``.
+    function computes its own slice tap radius, and it ignores ``det_row_radius``,
+    ``vox_slice_radius``, and ``plan``.
     """
     if triton is None:
         raise RuntimeError('the Triton multiaxis forward body was called '
@@ -467,7 +474,8 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
             num_recon_rows, num_recon_cols, num_slices, delta_voxel,
             delta_voxel_row, delta_voxel_slice, delta_det_channel,
             delta_det_row, det_channel_offset, det_row_offset,
-            recon_slice_offset, psf_radius, slice_start=slice_start, plan=plan)
+            recon_slice_offset, det_channel_radius, det_row_radius, vox_slice_radius,
+            slice_start=slice_start, plan=plan)
 
     num_views, num_pixels = n_p.shape
     band_len = int(values.shape[1])
@@ -495,7 +503,7 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
     # The kernel clamps the slice center to these bounds.
     k_center_lo = float(int(slice_start) - slice_radius - 1)
     k_center_hi = float(int(slice_start) + band_len + slice_radius)
-    launch_key = ('mafwd', values.device.index, int(psf_radius), slice_radius,
+    launch_key = ('mafwd', values.device.index, int(det_channel_radius), slice_radius,
                   block_p, block_r, int(num_views), int(num_pixels),
                   int(num_channels), int(num_rows_r), launch_rows, band_len,
                   int(slice_start), int(num_slices))
@@ -509,7 +517,7 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
             launch_rows, int(num_channels) * launch_rows,
             band_len, int(slice_start), int(num_slices),
             _SLOPE_FLOOR, k_center_lo, k_center_hi,
-            PSF_RADIUS=int(psf_radius), SLICE_RADIUS=slice_radius,
+            DET_CHANNEL_RADIUS=int(det_channel_radius), SLICE_RADIUS=slice_radius,
             BLOCK_P=block_p, BLOCK_R=block_r,
             num_warps=MULTIAXIS_FWD_NUM_WARPS,
             num_stages=MULTIAXIS_FWD_NUM_STAGES)

@@ -72,7 +72,7 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                           sino_ptr, out_ptr,
                           num_views, num_pixels, num_channels, num_band_rows,
                           sino_view_stride,
-                          PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
+                          DET_CHANNEL_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
                           ACCUMULATE: tl.constexpr,
                           BLOCK_P: tl.constexpr, BLOCK_R: tl.constexpr):
     """This function is the Triton back projection kernel.  It runs one program
@@ -104,10 +104,10 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
         clip = tl.minimum(w_p_c, 1.0)
         sino_view_ptr = sino_ptr + v.to(tl.int64) * sino_view_stride
 
-        for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+        for tc in _tap_range(0, 2 * DET_CHANNEL_RADIUS + 1):
             # The weight is zero where the tap falls off the detector.  The
             # index is then clamped to the detector.
-            n_tap = centers + (tc - PSF_RADIUS)
+            n_tap = centers + (tc - DET_CHANNEL_RADIUS)
             w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                                 - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
             w_chan = tl.minimum(w_chan, clip) * weight_scale
@@ -136,7 +136,8 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
                                      view_params_batch, num_rows, num_cols,
                                      num_channels, delta_det_channel,
                                      det_channel_offset, delta_voxel,
-                                     delta_voxel_row, psf_radius,
+                                     delta_voxel_row, det_channel_radius,
+                                     det_row_radius, vox_slice_radius,
                                      coeff_power=1, slice_start=0,
                                      band_slices=None, plan=None,
                                      accumulate_into=None):
@@ -148,7 +149,8 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     Each call allocates a new output array, so the caller may add to it in
     place.  The function is never compiled by torch.compile.  The arguments
     ``slice_start`` and ``band_slices`` must keep their defaults, because the
-    sinogram rows already select the slices.  The function ignores ``plan``.
+    sinogram rows already select the slices.  The function ignores
+    ``det_row_radius``, ``vox_slice_radius``, and ``plan``.
 
     ``accumulate_into`` is None or the output of an earlier call with the same
     pixels and rows.  If it is given, the function adds this batch to it in
@@ -165,7 +167,8 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
         block = _parallel_back_view_batch(
             sino_batch, pixel_indices, view_params_batch, num_rows, num_cols,
             num_channels, delta_det_channel, det_channel_offset, delta_voxel,
-            delta_voxel_row, psf_radius, coeff_power=coeff_power,
+            delta_voxel_row, det_channel_radius, det_row_radius,
+            vox_slice_radius, coeff_power=coeff_power,
             slice_start=slice_start, band_slices=band_slices, plan=plan)
         return block if accumulate_into is None else accumulate_into.add_(block)
 
@@ -204,7 +207,7 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     block_r = _tile_size(PARALLEL_BACK_BLOCK_R, launch_rows,
                          PARALLEL_BACK_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-launch_rows // block_r))
-    launch_key = ('pback', sino_batch.device.index, int(psf_radius),
+    launch_key = ('pback', sino_batch.device.index, int(det_channel_radius),
                   int(coeff_power), target is not None, block_p, block_r,
                   int(num_views), int(num_pixels), int(num_channels),
                   launch_rows)
@@ -217,7 +220,7 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
             *contract, sino_t, out,
             int(num_views), int(num_pixels), int(num_channels), launch_rows,
             int(num_channels) * launch_rows,
-            PSF_RADIUS=int(psf_radius), COEFF_POWER=int(coeff_power),
+            DET_CHANNEL_RADIUS=int(det_channel_radius), COEFF_POWER=int(coeff_power),
             ACCUMULATE=target is not None,
             BLOCK_P=block_p, BLOCK_R=block_r,
             num_warps=PARALLEL_BACK_NUM_WARPS,
@@ -279,7 +282,7 @@ def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                              weight_scale_ptr, values_ptr, out_ptr,
                              num_pixels, num_channels, num_cols,
                              out_view_stride,
-                             PSF_RADIUS: tl.constexpr, BLOCK_P: tl.constexpr,
+                             DET_CHANNEL_RADIUS: tl.constexpr, BLOCK_P: tl.constexpr,
                              BLOCK_R: tl.constexpr):
     """This function is the Triton forward projection kernel that loops over
     the channel taps.  It runs one program for each triple (pixel block,
@@ -313,10 +316,10 @@ def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                    + r_offs[None, :], mask=tile_mask, other=0.0)
 
     out_view_ptr = out_ptr + v.to(tl.int64) * out_view_stride
-    for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+    for tc in _tap_range(0, 2 * DET_CHANNEL_RADIUS + 1):
         # The weights use the same trapezoid formula as the back projection.  The
         # mask excludes taps outside the detector, so no atomic add occurs for them.
-        n_tap = centers + (tc - PSF_RADIUS)
+        n_tap = centers + (tc - DET_CHANNEL_RADIUS)
         w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                             - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
         w_chan = tl.minimum(w_chan, clip) * weight_scale
@@ -335,7 +338,7 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                                     num_channels, num_cols, out_view_stride,
                                     VIEW_CHUNK: tl.constexpr,
                                     WINDOW: tl.constexpr,
-                                    PSF_RADIUS: tl.constexpr,
+                                    DET_CHANNEL_RADIUS: tl.constexpr,
                                     BLOCK_P: tl.constexpr,
                                     BLOCK_R: tl.constexpr):
     """This function is the Triton forward projection kernel that sorts the
@@ -374,8 +377,8 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                        + r_offs[None, :], mask=tile_mask, other=0.0)
 
         big = 2147483647
-        c_lo = tl.min(tl.where(p_mask, centers, big)) - PSF_RADIUS
-        c_hi = tl.max(tl.where(p_mask, centers, -big)) + PSF_RADIUS
+        c_lo = tl.min(tl.where(p_mask, centers, big)) - DET_CHANNEL_RADIUS
+        c_hi = tl.max(tl.where(p_mask, centers, -big)) + DET_CHANNEL_RADIUS
         span = c_hi - c_lo + 1
         if span <= WINDOW:
             # The window weights use the same trapezoid formula at every channel of
@@ -403,8 +406,8 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                                    & (c < num_channels))[:, None]
                                 & r_mask[None, :]))
         else:
-            for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
-                n_tap = centers + (tc - PSF_RADIUS)
+            for tc in _tap_range(0, 2 * DET_CHANNEL_RADIUS + 1):
+                n_tap = centers + (tc - DET_CHANNEL_RADIUS)
                 w_chan = tl.maximum(
                     (w_p_c + 1.0) / 2.0
                     - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
@@ -424,7 +427,8 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                                         view_params_batch, num_rows, num_cols,
                                         num_channels, delta_det_channel,
                                         det_channel_offset, delta_voxel,
-                                        delta_voxel_row, psf_radius,
+                                        delta_voxel_row, det_channel_radius,
+                                        det_row_radius, vox_slice_radius,
                                         slice_start=0, plan=None):
     """This function computes the parallel-beam forward projection of one batch
     of views with a Triton kernel.  It replaces
@@ -434,7 +438,7 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
     array.  The argument ``values`` has shape (P, cols), where cols is the
     number of detector rows that this call produces.  The argument
     ``slice_start`` must be 0, because each slice maps to one detector row.
-    The function ignores ``plan``.
+    The function ignores ``det_row_radius``, ``vox_slice_radius``, and ``plan``.
     """
     if triton is None:
         raise RuntimeError('the Triton parallel forward body was called '
@@ -478,7 +482,7 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                                  PARALLEL_SORTED_MIN_R))
         grid = (-(-num_pixels // block_p), -(-launch_cols // block_r),
                 -(-num_views // PARALLEL_SORTED_VIEW_CHUNK))
-        launch_key = ('pfwd_sorted', values.device.index, int(psf_radius),
+        launch_key = ('pfwd_sorted', values.device.index, int(det_channel_radius),
                       block_p, block_r, int(num_views),
                       int(num_pixels), int(num_channels), launch_cols)
         first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
@@ -491,7 +495,7 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                 launch_cols, int(num_channels) * launch_cols,
                 VIEW_CHUNK=PARALLEL_SORTED_VIEW_CHUNK,
                 WINDOW=PARALLEL_SORTED_WINDOW,
-                PSF_RADIUS=int(psf_radius), BLOCK_P=block_p,
+                DET_CHANNEL_RADIUS=int(det_channel_radius), BLOCK_P=block_p,
                 BLOCK_R=block_r,
                 num_warps=PARALLEL_SORTED_NUM_WARPS,
                 num_stages=PARALLEL_SORTED_NUM_STAGES)
@@ -516,7 +520,7 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                          PARALLEL_FWD_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-launch_cols // block_r),
             num_views)
-    launch_key = ('pfwd', values.device.index, int(psf_radius), block_p,
+    launch_key = ('pfwd', values.device.index, int(det_channel_radius), block_p,
                   block_r, int(num_views),
                   int(num_pixels), int(num_channels), launch_cols)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
@@ -528,7 +532,7 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
             *contract, values, out,
             int(num_pixels), int(num_channels), launch_cols,
             int(num_channels) * launch_cols,
-            PSF_RADIUS=int(psf_radius), BLOCK_P=block_p, BLOCK_R=block_r,
+            DET_CHANNEL_RADIUS=int(det_channel_radius), BLOCK_P=block_p, BLOCK_R=block_r,
             num_warps=PARALLEL_FWD_NUM_WARPS,
             num_stages=PARALLEL_FWD_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)

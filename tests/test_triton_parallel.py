@@ -53,7 +53,7 @@ requires_cuda = pytest.mark.skipif(
     reason="the hand-written Triton kernels need a CUDA device")
 
 # The three contract variants the parity tests sweep.  They are not cosmetic:
-# voxel_row_aspect widens the projected footprint enough to raise psf_radius
+# voxel_row_aspect widens the projected footprint enough to raise det_channel_radius
 # from 1 to 2 (a longer tap loop, and W_p_c > 1 so the min(1, W_p_c) clip
 # binds), and det_channel_offset shifts n_p off the channel grid so the tap
 # centers and their trapezoid weights all move.
@@ -128,7 +128,8 @@ def test_parallel_back_kernel_parity(variant, coeff_power, tol):
     assert bool(kernel_out.isfinite().all())
     rel = _rel_max(kernel_out, reference)
     print(f"parallel back triton parity ({variant}, "
-          f"coeff_power={coeff_power}, psf_radius={args['psf_radius']}): "
+          f"coeff_power={coeff_power}, "
+          f"det_channel_radius={args['det_channel_radius']}): "
           f"rel_max = {rel:.2e}")
     assert rel <= tol
 
@@ -240,7 +241,7 @@ def test_parallel_forward_kernel_parity(variant):
     assert bool(kernel_out.isfinite().all())
     rel = _rel_max(kernel_out, reference)
     print(f"parallel forward triton parity ({variant}, "
-          f"psf_radius={args['psf_radius']}): rel_max = {rel:.2e}")
+          f"det_channel_radius={args['det_channel_radius']}): rel_max = {rel:.2e}")
     assert rel <= 1e-5
 
 

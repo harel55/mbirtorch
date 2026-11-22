@@ -22,10 +22,15 @@ What to implement
 - ``_view_batch_bodies``, which returns the pair of functions above.
 - ``_view_batch_args``, which returns the keyword arguments the functions need.  It reads the
   parameters on every call, so a change made with ``set_params`` takes effect.
-- ``verify_valid_params``, ``get_magnification``, ``get_psf_radius``, and
-  ``auto_set_recon_geometry``: parameter checks, the scale from the rotation axis to the
-  detector, the number of detector channels a voxel can reach on either side of its center, and
-  the default reconstruction shape and voxel spacing.
+- ``verify_valid_params``, ``get_magnification``, and ``auto_set_recon_geometry``: parameter
+  checks, the scale from the rotation axis to the detector, and the default reconstruction shape
+  and voxel spacing.
+- ``_get_psf_radii``, which returns three integer radii in the order ``det_channel_radius``,
+  ``det_row_radius``, ``vox_slice_radius``.  ``det_channel_radius`` is the number of detector
+  channels on each side of a voxel's center channel that a loop visits.  ``det_row_radius`` is
+  the same number for detector rows.  ``vox_slice_radius`` is the number of recon slices on each
+  side of a detector row's center slice.  A radius that no loop of the geometry reads is 0.
+  ``_view_batch_args`` passes the three radii to the projection functions under these names.
 - ``rows_track_slices``, a class attribute.  Set it True only when detector row ``r`` maps to
   reconstruction slice ``r`` alone, as in parallel beam.
 - ``_transient_cols``, which returns the width of the largest temporary array a projection

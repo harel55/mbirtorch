@@ -13,7 +13,8 @@ from mbirtorch import TomographyModel
 def _template_forward_view_batch(values, pixel_indices, view_params_batch,
                                  num_rows, num_cols, num_channels,
                                  delta_det_channel, det_channel_offset,
-                                 delta_voxel, psf_radius,
+                                 delta_voxel, det_channel_radius,
+                                 det_row_radius, vox_slice_radius,
                                  slice_start=0, plan=None):
     """Forward project a batch of voxel cylinders into a batch of views.
 
@@ -46,7 +47,8 @@ def _template_forward_view_batch(values, pixel_indices, view_params_batch,
 def _template_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                               num_rows, num_cols, num_channels,
                               delta_det_channel, det_channel_offset,
-                              delta_voxel, psf_radius,
+                              delta_voxel, det_channel_radius,
+                              det_row_radius, vox_slice_radius,
                               coeff_power=1, slice_start=0, band_slices=None,
                               plan=None):
     """Back project a batch of sinogram views onto a batch of voxel cylinders,
@@ -110,14 +112,17 @@ class TemplateModel(TomographyModel):
         # TODO: adjust for the geometry.
         return 1.0
 
-    def get_psf_radius(self):
-        """Integer radius of the projection footprint: the maximum number of
-        detector channels on either side of the center channel hit by one
-        voxel."""
-        # TODO: compute from the voxel and detector spacings.
+    def _get_psf_radii(self):
+        """This method returns the tap radii of the projection loops as
+        (det_channel_radius, det_row_radius, vox_slice_radius).  Each radius is
+        the number of cells on each side of the center that one loop visits.
+        A radius that no loop reads is 0."""
+        # TODO: compute each radius from the voxel and detector pitches along
+        # the axis of its loop.
         delta_det_channel, delta_voxel = self.get_params(
             ['delta_det_channel', 'delta_voxel'])
-        return int(np.ceil(np.ceil(delta_voxel / delta_det_channel) / 2))
+        det_channel_radius = int(np.ceil(np.ceil(delta_voxel / delta_det_channel) / 2))
+        return det_channel_radius, 0, 0
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """Set recon_shape and delta_voxel to reasonable defaults from the
@@ -151,9 +156,12 @@ class TemplateModel(TomographyModel):
             ['delta_det_channel', 'det_channel_offset', 'delta_voxel'])
         recon_shape = self.get_params('recon_shape')
         num_channels = self.get_params('sinogram_shape')[2]
+        det_channel_radius, det_row_radius, vox_slice_radius = self._get_psf_radii()
         return dict(num_rows=recon_shape[0], num_cols=recon_shape[1],
                     num_channels=num_channels,
                     delta_det_channel=delta_det_channel,
                     det_channel_offset=det_channel_offset,
                     delta_voxel=delta_voxel,
-                    psf_radius=self.get_psf_radius())
+                    det_channel_radius=det_channel_radius,
+                    det_row_radius=det_row_radius,
+                    vox_slice_radius=vox_slice_radius)

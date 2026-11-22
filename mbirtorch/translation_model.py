@@ -3,7 +3,7 @@ this geometry, each view is a cone beam projection of the object after a transla
 model is useful for 3D imaging of thin objects.
 
 The projectors use two separable fans, as in the cone beam model.  Each view has an object
-translation (t_x, t_y, t_z) in place of a rotation.  Both fans use the same psf radius.
+translation (t_x, t_y, t_z) in place of a rotation.  The three tap radii have the same value.
 """
 
 import warnings
@@ -90,10 +90,12 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
                                     delta_det_channel, delta_det_row,
                                     det_channel_offset, det_row_offset,
                                     magnification, source_detector_dist,
-                                    psf_radius, slice_start=0, plan=None):
+                                    det_channel_radius, det_row_radius, vox_slice_radius,
+                                    slice_start=0, plan=None):
     """This function returns the forward projection of one batch of views.  The output has shape
     (Vb, R, C).  The array ``values`` has shape (P, L).  It may hold only a contiguous block of
-    L slices that starts at ``slice_start``.  This function does not use ``plan``.
+    L slices that starts at ``slice_start``.  This function does not use ``det_row_radius`` or
+    ``plan``.
     """
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
@@ -127,7 +129,7 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
     m_p = slope * (k_center.to(_F32) - k_m)                      # Projection offset.
 
     det_col = torch.zeros((vb, num_pixels, num_rows_r), dtype=_F32, device=dev)
-    for k_off in range(-psf_radius, psf_radius + 1):
+    for k_off in range(-vox_slice_radius, vox_slice_radius + 1):
         k_ind = k_center + k_off
         A = torch.clamp((slope + 1.0) / 2.0 - (m_p + slope * k_off).abs(), min=0.0)
         A = torch.minimum(A, L_max_r)
@@ -138,7 +140,7 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
         det_col = det_col + A * g
 
     acc = fan_forward_batch((n_p, centers, W_p_c, weight_scale), det_col,
-                            num_channels, psf_radius)
+                            num_channels, det_channel_radius)
     return acc.permute(0, 2, 1)
 
 
@@ -149,12 +151,13 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                                  delta_det_channel, delta_det_row,
                                  det_channel_offset, det_row_offset,
                                  magnification, source_detector_dist,
-                                 psf_radius, coeff_power=1, slice_start=0,
+                                 det_channel_radius, det_row_radius, vox_slice_radius,
+                                 coeff_power=1, slice_start=0,
                                  band_slices=None, plan=None):
     """This function computes the back projection of one batch of views.  It sums the back
     projections of the individual views.  The output has shape (P, S), or (P, band_slices) when
     ``band_slices`` is given.
-    This function does not use ``plan``.
+    This function does not use ``vox_slice_radius`` or ``plan``.
     """
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
@@ -166,7 +169,7 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
 
     sino_T = sino_batch.permute(0, 2, 1).contiguous()            # (Vb, C, R)
     det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
-                             num_channels, psf_radius,
+                             num_channels, det_channel_radius,
                              coeff_power=coeff_power, reduce_views=False)
 
     m0, W_p_r, z_offset = _translation_vertical_affine(
@@ -186,7 +189,7 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     L_max_r = torch.clamp(slope, max=1.0)
 
     out = torch.zeros((num_pixels, band_len), dtype=_F32, device=dev)
-    for m_off in range(-psf_radius, psf_radius + 1):
+    for m_off in range(-det_row_radius, det_row_radius + 1):
         mm = m_center + m_off
         L = torch.clamp((slope + 1.0) / 2.0 - (m_p - mm.to(_F32)).abs(), min=0.0)
         A = torch.minimum(L, L_max_r) / cos_phi
@@ -284,6 +287,7 @@ class TranslationModel(TomographyModel):
         (ddr, ddc, dro, dco, sdd, dv, vra, vsa) = self.get_params(gp_names)
         sinogram_shape = self.get_params('sinogram_shape')
         recon_shape = self.get_params('recon_shape')
+        det_channel_radius, det_row_radius, vox_slice_radius = self._get_psf_radii()
         return dict(num_rows_r=sinogram_shape[1], num_channels=sinogram_shape[2],
                     num_recon_rows=recon_shape[0], num_recon_cols=recon_shape[1],
                     num_slices=recon_shape[2], delta_voxel=dv,
@@ -292,7 +296,9 @@ class TranslationModel(TomographyModel):
                     det_channel_offset=dco, det_row_offset=dro,
                     magnification=self.get_magnification(),
                     source_detector_dist=sdd,
-                    psf_radius=self.get_psf_radius())
+                    det_channel_radius=det_channel_radius,
+                    det_row_radius=det_row_radius,
+                    vox_slice_radius=vox_slice_radius)
 
     def _transient_cols(self, band_cols):
         # The projector functions hold (Vb, P, S) and (Vb, P, R) temporary arrays for any requested block of slices.
@@ -325,9 +331,11 @@ class TranslationModel(TomographyModel):
         if voxel_row_aspect <= 0 or voxel_slice_aspect <= 0:
             raise ValueError('Voxel aspect ratios must be positive.')
 
-    def get_psf_radius(self):
-        """This method returns the integer radius of the psf kernel.  It computes the radius
-        from the largest magnification over all translated positions."""
+    def _get_psf_radii(self):
+        """This method returns the tap radii of the translation projector loops as
+        (det_channel_radius, det_row_radius, vox_slice_radius).  It computes one radius from
+        the largest magnification over all translated positions, and all three radii equal
+        it."""
         (delta_det_row, delta_det_channel, source_iso_dist, source_detector_dist,
          recon_shape, delta_voxel, translation_vectors, voxel_row_aspect,
          voxel_slice_aspect) = self.get_params(
@@ -354,7 +362,7 @@ class TranslationModel(TomographyModel):
             warnings.warn('A single voxel may project onto 100 or more detector '
                           'elements, which may lead to artifacts. Consider '
                           'using smaller voxels.')
-        return psf_radius
+        return psf_radius, psf_radius, psf_radius
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """This method sets the reconstruction shape and voxel size automatically from the

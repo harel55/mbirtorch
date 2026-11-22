@@ -41,7 +41,7 @@ def tap_weights(n_p, n, W_p_c, weight_scale, num_channels):
     return A, n.clamp(0, num_channels - 1)
 
 
-def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
+def fan_forward_batch(hfan_data, values, num_channels, det_channel_radius):
     """This function computes the forward horizontal fan projection for one batch of views.
     For each pixel, the function multiplies the row of the pixel by the tap weights of the
     pixel.  The function then adds these products into the detector channels.
@@ -53,8 +53,8 @@ def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
             uses one set of rows for all views.  Cone beam uses the output of the vertical fan
             projection, which has one set of rows for each view.
         num_channels (int): The number of detector channels.
-        psf_radius (int): The number of taps on each side of the center.  The total number of
-            taps is 2*psf_radius + 1.
+        det_channel_radius (int): The number of channel taps on each side of the center.  The
+            total number of taps is 2*det_channel_radius + 1.
 
     Returns:
         (Vb, num_channels, num_cols) tensor of partial views, with the channel axis before the
@@ -68,7 +68,7 @@ def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
     # Row v*num_channels + n of the flat accumulator holds view v, channel n.
     acc = torch.zeros((vb * num_channels, num_cols), dtype=_F32, device=dev)
     row_base = torch.arange(vb, device=dev)[:, None] * num_channels
-    for offset in range(-psf_radius, psf_radius + 1):
+    for offset in range(-det_channel_radius, det_channel_radius + 1):
         A, n = tap_weights(n_p, centers + offset, W_p_c, weight_scale,
                            num_channels)
         idx = (row_base + n).reshape(-1)
@@ -77,7 +77,7 @@ def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
     return acc.view(vb, num_channels, num_cols)
 
 
-def fan_back_batch(sino_batch_T, hfan_data, num_channels, psf_radius,
+def fan_back_batch(sino_batch_T, hfan_data, num_channels, det_channel_radius,
                    coeff_power=1, reduce_views=True):
     """This function computes the back projection, which is the adjoint of the horizontal fan
     projection, for one batch of views.  For each pixel, the function reads the detector
@@ -89,7 +89,7 @@ def fan_back_batch(sino_batch_T, hfan_data, num_channels, psf_radius,
             before the row axis.
         hfan_data: The same tuple as in :func:`fan_forward_batch`.
         num_channels (int): The number of detector channels.
-        psf_radius (int): The number of taps on each side of the center.
+        det_channel_radius (int): The number of channel taps on each side of the center.
         coeff_power (int): The power applied to each weight.  A value of 2 gives the Hessian
             diagonal.
         reduce_views (bool): If True, the function sums over the views in the batch.  If False,
@@ -108,7 +108,7 @@ def fan_back_batch(sino_batch_T, hfan_data, num_channels, psf_radius,
         out = torch.zeros((num_pixels, num_rows), dtype=_F32, device=dev)
     else:
         out = torch.zeros((vb, num_pixels, num_rows), dtype=_F32, device=dev)
-    for offset in range(-psf_radius, psf_radius + 1):
+    for offset in range(-det_channel_radius, det_channel_radius + 1):
         A, n = tap_weights(n_p, centers + offset, W_p_c, weight_scale,
                            num_channels)
         if coeff_power != 1:
