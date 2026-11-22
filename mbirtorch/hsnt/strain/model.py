@@ -37,9 +37,27 @@ from .bragg import emg_median, legendre_columns, reflections
 from ._dist import all_sum, all_sum_float
 
 
+class RayTexture:
+    """The rays' views and, per material, their texture-basis weights Q (Pc, nb): the density-weighted ray averages
+    of the smooth texture field's basis functions (TomoFit.texture_q). Passed to Hybrid2.spectra in place of the views
+    when the texture varies over the sample (texture_basis > 1)."""
+
+    def __init__(self, views, Q):
+        self.views, self.Q = views, Q
+
+
 def multiplicities(lattice, ns):
-    """Number of (h, k, l), signs and permutations included, allowed by the lattice type for each h^2 + k^2 + l^2."""
-    from .bragg import LATTICES
+    """Number of (h, k, l), signs and permutations included, allowed by the lattice type for each h^2 + k^2 + l^2
+    (for "hcp:<c/a>", each effective index of bragg.hcp_index, with l of either sign)."""
+    from .bragg import LATTICES, HCP_TOL, hcp_ratio, hcp_allowed, hcp_index
+    ca = hcp_ratio(lattice)
+    if ca is not None:
+        out = []
+        for n in ns:
+            hm = int(math.ceil(math.sqrt(n))) + 1; lm = int(math.ceil(math.sqrt(n) * ca)) + 1
+            out.append(sum(1 for h in range(-hm, hm + 1) for k in range(-hm, hm + 1) for l in range(-lm, lm + 1)
+                           if (h, k, l) != (0, 0, 0) and hcp_allowed(h, k, abs(l)) and abs(hcp_index(h, k, l, ca) - n) < HCP_TOL))
+        return out
     allowed = LATTICES[lattice]
     out = []
     for n in ns:
@@ -53,8 +71,11 @@ def cubic_k4(lattice, ns):
     """Returns, for each h^2 + k^2 + l^2 in ns, the cubic harmonic of degree 4, (h^4 + k^4 + l^4) / (h^2 + k^2 + l^2)^2 - 3/5,
     averaged over the (h, k, l) that the lattice type allows. Several families can share h^2 + k^2 + l^2. In a cubic
     crystal, a texture's lowest-order effect on reflection hkl is proportional to this value. It is 0.4 for 200 and
-    -0.1 for 110, 211 and 220."""
-    from .bragg import LATTICES
+    -0.1 for 110, 211 and 220. A hexagonal lattice ("hcp:<c/a>") has no cubic harmonic, so its values are 0 and
+    shape_model 'cubic4' leaves it untextured."""
+    from .bragg import LATTICES, hcp_ratio
+    if hcp_ratio(lattice) is not None:
+        return [0.0] * len(ns)
     allowed = LATTICES[lattice]
     out = []
     for n in ns:
@@ -302,7 +323,7 @@ class Hybrid2:
     BAND = (-240, 220)                                   # fine-grid offsets of a bin's band: the tail is on the left
 
     def __init__(self, lam, dose_per_bin, lattices, smooth_degree=LEGENDRE_DEGREE, n_contam=2, device="cuda", dtype=torch.float32,
-                 pad=0.1, edge_slope=False, two_scale=False, shape_model=None, kernel="two_scale"):
+                 pad=0.1, edge_slope=False, two_scale=False, shape_model=None, kernel="two_scale", texture_basis=1):
         self.dev, self.dt = device, dtype
         lam = np.asarray(lam, dtype=np.float64)
         lo, hi = bin_intervals(lam)
@@ -341,7 +362,10 @@ class Hybrid2:
         self.shape_model = shape_model
         self.kernel = kernel
         self.slices, off = [], 0
-        nx = {"texture3d": 3, "cubic4": 9}.get(shape_model, 2)              # the linked shape block's width
+        self.tex_nb = int(texture_basis)                                     # smooth texture field: basis functions (1: global)
+        if self.tex_nb > 1 and shape_model != "cubic4":
+            raise ValueError("a texture field (texture_basis > 1) needs shape_model 'cubic4'")
+        nx = {"texture3d": 3, "cubic4": 9 * self.tex_nb}.get(shape_model, 2)  # the linked shape block's width
         for m in self.mats:
             ne = len(m["ns"]); o = off + 1 + 2 * ne
             sl = dict(a=off, h=(off + 1, off + 1 + ne), t=(off + 1 + ne, o), x=(o, o + nx), c=(o + nx, o + nx + 2),
@@ -430,7 +454,9 @@ class Hybrid2:
                 shape = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]       # 1 + t (lam - ee) / ee
                 shape = shape * self.linked_shape(self.lamf.to(dt)[None, None, :], ee[:, :, None], h.to(dt)[None, :, None],
                                                   m["mult"].to(dt)[None, :, None], xp).to(dt)
-                if self.shape_model in VIEW_TEXTURES and views is not None:
+                if isinstance(views, RayTexture):                                 # a texture field: per ray
+                    shape = shape * self.texture_factor_rays(g, r, views.views, views.Q[r])
+                elif self.shape_model in VIEW_TEXTURES and views is not None:
                     shape = shape * (self.texture_factor(g, r) if tex is None else tex[r])[views]
                 out.append((x * x).to(dt) * torch.einsum('pek,e->pk', step * shape, h.to(dt)) + smooth.to(dt))
         return torch.stack(out, 0) if eps is None else torch.stack(out, 1)
@@ -487,6 +513,26 @@ class Hybrid2:
         cos_a = (cos_t[..., None] * torch.cos(phi) * torch.sin(psi) + sin_t[..., None] * torch.cos(psi))
         P = (r_md ** 2 * cos_a ** 2 + (1 - cos_a ** 2) / r_md) ** -1.5
         return P.mean(-1)
+
+    def texture_factor_rays(self, g, r, views, Q):
+        """Material r's cubic4 texture factor per ray (Pc, edges, Kf) in the model's dtype, for a texture that varies
+        over the sample: 1 + k4(hkl) P4(sin theta) sum_j Y4_j(beam) cbar_j, where cbar_j = sum_b beta_jb Q_b is the
+        ray's density-weighted average of coefficient j's field (beta: the x block as (9, nb); Q (Pc, nb): the rays'
+        basis weights). With nb = 1 and Q = 1 it equals texture_factor."""
+        m, sl = self.mats[r], self.slices[r]; x0 = sl["x"][0]
+        e = 2.0 * g[sl["a"]] / torch.sqrt(m["ns"])
+        st = (self.lamf[None, :] / e[:, None]).clamp(0.0, 1.0)
+        p4 = (35 * st ** 4 - 30 * st ** 2 + 3) / 8                                            # (edges, Kf)
+        A = ((self._harmonics_views()[views] @ g[x0:x0 + 9 * self.tex_nb].reshape(9, self.tex_nb)) * Q.double()).sum(1)
+        return (1 + m["k4"][None, :, None] * p4[None] * A[:, None, None]).clamp_min(CUBIC4_FLOOR).to(self.dt)
+
+    def _harmonics_views(self):
+        """The degree-4 harmonics at each view's beam direction (views, 9), float64, computed once."""
+        c = getattr(self, "_y4_cache", None)
+        if c is None or c[0] is not self.view_dirs:
+            c = (self.view_dirs, harmonics4(torch.as_tensor(self.view_dirs, dtype=torch.float64, device=self.dev)))
+            self._y4_cache = c
+        return c[1]
 
     def texture_factor(self, g, r):
         """Material r's texture factor (views, edges, fine bins) in the model's dtype, for shape_model 'texture3d': the
@@ -684,6 +730,7 @@ class FitB:
         self.inflation = float(inflation)
         self.eps = None if eps is None else eps.clone()
         self.ray_view = None             # (rays,) each ray's view, for a view-dependent spectrum (texture3d, cubic4)
+        self.tex_Q = None                # texture field: per material, the rays' basis weights (rays, nb) (TomoFit.sync)
         self.chunk = chunk
         self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
         self.z = norm.isf(alpha / (2 * model.K)) if z is None else z
@@ -712,7 +759,7 @@ class FitB:
     def _texture(self, g):
         """The texture factors per material at g (texture3d), computed once per state of g and kept; None when g carries
         derivatives (automatic differentiation then goes through the factor) or there is no view-dependent texture."""
-        if self.M.shape_model not in VIEW_TEXTURES or self.ray_view is None or g.requires_grad:
+        if self.M.shape_model not in VIEW_TEXTURES or self.ray_view is None or g.requires_grad or self.M.tex_nb > 1:
             return None
         try:
             if torch._C._functorch.is_functorch_wrapped_tensor(g):
@@ -728,8 +775,13 @@ class FitB:
         return tex
 
     def _views(self, sl):
-        """The views of the rays sl, or None (a view-dependent spectrum needs them; see Hybrid2.texture_factor)."""
-        return None if self.ray_view is None else self.ray_view[sl]
+        """The views of the rays sl, or None (a view-dependent spectrum needs them; see Hybrid2.texture_factor). With a
+        texture field, a RayTexture that also carries the rays' basis weights (tex_Q, set by TomoFit.sync)."""
+        if self.ray_view is None:
+            return None
+        if self.M.tex_nb > 1:                       # before the field's weights exist: no views, so a random powder
+            return None if self.tex_Q is None else RayTexture(self.ray_view[sl], [Q[sl] for Q in self.tex_Q])
+        return self.ray_view[sl]
 
     def _state(self, g):
         M = self.M
@@ -795,7 +847,8 @@ class FitB:
     # and the accepted trials of the line searches), so a step's starting loss and a driver's log cost no pass. It is
     # tied to the state's tensors and their version counters, so any change to them makes it stale.
     def _state_key(self):
-        return tuple((t, t._version if torch.is_tensor(t) else None) for t in (self.g, self.W, self.eps, self.f, self.T, self.ray_weight))
+        tex = tuple(self.tex_Q) if self.tex_Q is not None else (None,)     # the texture's ray weights change the loss too
+        return tuple((t, t._version if torch.is_tensor(t) else None) for t in (self.g, self.W, self.eps, self.f, self.T, self.ray_weight) + tex)
 
     def remember_data_loss(self, value):
         """Record value as the data loss (the deviance, no penalties) at the current state."""
@@ -964,6 +1017,21 @@ class FitB:
                           - torch.einsum('jk,pj,j->pk', self.f, beta, kap[:, r]))
             cols_u.append(-s * M.apply_band(E * dmu, Rb))
         return torch.stack(cols_w + cols_u, 2), m
+
+    def texture_curve(self, sl, r, eps=None):
+        """Material r's derivative of the spectrum with respect to a ray's mean texture term A = sum_j Y_j cbar_j,
+        (Pc, Kf) in the model's dtype: sum over edges of height x k4 x P4(sin theta) x the edge term, where the factor is
+        above its floor. With a texture field or per-voxel texture, d mu_r / d cbar_j = Y_j(view) times this curve."""
+        M = self.M; slr = M.slices[r]
+        eps = self.eps[sl] if eps is None else eps
+        tq = self._views(sl)
+        terms = M.edge_terms(self.g, eps, r)
+        fac = M.texture_factor_rays(self.g, r, tq.views, tq.Q[r])
+        e_ = 2.0 * self.g[slr["a"]] / torch.sqrt(M.mats[r]["ns"])
+        st = (M.lamf[None, :] / e_[:, None]).clamp(0.0, 1.0)
+        p4 = ((35 * st ** 4 - 30 * st ** 2 + 3) / 8).to(M.dt)
+        h = self.g[slr["h"][0]:slr["h"][1]].to(M.dt); k4 = M.mats[r]["k4"].to(M.dt)
+        return ((h * k4)[None, :, None] * terms * p4[None] * (fac > CUBIC4_FLOOR).to(M.dt)).sum(1)
 
     def ray_loss(self, sl, W, eps, cache):
         """Deviance of each ray in sl at maps W and strains eps (no penalties)."""
@@ -1135,7 +1203,18 @@ class FitB:
             if i < M.res_sl[0]:                                                      # a material parameter
                 r = next(rr for rr, slc in enumerate(M.slices) if slc["a"] <= i < slc["s"][1])
                 slr = M.slices[r]
-                if tex is not None and dtex is not None and eps is not None and (
+                if M.tex_nb > 1 and eps is not None and slr["x"][0] <= i < slr["x"][1]:
+                    # texture field: m depends on beta_jb through the factor 1 + k4 P4 sum_j Y_j cbar_j, so dm/dbeta_jb =
+                    # Y_j(view) Q_b x sum_e h_e k4_e P4_e x (edge term) (the floor's clamp is ignored)
+                    if ("G", r) not in terms:
+                        tq = self._views(sl)
+                        terms[("G", r)] = self.texture_curve(sl, r, eps)
+                        terms[("YQ", r)] = (M._harmonics_views()[tq.views].to(M.dt), tq.Q[r].to(M.dt))
+                    j, b = divmod(i - slr["x"][0], M.tex_nb)
+                    Y, Q = terms[("YQ", r)]
+                    dm = terms[("G", r)] * (Y[:, j] * Q[:, b])[:, None]
+                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                elif tex is not None and dtex is not None and eps is not None and (
                         slr["h"][0] <= i < slr["h"][1] or slr["x"][0] <= i < slr["x"][1]):
                     # texture3d, cubic4: a height's derivative is its edge term times the view's factor; a texture parameter's
                     # is the sum over edges of height x edge term x the factor's derivative (dtex, computed once)
@@ -1282,7 +1361,7 @@ class FitB:
         grad = torch.zeros(len(idx), device=M.dev, dtype=torch.float64)
         F = torch.zeros(len(idx), len(idx), device=M.dev, dtype=torch.float64)
         dtex = None
-        if M.shape_model in VIEW_TEXTURES and self.ray_view is not None:
+        if M.shape_model in VIEW_TEXTURES and self.ray_view is not None and M.tex_nb == 1:
             dtex = []
             for r in range(M.R):
                 x0, x1 = M.slices[r]["x"]

@@ -32,15 +32,43 @@ LATTICES = {
 }
 
 
+HCP_PREFIX = "hcp:"                  # a hexagonal close-packed lattice is named "hcp:<c/a>", e.g. "hcp:1.587" for Ti
+HCP_TOL = 1e-9                       # effective index values closer than this are one edge
+
+
+def hcp_ratio(lattice):
+    """Returns c / a of a lattice named "hcp:<c/a>", or None for a cubic lattice."""
+    return float(lattice[len(HCP_PREFIX):]) if lattice.startswith(HCP_PREFIX) else None
+
+
+def hcp_allowed(h, k, l):
+    """An hcp reflection (space group P6_3/mmc, two atoms per cell) is absent when l is odd and h - k is a multiple
+    of 3."""
+    return not (l % 2 == 1 and (h - k) % 3 == 0)
+
+
+def hcp_index(h, k, l, ca):
+    """The effective index n with d = a / sqrt(n): 4/3 (h^2 + h k + k^2) + l^2 / (c/a)^2."""
+    return 4.0 / 3.0 * (h * h + h * k + k * k) + l * l / (ca * ca)
+
+
 def reflections(lattice, a, lam_min, lam_max, hmax=None):
-    """Bragg-edge wavelengths 2 d_hkl in [lam_min, lam_max] for a cubic lattice of parameter a, ascending, one per
-    distinct h^2 + k^2 + l^2 (families with equal spacing share an edge). Returns (n_values, edges) as arrays.
-    The index range follows from the wavelength range: h^2 + k^2 + l^2 <= (2 a / lam_min)^2."""
-    allowed = LATTICES[lattice]
+    """Bragg-edge wavelengths 2 d_hkl in [lam_min, lam_max] for a lattice of parameter a, ascending, one per distinct
+    spacing (families with equal spacing share an edge). Returns (n_values, edges) as arrays, with edge = 2 a / sqrt(n).
+    For a cubic lattice n = h^2 + k^2 + l^2. For "hcp:<c/a>", n is the effective index of hcp_index, with c / a held
+    fixed, so a strain scales a and c together. The index range follows from the wavelength range."""
     if hmax is None:
         hmax = int(math.ceil(2.0 * a / max(lam_min, 1e-9))) + 1
-    ns = sorted({h * h + k * k + l * l for h in range(hmax) for k in range(hmax) for l in range(hmax)
-                 if (h, k, l) != (0, 0, 0) and allowed(h, k, l)})
+    ca = hcp_ratio(lattice)
+    if ca is None:
+        allowed = LATTICES[lattice]
+        ns = sorted({h * h + k * k + l * l for h in range(hmax) for k in range(hmax) for l in range(hmax)
+                     if (h, k, l) != (0, 0, 0) and allowed(h, k, l)})
+    else:
+        lmax = int(math.ceil(hmax * ca)) + 1
+        vals = sorted(hcp_index(h, k, l, ca) for h in range(-hmax, hmax + 1) for k in range(-hmax, hmax + 1)
+                      for l in range(lmax + 1) if (h, k, l) != (0, 0, 0) and hcp_allowed(h, k, l))
+        ns = [v for i, v in enumerate(vals) if i == 0 or v - vals[i - 1] > HCP_TOL]
     ns = np.array([n for n in ns if lam_min <= 2 * a / math.sqrt(n) <= lam_max], dtype=float)
     return ns, 2 * a / np.sqrt(ns)
 

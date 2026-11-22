@@ -446,6 +446,11 @@ def _otsu_threshold(x):
     return lo + (k + 1) * (hi - lo) / OTSU_BINS
 
 
+TEXTURE_SMOOTH_SD = 0.1          # per-voxel texture: the standard deviation of a coefficient's step between neighbouring voxels
+TEXTURE_RIDGE_SD = 1.0           # per-voxel texture: each coefficient's standard deviation about 0 (a random powder)
+TEXTURE_CG_ITERS = 20            # per-voxel texture: conjugate-gradient iterations of each texture step
+TEXTURE_STEP_TRIES = (1.0, 0.5, 0.25, 0.125)   # per-voxel texture: step lengths tried by the line search
+
 class TomoFit:
     """The volume part of the tomographic fit. Per material r: a density volume V (n, n, n, R) and strain volumes E
     (n, n, n, R, C), C = 1 (a scalar dilation, the same in every view) or 6 (the strain tensor, COMPONENTS order xx,
@@ -607,6 +612,124 @@ class TomoFit:
         b = self.proj.back(torch.cat([gW, (gU[:, :, None] * self.w_ray[:, None, :]).reshape(P, R * C)], 1))
         return b[..., :R], b[..., R:].reshape(*b.shape[:3], R, C)
 
+    def set_texture_basis(self, k):
+        """A smooth texture field (shape_model 'cubic4', Hybrid2 texture_basis = k^3): each coefficient is a tensor
+        product of Bernstein polynomials of degree k - 1 along each axis of the volume. The basis sums to 1 in every voxel,
+        so a field lies between its smallest and largest coefficient, and k = 1 is the global texture."""
+        n = self.V.shape[0]
+        t = torch.linspace(0, 1, n, device=self.V.device, dtype=torch.float64)
+        b1 = torch.stack([math.comb(k - 1, i) * t ** i * (1 - t) ** (k - 1 - i) for i in range(k)], 1)   # (n, k)
+        self.tex_basis = torch.einsum('ai,bj,ck->abcijk', b1, b1, b1).reshape(n, n, n, k ** 3).to(self.V.dtype)
+        self.sync()
+
+    def set_texture_voxels(self, smooth_sd=TEXTURE_SMOOTH_SD, ridge_sd=TEXTURE_RIDGE_SD):
+        """Per-voxel texture (shape_model 'cubic4' with Hybrid2 texture_basis = 9): each cubic material's 9 degree-4
+        coefficients in every voxel, Tx (n, n, n, materials with a cubic texture, 9), starting as a random powder. The
+        model's field weights are held at the identity, so each ray's Q is its density-weighted mean coefficients.
+        The prior is quadratic: neighbouring voxels differ with standard deviation smooth_sd, and each coefficient has
+        standard deviation ridge_sd about 0, which holds the combinations the views cannot see. texture_step updates Tx."""
+        fit = self.fit; M = fit.M
+        if M.tex_nb != 9:
+            raise ValueError('per-voxel texture needs a model with texture_basis = 9')
+        eye = torch.eye(9, dtype=torch.float64, device=fit.g.device).reshape(-1)
+        for r in range(M.R):
+            x0, x1 = M.slices[r]['x']
+            fit.g[x0:x1] = eye; M.lb[x0:x1] = eye.to(M.lb.device); M.ub[x0:x1] = eye.to(M.ub.device)
+        self.tex_r = [r for r in range(M.R) if float(M.mats[r]['k4'].abs().max()) > 0]
+        n = self.V.shape[0]
+        self.Tx = torch.zeros(n, n, n, len(self.tex_r), 9, device=self.V.device, dtype=self.V.dtype)
+        self.tex_smooth_sd, self.tex_ridge_sd = float(smooth_sd), float(ridge_sd)
+        self.sync()
+
+    def texture_rays(self, V, Tx, W):
+        """Per material, each ray's density-weighted mean texture coefficients (P, 9): projection(V_r Tx_r) /
+        projection(V_r); zeros for materials without a cubic texture and where a ray misses the material."""
+        nt = len(self.tex_r); P = W.shape[0]
+        out = [torch.zeros(P, 9, device=W.device, dtype=W.dtype) for _ in range(W.shape[1])]
+        if nt == 0:
+            return out
+        U = self.proj.with_q(9 * nt).fwd(torch.cat([V[..., r:r + 1] * Tx[..., i, :] for i, r in enumerate(self.tex_r)], -1))
+        for i, r in enumerate(self.tex_r):
+            Wr = W[:, r:r + 1]
+            out[r] = torch.where(Wr > EPS_W_MIN, U[:, 9 * i:9 * i + 9] / Wr.clamp_min(EPS_W_MIN), torch.zeros_like(Wr))
+        return out
+
+    def texture_prior(self, Tx):
+        """The per-voxel texture's prior: 0.5 sum (neighbour differences / smooth_sd)^2 + 0.5 sum (Tx / ridge_sd)^2."""
+        tot = 0.0
+        for d in range(3):
+            tot = tot + 0.5 * float((Tx.diff(dim=d).double() ** 2).sum()) / self.tex_smooth_sd ** 2
+        return tot + 0.5 * float((Tx.double() ** 2).sum()) / self.tex_ridge_sd ** 2
+
+    def _texture_prior_apply(self, X):
+        """The prior's Hessian applied to X (its gradient at X): laplacian / smooth_sd^2 + X / ridge_sd^2."""
+        return self.laplacian(X) / self.tex_smooth_sd ** 2 + X / self.tex_ridge_sd ** 2
+
+    def texture_step(self, cg_iters=TEXTURE_CG_ITERS):
+        """One Gauss-Newton step on the per-voxel texture Tx with the volumes, strain and spectra fixed, by conjugate
+        gradients on the normal equations, then a line search on the data loss plus the texture prior. Each ray's
+        Fisher information in its mean coefficients is (Y Y^T) x B, with Y the view's degree-4 harmonics and B
+        (materials x materials) from each material's texture curve (FitB.texture_curve). Returns the objective's change."""
+        fit = self.fit; M = fit.M; nt = len(self.tex_r)
+        if nt == 0:
+            return 0.0
+        self.sync(); cache = fit._state(fit.g); _, Rb, _ = cache
+        P = fit.T.shape[0]; Y = M._harmonics_views().to(self.V.dtype)
+        a = torch.zeros(P, nt, device=self.V.device, dtype=self.V.dtype)        # sum_k r d_r per ray
+        B = torch.zeros(P, nt, nt, device=self.V.device, dtype=self.V.dtype)    # sum_k w d_r d_r' per ray
+        for sl in fit.chunks():
+            m, E, n_, beta, s_ = fit.mean(sl, cache=cache)
+            mm = m.clamp_min(1e-12); T = fit.T[sl]
+            r_ = fit.dose(sl) * (1 - T / mm); w_ = fit.dose(sl) / mm
+            W = fit.W[sl]
+            d = torch.stack([-s_ * M.apply_band(E * (W[:, r:r + 1] * fit.texture_curve(sl, r)), Rb) for r in self.tex_r], 2)
+            a[sl] = torch.einsum('pk,pkr->pr', r_, d).to(a.dtype)
+            B[sl] = torch.einsum('pk,pkr,pks->prs', w_, d, d).to(B.dtype)
+        views = fit.ray_view; Yv = Y[views]                                         # (P, 9)
+        Wt = torch.stack([fit.W[:, r] for r in self.tex_r], 1)                      # (P, nt)
+        inv_w = torch.where(Wt > EPS_W_MIN, 1.0 / Wt.clamp_min(EPS_W_MIN), torch.zeros_like(Wt))
+        Vt = torch.stack([self.V[..., r] for r in self.tex_r], -1)                  # (n, n, n, nt)
+        pr = self.proj.with_q(9 * nt)
+
+        def A(X):                                        # voxel coefficients -> rays' mean coefficients (P, nt, 9)
+            return pr.fwd((Vt[..., None] * X).reshape(*X.shape[:3], 9 * nt)).reshape(P, nt, 9) * inv_w[..., None]
+
+        def At(Yr):                                      # its adjoint
+            return pr.back((Yr * inv_w[..., None]).reshape(P, 9 * nt)).reshape(*Vt.shape, 9) * Vt[..., None]
+
+        def fisher(C):                                   # (Y Y^T) x B per ray, applied to mean coefficients (P, nt, 9)
+            z = torch.einsum('pj,prj->pr', Yv, C)
+            return torch.einsum('prs,ps->pr', B, z)[..., None] * Yv[:, None, :]
+
+        rhs = -(At(a[..., None] * Yv[:, None, :]) + self._texture_prior_apply(self.Tx))
+        x = torch.zeros_like(self.Tx); r_cg = rhs.clone(); p_cg = r_cg.clone(); rr = float((r_cg * r_cg).sum())
+        for _ in range(cg_iters):
+            q = At(fisher(A(p_cg))) + self._texture_prior_apply(p_cg)
+            al = rr / max(float((p_cg * q).sum()), 1e-30)
+            x += al * p_cg; r_cg -= al * q; rn = float((r_cg * r_cg).sum())
+            p_cg = r_cg + (rn / max(rr, 1e-30)) * p_cg; rr = rn
+        old_Tx, old_Q = self.Tx, fit.tex_Q
+        obj0 = float(fit.data_loss()) + self.texture_prior(old_Tx)
+        for step in TEXTURE_STEP_TRIES:
+            cand = old_Tx + step * x
+            fit.tex_Q = self.texture_rays(self.V, cand, fit.W)
+            obj = float(fit.data_loss()) + self.texture_prior(cand)
+            if obj < obj0:
+                self.Tx = cand
+                return obj - obj0
+        fit.tex_Q = old_Q
+        return 0.0
+
+    def texture_q(self, V, W):
+        """Per material, the rays' basis weights (P, nb): the density-weighted ray averages of the texture field's
+        basis functions, projection(V_r B_b) / projection(V_r); zero where a ray misses the material."""
+        B = self.tex_basis; pr = self.proj.with_q(B.shape[-1])
+        out = []
+        for r in range(V.shape[-1]):
+            P = pr.fwd(V[..., r:r + 1] * B)
+            out.append(torch.where(W[:, r:r + 1] > EPS_W_MIN, P / W[:, r:r + 1].clamp_min(EPS_W_MIN), torch.zeros_like(P)))
+        return out
+
     def rays(self, V, E):
         W, U = self._fwd(V, V[..., None] * E)
         eps = torch.where(W > EPS_W_MIN, U / W.clamp_min(EPS_W_MIN), torch.zeros_like(U))
@@ -614,6 +737,10 @@ class TomoFit:
 
     def sync(self):
         self.fit.W, self.fit.eps = self.rays(self.V, self.E)
+        if getattr(self, 'tex_basis', None) is not None:              # the texture field's ray weights follow the volume
+            self.fit.tex_Q = self.texture_q(self.V, self.fit.W)
+        elif getattr(self, 'Tx', None) is not None:                   # per-voxel texture: the rays' mean coefficients
+            self.fit.tex_Q = self.texture_rays(self.V, self.Tx, self.fit.W)
         self._synced = (self.V, self.V._version, self.E, self.E._version, self.fit.W, self.fit.W._version,
                         self.fit.eps, self.fit.eps._version)
 
@@ -1760,6 +1887,9 @@ class TomoFit:
         return float('nan'), 0.0
 
 
+INIT_SPECTRA_RESOLUTION = (0.005, 0.0)   # warmup with init_spectra: the kernel's starting relative width (the Ti rods' 0.02 A at 4 A)
+
+
 def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_DEGREE, n_contam=2, chunk=1024, a_range=0.01,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='jacobi',
@@ -1767,7 +1897,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='max', mask_freeze=False, fraction=False, normalize=True, free_lattice=True,
            strain_prior='qggmrf', smooth_order=1,
            eq_stencil='corner',
-           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False):
+           noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
+           init_spectra=None, texture_voxels=None):
     """The pipeline's start with given lattice types: returns a TomoFit. warm_start searches each lattice parameter
     within a0 * (1 +- a_range). The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -1822,29 +1953,34 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     # each process keeps its own H0 to express its maps in that model's spectra
     H0_local = H0
     H0, = broadcast_objects([H0])
-    out = [None]
-    if rank() == 0:
-        th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=R, lattices=lats, device=device)
-        out = [([t.cpu() for t in th_], fd_, res_)]
-    thetas, found, resolution = broadcast_objects(out)[0]
-    # warm_start orders its components by its own criterion: pair each given lattice with the found component of the
-    # same type and the nearest lattice parameter
-    from scipy.optimize import linear_sum_assignment
-    cost = np.array([[abs(float(th[0]) / a - 1) if lf == lt else np.inf for (lf, _), th in zip(found, thetas)]
-                     for lt, a in zip(lattices, a0)])
-    assert len(found) == R and np.isfinite(cost).any(axis=1).all(), (found, lattices)
-    _, order = linear_sum_assignment(np.where(np.isfinite(cost), cost, 1e9))
-    found = [found[j] for j in order]; thetas = [thetas[j] for j in order]
-    assert all(np.isfinite(cost[i, j]) for i, j in enumerate(order)), (found, lattices)
+    if init_spectra is not None:
+        # given starting spectra (e.g. tabulated, one row per lattice, on lam): no search; each material starts at its a0
+        found = lats; thetas = [torch.tensor([float(a)], dtype=torch.float64) for a in a0]; resolution = INIT_SPECTRA_RESOLUTION
+    else:
+        out = [None]
+        if rank() == 0:
+            th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=R, lattices=lats, device=device)
+            out = [([t.cpu() for t in th_], fd_, res_)]
+        thetas, found, resolution = broadcast_objects(out)[0]
+        # warm_start orders its components by its own criterion: pair each given lattice with the found component of the
+        # same type and the nearest lattice parameter
+        from scipy.optimize import linear_sum_assignment
+        cost = np.array([[abs(float(th[0]) / a - 1) if lf == lt else np.inf for (lf, _), th in zip(found, thetas)]
+                         for lt, a in zip(lattices, a0)])
+        assert len(found) == R and np.isfinite(cost).any(axis=1).all(), (found, lattices)
+        _, order = linear_sum_assignment(np.where(np.isfinite(cost), cost, 1e9))
+        found = [found[j] for j in order]; thetas = [thetas[j] for j in order]
+        assert all(np.isfinite(cost[i, j]) for i, j in enumerate(order)), (found, lattices)
     targets = []
-    for (lt, ar), th in zip(found, thetas):
-        tgt = BraggSpectrum(lam, lattice=lt, a_range=ar, resolution=resolution)(th.cpu()).detach().numpy()
+    for r_, ((lt, ar), th) in enumerate(zip(found, thetas)):
+        tgt = (np.asarray(init_spectra[r_], dtype=np.float64) if init_spectra is not None else
+               BraggSpectrum(lam, lattice=lt, a_range=ar, resolution=resolution)(th.cpu()).detach().numpy())
         targets.append(tgt / max(np.abs(tgt).mean(), 1e-12) * float(np.abs(H0).mean()))
     targets = np.stack(targets)
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
     M = Hybrid2(lam, d, lats, smooth_degree=smooth_degree, n_contam=n_contam, device=device, two_scale=True, kernel=kernel,
-                shape_model=shape_model)
+                shape_model=shape_model, texture_basis=9 if texture_voxels is not None else texture_knots ** 3)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
     if kernel_values is not None:                       # a calibrated kernel, held fixed
@@ -1914,6 +2050,10 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
                  voxel_scale=voxel_scale, traction=traction, smooth_sd=smooth_sd, mask_method=mask_method,
                  mask_freeze=mask_freeze, fraction=fraction, eq_stencil=eq_stencil, normalize=normalize,
                  strain_prior=strain_prior, smooth_order=smooth_order)
+    if texture_knots > 1:
+        tf.set_texture_basis(texture_knots)
+    if texture_voxels is not None:                       # (smooth_sd, ridge_sd) of the per-voxel texture's prior
+        tf.set_texture_voxels(*texture_voxels)
     if free_lattice:
         tf.free_lattice()
     return tf, dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
