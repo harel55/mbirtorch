@@ -125,6 +125,7 @@ LATTICE_COARSE_STEP = 5e-4   # relative spacing of its coarse grid: about a Brag
 LATTICE_TOL = 1e-6           # relative tolerance of its golden-section refinement
 GOLDEN = (math.sqrt(5) - 1) / 2   # the golden section's ratio
 CUBIC4_BOUND = 1.0               # cubic4: the bound on each degree-4 texture coefficient
+P4_MIN = -3.0 / 7.0                # the smallest value of the Legendre polynomial P4 (at x^2 = 3/7)
 CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a truncated expansion can go negative)
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
 VIEW_TEXTURES = ("cubic4",)      # shape models whose spectra depend on the view
@@ -354,6 +355,7 @@ class Hybrid2:
         phi = np.interp(lamf, lam, np.asarray(dose_per_bin, dtype=np.float64))
         f64 = dict(device=device, dtype=torch.float64)
         self.hf = hf
+        self.dense_spectra = False      # True: spectra sums every edge over every fine bin (a check on _ray_spectrum)
         self.lam = torch.as_tensor(lam, **f64); self.lamf = torch.as_tensor(lamf, **f64)
         self.lam_lo = torch.as_tensor(lo, **f64); self.lam_hi = torch.as_tensor(hi, **f64)
         self.phi = torch.as_tensor(phi / phi.max(), **f64)
@@ -499,6 +501,10 @@ class Hybrid2:
                 shape = shape * self.linked_shape(self.lamf[:, None], e[None, :], h[None, :], m["mult"][None, :], xp)
                 out.append(x * x * ((step * shape) @ h) + smooth)
             else:
+                fast = None if self.dense_spectra else self._ray_spectrum(g, r, eps, views, sd, x, smooth)
+                if fast is not None:
+                    out.append(fast)
+                    continue
                 dt = self.dt
                 e_r, af = self._lattice_strain(r, eps)
                 off, ee = self._edge_offsets(e, e_r)
@@ -512,6 +518,73 @@ class Hybrid2:
                     shape = shape * (self.texture_factor(g, r) if tex is None else tex[r])[views]
                 out.append((x * x).to(dt) * torch.einsum('pek,e->pk', step * shape, h.to(dt)) + smooth.to(dt))
         return torch.stack(out, 0) if eps is None else torch.stack(out, 1)
+
+    def _ray_spectrum(self, g, r, eps, views, sd, x, smooth):
+        """Material r's spectra (Pc, Kf) under per-ray dilations eps, equal to spectra's per-edge sum but without
+        per-edge arrays over all fine bins. Each edge has a window: the bins its rays' edges reach (their spread over the
+        rays, plus EDGE_SPREAD_REACH widths of the strain's spread). Below the window every ray's edge is fully present,
+        and there the sum over edges is a few matrix products (the slope is linear in 1 / edge and the cubic4 factor in
+        the ray's texture term). Within the window the edges are summed bin by bin. Returns None, so that spectra sums
+        every bin, for a shape model linked to the heights (extinction, texture) or when a ray's cubic4 factor could
+        reach CUBIC4_FLOOR."""
+        if self.shape_model in ("extinction", "texture"):
+            return None
+        m, sl = self.mats[r], self.slices[r]; dt = self.dt
+        h = g[sl["h"][0]:sl["h"][1]]; t = g[sl["t"][0]:sl["t"][1]]
+        e = 2.0 * g[sl["a"]] / torch.sqrt(m["ns"])                                      # unstrained edges (n_e,)
+        e_r, af = self._lattice_strain(r, eps)
+        ee = (e[None, :] * (1 + e_r.double())).to(dt)                                   # (Pc, n_e)
+        width = None if sd is None else ee * af * sd[:, r:r + 1].to(dt)
+        A = None                                                                         # each ray's texture term
+        if isinstance(views, RayTexture):
+            x0 = sl["x"][0]
+            A = ((self._harmonics_views()[views.views] @ g[x0:x0 + 9 * self.tex_nb].reshape(9, self.tex_nb))
+                 * views.Q[r].double()).sum(1)
+        elif self.shape_model in VIEW_TEXTURES and views is not None:
+            x0 = sl["x"][0]
+            A = (self._harmonics_views() @ g[x0:x0 + 9])[views]
+        st = (self.lamf[None, :] / e[:, None]).clamp(0.0, 1.0)
+        p4 = (35 * st ** 4 - 30 * st ** 2 + 3) / 8                                         # (n_e, Kf)
+        if A is not None:
+            kA = (m["k4"][None, :] * A[:, None]).detach()
+            if bool(((1 + torch.minimum(kA * P4_MIN, kA)) <= CUBIC4_FLOOR).any()):
+                return None
+        with torch.no_grad():
+            eed = ee.detach().double()
+            wd = torch.zeros_like(e) if width is None else width.detach().double().amax(0)
+            f0 = float(self.lamf[0]); Kf = self.Kf
+            lo = eed.amin(0) - 0.5 * self.hf - EDGE_SPREAD_REACH * wd
+            hi = eed.amax(0) + 0.5 * self.hf + EDGE_SPREAD_REACH * wd
+            k0 = (torch.floor((lo - f0) / self.hf) - 1).clamp(0, Kf).long()
+            k1 = (torch.ceil((hi - f0) / self.hf) + 2).clamp(0, Kf).long()
+            k1 = torch.maximum(k1, k0)
+            wb = max(int((k1 - k0).max()), 1)
+            idx = k0[:, None] + torch.arange(wb, device=k0.device)[None, :]               # (n_e, wb)
+            valid = idx < k1[:, None]
+            idx = idx.clamp(max=Kf - 1)
+            below = (torch.arange(Kf, device=k0.device)[None, :] < k0[:, None]).double()   # (n_e, Kf)
+        lam = self.lamf
+        out = ((1 - t) * h) @ below                                                      # (Kf,)
+        Bq = ((t * h)[:, None] * lam[None, :] * below)                                   # (n_e, Kf)
+        q = 1 / ee
+        out = out.to(dt)[None, :] + q @ Bq.to(dt)
+        if A is not None:
+            k4 = m["k4"]
+            C1 = ((1 - t) * h * k4) @ (below * p4)
+            BqA = ((t * h * k4)[:, None] * lam[None, :] * below * p4)
+            Ad = A.to(dt)
+            out = out + Ad[:, None] * C1.to(dt)[None, :] + (Ad[:, None] * q) @ BqA.to(dt)
+        # the windows, bin by bin as in spectra
+        lw = lam[idx]                                                                    # (n_e, wb)
+        off = (e[:, None] - lw + 0.5 * self.hf).to(dt)[None] + (e[None, :] * e_r.double()).to(dt)[:, :, None]
+        step = edge_step(off, self.hf, None if width is None else width[:, :, None])
+        shape = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
+        if A is not None:
+            fac = 1 + (m["k4"][:, None] * p4.gather(1, idx)).to(dt)[None] * A.to(dt)[:, None, None]
+            shape = shape * fac.clamp_min(CUBIC4_FLOOR)
+        win = (h.to(dt)[None, :, None] * step * shape) * valid.to(dt)[None]
+        out = out.index_add(1, idx.reshape(-1), win.reshape(win.shape[0], -1))
+        return (x * x).to(dt)[None, :] * out + smooth.to(dt)[None, :]
 
     def edge_terms(self, g, eps, r, sd=None):
         """Material r's edge terms under per-pixel dilations eps (Pc, R): (Pc, n_edges, Kf) in the model's dtype, each the

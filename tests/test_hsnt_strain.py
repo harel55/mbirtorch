@@ -841,6 +841,58 @@ def test_texture_field_global_grad():
     assert bool((torch.diagonal(F) > 0).all())
 
 
+@pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic'])
+@pytest.mark.parametrize('spread', [False, True])
+def test_ray_spectrum_matches_dense(case, spread):
+    """The windowed per-ray spectra (Hybrid2._ray_spectrum) equal the sum of every edge over every fine bin, with and
+    without the strain's spread along the rays, and so do their derivatives with respect to the global parameters and
+    the strains."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, RayTexture, harmonics4
+    lam = np.linspace(1.2, 4.4, 600)
+    nb = 2 if case == 'field' else 1
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64, edge_slope=True,
+                shape_model=None if case == 'powder' else 'cubic4', texture_basis=nb)
+    gen = torch.Generator().manual_seed(5)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]; ne = sl['h'][1] - sl['h'][0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3 + 0.1 * torch.rand(ne, generator=gen, dtype=torch.float64)
+    g[sl['t'][0]:sl['t'][1]] = 0.2 * torch.randn(sl['t'][1] - sl['t'][0], generator=gen, dtype=torch.float64)
+    g[sl['c'][0]] = 0.2
+    if case != 'powder':
+        g[sl['x'][0]:sl['x'][1]] = 0.05 * torch.randn(sl['x'][1] - sl['x'][0], generator=gen, dtype=torch.float64)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    P = 30
+    if case == 'anisotropic':
+        M.set_dec(0, 0.8 + 0.4 * torch.rand(ne, generator=gen, dtype=torch.float64), 0.05 * torch.randn(ne, generator=gen, dtype=torch.float64))
+        eps = 2e-3 * torch.randn(P, 2, generator=gen, dtype=torch.float64)
+    else:
+        eps = 2e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
+    views = None if case == 'powder' else torch.arange(P) % 8
+    if case == 'field':
+        q = torch.rand(P, generator=gen, dtype=torch.float64)
+        views = RayTexture(views, [torch.stack([q, 1 - q], 1)])
+    sd = 3e-4 * torch.rand(P, 1, generator=gen, dtype=torch.float64) if spread else None
+
+    def run(dense, gg, ee):
+        M.dense_spectra = dense
+        return M.spectra(gg, ee, views, sd=sd)
+    a, b = run(False, g, eps), run(True, g, eps)
+    x = M.lamf / M.lam_ref
+    assert M._ray_spectrum(g, 0, eps, views, sd, x, torch.zeros_like(x)) is not None    # the windowed path ran
+    assert torch.allclose(a, b, rtol=0, atol=1e-10 * float(b.abs().max()))
+    w = torch.randn_like(b)
+    grads = []
+    for dense in (False, True):
+        gp = g.clone().requires_grad_(True)
+        grads.append(torch.autograd.grad((run(dense, gp, eps) * w).sum(), gp)[0])
+    assert torch.allclose(grads[0], grads[1], rtol=1e-8, atol=1e-10 * float(grads[1].abs().max()))
+    tang = torch.randn_like(eps)
+    jv = [torch.func.jvp(lambda ee: run(dense, g, ee), (eps,), (tang,))[1] for dense in (False, True)]
+    assert torch.allclose(jv[0], jv[1], rtol=0, atol=1e-8 * float(jv[1].abs().max()))
+    M.dense_spectra = False
+
+
 def test_fine_projector_set_mount():
     """A FineProjector whose mount is changed in place projects like one built with that mount, series by series, and
     reports the mount in voxels of the detector grid."""
