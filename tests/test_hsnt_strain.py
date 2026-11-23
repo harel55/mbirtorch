@@ -728,6 +728,162 @@ def test_kernel_moves_on_fisher_steps():
     assert not all(recomputed[3:])
 
 
+GRAD_RTOL = 1e-6                 # global_grad against global_system's gradient, relative
+CUBIC4_GRAD_RTOL = 1e-5          # the same with the cubic4 model, as in test_cubic4_global_grad
+GRAD_ATOL_SHARE = 1e-8           # the absolute tolerance of those checks, as a share of the largest gradient entry
+STRATA_RTOL = 1e-10              # test_fisher_rays_strata_counts: the subset against the full Fisher information
+FISHER_SUBSET_SHARE = 4          # test_fisher_rays_subset_accuracy and the global steps sample one ray in this many.
+# test_fisher_rays_subset_accuracy: the largest entry of the subset's minus the full Fisher information, in units of the
+# square root of the product of the full one's two diagonal entries
+FISHER_SUBSET_TOL = 0.1
+FISHER_TEST_VIEWS = 8            # The fisher_rays tests' fits have this many views.
+KERNEL_START_FACTOR = 1.2        # test_fisher_rays_global_steps starts the kernel's widths this many times too wide.
+GLOBAL_TEST_STEPS = 6            # test_fisher_rays_global_steps takes this many global steps,
+GLOBAL_TEST_EVERY = 2            # and it recomputes the Fisher information on every this many steps.
+SETTLED_KERNEL_SE = 0.5          # A kernel's last move of this many times KERNEL_LAG_SE counts as settled.
+STEP_LOSS_RTOL = 1e-9            # A global step may raise the loss by at most this share (rounding).
+ACCURACY_TEST_RAYS = 1200        # test_fisher_rays_subset_accuracy's fit has this many rays.
+AUTO_TEST_RAYS_PER_PARAMETER = 2  # test_fisher_rays_auto sets FISHER_RAYS_PER_PARAMETER to this value.
+
+
+def _free_globals(fit):
+    """Returns the indices of the fit's free global parameters, the resolution kernel's slots included."""
+    M = fit.M
+    return [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]
+
+
+def _fisher_fit(groups, repeat=1, masked_groups=0, seed=5):
+    """Returns a small FitB with the cubic4 model for the fisher_rays checks. It has one bcc material, FISHER_TEST_VIEWS
+    views and one contamination component. Its rays are stored view by view, and within a view their maps and strains
+    vary smoothly, as along a detector's rows. Each of the groups distinct rays is stored repeat times in a row. A ray
+    mask leaves out the first masked_groups groups. The counts come from the model."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
+    lam = np.linspace(2.0, 4.4, 300)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device='cpu', dtype=torch.float64, shape_model='cubic4')
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    axis = torch.tensor([np.sin(0.9) * np.cos(0.4), np.sin(0.9) * np.sin(0.4), np.cos(0.9)], dtype=torch.float64)
+    g[sl['x'][0]:sl['x'][1]] = 0.05 * harmonics4(axis)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0005, 0.001, 0.002, 0.0005, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    gen = torch.Generator().manual_seed(seed)
+    d = torch.randn(FISHER_TEST_VIEWS, 3, generator=gen, dtype=torch.float64)
+    M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    per = groups // FISHER_TEST_VIEWS
+    view = torch.arange(groups) // per
+    phase = 2 * np.pi * torch.rand(FISHER_TEST_VIEWS, generator=gen, dtype=torch.float64)[view]
+    u = 2 * np.pi * (torch.arange(groups) % per).double() / per + phase          # each ray's place along its view
+    W = (1.0 + 0.5 * torch.sin(u))[:, None]
+    eps = (1e-3 * torch.cos(2 * u))[:, None]
+    f = torch.zeros(1, M.K, dtype=torch.float64); f[0, 100:140] = 0.05
+    mask = torch.ones(groups * repeat, dtype=torch.bool); mask[:masked_groups * repeat] = False
+    fit = FitB(M, torch.ones(groups * repeat, M.K, dtype=torch.float64), g, W.repeat_interleave(repeat, 0), f,
+               eps=eps.repeat_interleave(repeat, 0), chunk=16, ray_mask=mask if masked_groups else None)
+    fit.ray_view = view.repeat_interleave(repeat)
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
+    return fit
+
+
+@pytest.mark.parametrize('lean', [False, True])
+def test_global_grad_with_kernel(lean):
+    """FitB.global_grad with the resolution kernel's slots equals global_system's gradient: to GRAD_RTOL for a powder,
+    and to CUBIC4_GRAD_RTOL with the cubic4 model. This also holds with lean_syncs."""
+    for fit, rtol in ((_small_fit(), GRAD_RTOL), (_fisher_fit(40), CUBIC4_GRAD_RTOL)):
+        fit.lean_syncs = lean
+        M = fit.M
+        idx = _free_globals(fit)
+        assert any(M.res_sl[0] <= i < M.res_sl[1] for i in idx)
+        g1, _ = fit.global_system(idx)
+        g2 = fit.global_grad(idx)
+        assert torch.allclose(g1, g2, rtol=rtol, atol=GRAD_ATOL_SHARE * float(g1.abs().max())), (g1, g2)
+
+
+def test_fisher_rays_all_rays_exact():
+    """With fisher_rays at the number of rays, subset_fisher gives global_system's Fisher information exactly."""
+    fit = _fisher_fit(80)
+    idx = _free_globals(fit)
+    _, F = fit.global_system(idx)
+    fit.fisher_rays = fit.P
+    assert torch.equal(fit.subset_fisher(idx), F)
+    assert fit.fisher_subset_info == dict(rays=fit.P, asked=fit.P, kept=fit.P)
+
+
+@pytest.mark.parametrize('lean', [False, True])
+def test_fisher_rays_strata_counts(lean):
+    """When the rays come in runs of identical rays and each stratum is one run, the subset's Fisher information equals
+    the full one to rounding, because each sampled ray counts for its stratum. This checks the sampled rays' Jacobians
+    and their counts, also with lean_syncs and with a ray mask that leaves out whole runs."""
+    groups, repeat, masked = 64, 4, 8
+    fit = _fisher_fit(groups, repeat, masked)
+    fit.lean_syncs = lean
+    idx = _free_globals(fit)
+    _, F = fit.global_system(idx)
+    fit.fisher_rays = groups - masked
+    Fs = fit.subset_fisher(idx)
+    assert fit.fisher_subset_info == dict(rays=groups - masked, asked=groups - masked, kept=(groups - masked) * repeat)
+    assert torch.allclose(Fs, F, rtol=STRATA_RTOL, atol=STRATA_RTOL * float(torch.diagonal(F).abs().max()))
+
+
+def test_fisher_rays_subset_accuracy():
+    """With one ray in FISHER_SUBSET_SHARE, every entry of the subset's Fisher information is within FISHER_SUBSET_TOL
+    of the full one's, in units of the square root of the product of the full one's two diagonal entries. The rays'
+    maps and strains vary smoothly within each view, as on a detector."""
+    from mbirtorch.hsnt.strain.model import INFO_FLOOR
+    fit = _fisher_fit(ACCURACY_TEST_RAYS)
+    idx = _free_globals(fit)
+    _, F = fit.global_system(idx)
+    fit.fisher_rays = fit.P // FISHER_SUBSET_SHARE
+    Fs = fit.subset_fisher(idx)
+    assert fit.fisher_subset_info['rays'] == fit.P // FISHER_SUBSET_SHARE
+    d = torch.diagonal(F)
+    live = d > INFO_FLOOR * d.max()
+    s = d[live].rsqrt()
+    err = float((s[:, None] * (Fs - F)[live][:, live] * s[None, :]).abs().max())
+    assert err < FISHER_SUBSET_TOL, err
+
+
+def test_fisher_rays_global_steps():
+    """With fisher_rays and fisher_every GLOBAL_TEST_EVERY, the global steps never raise the loss, and they recompute
+    the Fisher information on every GLOBAL_TEST_EVERY-th step. The resolution kernel also moves on the steps in
+    between, because the gradient covers it."""
+    from mbirtorch.hsnt.strain import model as mdl
+    fit = _fisher_fit(200)
+    M = fit.M
+    res = list(range(*M.res_sl))
+    g = fit.g.clone()
+    g[M.res_sl[0] + 1] *= KERNEL_START_FACTOR; g[M.res_sl[0] + 2] *= KERNEL_START_FACTOR
+    fit.g = g
+    fit.fisher_rays = fit.P // FISHER_SUBSET_SHARE
+    fit.fisher_every = GLOBAL_TEST_EVERY
+    loss = [fit.loss()]
+    moved, recomputed = [], []
+    for _ in range(GLOBAL_TEST_STEPS):
+        fit.last_kernel_step_se = SETTLED_KERNEL_SE * mdl.KERNEL_LAG_SE
+        g0 = fit.g.clone()
+        l, _ = fit.global_step()
+        loss.append(float(l))
+        moved.append(bool((fit.g[res] != g0[res]).any()))
+        recomputed.append(fit._fisher[2] == 1)
+    assert all(b <= a + STEP_LOSS_RTOL * abs(a) for a, b in zip(loss, loss[1:]))
+    assert recomputed == [k % GLOBAL_TEST_EVERY == 0 for k in range(GLOBAL_TEST_STEPS)]
+    assert any(mv for mv, rc in zip(moved, recomputed) if not rc)
+
+
+def test_fisher_rays_auto(monkeypatch):
+    """fisher_rays FISHER_RAYS_AUTO asks for FISHER_RAYS_PER_PARAMETER rays per free global parameter."""
+    from mbirtorch.hsnt.strain import model as mdl
+    monkeypatch.setattr(mdl, 'FISHER_RAYS_PER_PARAMETER', AUTO_TEST_RAYS_PER_PARAMETER)
+    fit = _fisher_fit(200)
+    idx = _free_globals(fit)
+    fit.fisher_rays = mdl.FISHER_RAYS_AUTO
+    fit.subset_fisher(idx)
+    n = AUTO_TEST_RAYS_PER_PARAMETER * len(idx)
+    assert n < fit.P and fit.fisher_subset_info == dict(rays=n, asked=n, kept=fit.P)
+
+
 def test_contamination_newton_kkt():
     """The contamination Newton step's inner solution meets the optimality conditions of its model: zero gradient where
     a coefficient is positive, gradient >= 0 where it is held at 0."""

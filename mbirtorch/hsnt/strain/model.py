@@ -36,7 +36,7 @@ import torch
 from scipy.stats import norm
 
 from .bragg import legendre_columns, reflections
-from ._dist import all_sum, all_sum_float
+from ._dist import all_sum, all_sum_float, rank
 
 
 class RayTexture:
@@ -129,6 +129,17 @@ GOLDEN = (math.sqrt(5) - 1) / 2   # the golden section's ratio
 CUBIC4_BOUND = 1.0               # cubic4: the bound on each degree-4 texture coefficient
 KERNEL_LAG_SE = 1.0              # a free resolution kernel moves only on the global step's Fisher iterations once its last
                                  # move was below this many standard errors (RMS); before that, on every step
+# FitB.fisher_rays takes this value to size the Fisher information's ray subset by the number of free global parameters.
+FISHER_RAYS_AUTO = "auto"
+# With FISHER_RAYS_AUTO, the ray subset holds this many rays per free global parameter. The subset's error in the Fisher
+# information shrinks as one over the square root of its rays. A material's parameters learn only from the rays that
+# cross it, and each added material adds parameters, so the subset grows with the parameter count.
+FISHER_RAYS_PER_PARAMETER = 2048
+FISHER_RAYS_SEED = 0             # This seed places each sampled ray within its stratum (FitB.fisher_subset).
+# A chunk of the global step's Fisher passes holds FitB.chunk / GLOBAL_CHUNK_SHARE rays, and at least GLOBAL_CHUNK_MIN.
+GLOBAL_CHUNK_SHARE = 4
+GLOBAL_CHUNK_MIN = 64
+MODEL_FLOOR = 1e-12              # The global Fisher passes clamp the model from below at this value.
 P4_MIN = -3.0 / 7.0                # the smallest value of the Legendre polynomial P4 (at x^2 = 3/7)
 CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a truncated expansion can go negative)
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
@@ -1194,6 +1205,13 @@ class FitB:
         # (with all other parameters), and on every step while its last move exceeds KERNEL_LAG_SE.
         self.fisher_every = 1
         self._fisher = None
+        # With fisher_rays above 0, the global step takes its Fisher information from a fixed subset of this many rays
+        # (fisher_subset), and each sampled ray stands for the rays of its stratum. The gradient still comes from all
+        # rays, so the steps reach the optimum of all the data. The resolution kernel then moves on every step.
+        # FISHER_RAYS_AUTO takes FISHER_RAYS_PER_PARAMETER rays per free global parameter. 0, the default, uses all rays.
+        self.fisher_rays = 0
+        self.fisher_subset_info = None   # fisher_subset records here the rays it sampled, asked for and could use.
+        self._fisher_sel = None          # fisher_subset keeps its selection here with the inputs it was made from.
         self.last_kernel_step_se = float('inf')   # the resolution kernel's last move, RMS in standard errors
         # contamination_newton: the contamination step takes a full Newton step on the atom coefficients
         # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
@@ -1517,10 +1535,12 @@ class FitB:
         widths = None if eps_all is None else self._window_widths(g, eps_all)
         hits = self._floor_hits(g)
         plan = []
-        start, stop, _ = sl.indices(self.P)
+        # A tensor of ray indices (fisher_subset) has no span, so each of its chunks checks its own rays for the floor.
+        span = isinstance(sl, slice)
+        start, stop, _ = sl.indices(self.P) if span else (None, None, None)
         for r in range(M.R):
             floor = None
-            if hits[r] is not None:
+            if hits[r] is not None and span:
                 h = hits[r]; floor = bool(np.searchsorted(h, start) < np.searchsorted(h, stop))
             plan.append(WindowPlan(None if widths is None else widths[r], floor))
         return plan
@@ -2216,6 +2236,8 @@ class FitB:
         due = self.fisher_every <= 1 or lag is None or lag[0] != idx or lag[2] % self.fisher_every == 0
         if res and not self.last_kernel_step_se < KERNEL_LAG_SE:
             due = True
+        if self.fisher_rays:              # The Fisher information comes from a ray subset, and the gradient from all rays.
+            return self._sampled_system(idx, lag, due)
         if due:
             grad, F = self.global_system(idx)
             self._fisher = (list(idx), F, 1)
@@ -2230,20 +2252,32 @@ class FitB:
 
     def global_grad(self, idx):
         """The gradient of the loss (with the spline penalty) for the global parameters idx, by automatic
-        differentiation: about two loss evaluations, against one Jacobian per parameter for global_system. The
-        resolution kernel must be held fixed (its band enters without derivatives)."""
+        differentiation: about two loss evaluations, against one Jacobian per parameter for global_system. When idx
+        holds resolution kernel slots, each pass also sums the loss's derivative with respect to the band matrix, and
+        band_grad turns that sum into the kernel's part of the gradient."""
         M = self.M
-        assert not any(M.res_sl[0] <= i < M.res_sl[1] for i in idx), 'global_grad holds the resolution kernel fixed'
+        kernel = any(M.res_sl[0] <= i < M.res_sl[1] for i in idx)
         gp = self.g.clone().requires_grad_(True)
         with torch.no_grad():
             band = self._band_kept(self.g) if getattr(self, "lean_syncs", False) else M.band_matrix(M.band(self.g))
+        if kernel:                         # The band matrix becomes a leaf, so that each pass gives its derivative.
+            band = band.detach().requires_grad_(True)
+            d_band = torch.zeros(band.shape, device=band.device, dtype=torch.float64)
         grad = torch.zeros_like(self.g); dev = 0.0
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
             m = self.mean(sl, g=gp, cache=cache)[0]
             dv = self.deviance_terms(sl, m, self.T_chunk(sl)).sum(dtype=torch.float64)
-            grad += torch.autograd.grad(dv, gp)[0]; dev += self._chunk_total(dv)
+            if kernel:
+                dg, db = torch.autograd.grad(dv, (gp, band))
+                grad += dg; d_band += db.double()
+            else:
+                grad += torch.autograd.grad(dv, gp)[0]
+            dev += self._chunk_total(dv)
         all_sum(grad)
+        if kernel:
+            all_sum(d_band)
+            grad[M.res_sl[0]:M.res_sl[1]] += self.band_grad(d_band)
         self.remember_data_loss(all_sum_float(float(dev), self.device))
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):
@@ -2285,10 +2319,10 @@ class FitB:
                     return M.texture_factor(torch.cat([g0[:x0], xx, g0[x1:]]), r)
                 J = torch.func.jacfwd(fac)(g0[x0:x1])                                   # (views, edges, Kf, x params)
                 dtex.append([J[..., k].to(M.dt) for k in range(x1 - x0)])
-        P = self.P; gch = max(64, self.chunk // 4); dev = 0.0
+        P = self.P; gch = self.global_chunk(); dev = 0.0
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
             Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb, dtex)
-            mm = m.clamp_min(1e-12); T = self.T_chunk(sl)
+            mm = m.clamp_min(MODEL_FLOOR); T = self.T_chunk(sl)
             grad += torch.einsum('pk,npk->n', self.residual(sl, T, mm), Jg).double()
             F += torch.einsum('pk,apk,bpk->ab', self.weight(sl, mm), Jg, Jg).double()
             dev += self._chunk_total(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
@@ -2303,6 +2337,112 @@ class FitB:
             self.last_fisher_data = (list(idx), F.clone())          # without the penalties, for the step measure
             grad += gpen.detach()[idx]; F += Hpen.detach()
         return grad, F
+
+    def global_chunk(self):
+        """Returns the number of rays per chunk of the global step's Fisher passes (global_system, subset_fisher)."""
+        return max(GLOBAL_CHUNK_MIN, self.chunk // GLOBAL_CHUNK_SHARE)
+
+    def band_grad(self, d_band):
+        """Returns the loss's derivative with respect to the resolution kernel's slots (float64), given its derivative
+        d_band (K, Kf) with respect to the dense band matrix at the current state. Each band value adds into the matrix
+        at its fine-grid index (Hybrid2.band_matrix), so its derivative is d_band at that index. The band's derivatives
+        with respect to the slots are forward-mode, as in global_system."""
+        M = self.M; r0, r1 = M.res_sl
+        g0 = self.g.detach().clone()
+
+        def band_of(res):
+            return M.band(torch.cat([g0[:r0], res, g0[r1:]]))
+        jb = torch.func.jacfwd(band_of)(g0[r0:r1])                                    # (K, bw, slots)
+        return torch.einsum('kj,kjq->q', d_band.gather(1, M.band_idx), jb)
+
+    def _sampled_system(self, idx, lag, due):
+        """This is _lagged_system with fisher_rays on. Every call takes the gradient from all rays, the resolution
+        kernel's slots included (global_grad). A call that is due takes the Fisher information from the ray subset
+        (subset_fisher). The other calls reuse the last Fisher information, and the kernel moves with the other
+        parameters."""
+        grad = self.global_grad(idx)
+        if due:
+            F = self.subset_fisher(idx)
+            self._fisher = (list(idx), F, 1)
+            return idx, grad, F
+        self._fisher = (lag[0], lag[1], lag[2] + 1)
+        return idx, grad, lag[1]
+
+    def fisher_subset(self, n_params):
+        """Returns the rays for the Fisher information with fisher_rays on, as a list of chunks (rays, count). rays is a
+        slice or a tensor of ray indices. count (rays,) holds the number of rays that each sampled ray stands for, or is
+        None for 1. The rays that enter the likelihood are split in their stored order into equal strata, and each
+        stratum gives one ray at a seeded random place. A tomographic fit stores its rays view by view and row by row,
+        so every view and every detector row gets its share. When fisher_rays is at least the number of rays, the
+        chunks are global_system's. n_params is the number of free global parameters, which sets the size for
+        FISHER_RAYS_AUTO. The selection is kept while fisher_rays, the rays and ray_mask do not change."""
+        asked = FISHER_RAYS_PER_PARAMETER * n_params if self.fisher_rays == FISHER_RAYS_AUTO else int(self.fisher_rays)
+        if asked < 1:
+            raise ValueError(f"fisher_rays must be a positive number of rays or {FISHER_RAYS_AUTO!r}, not {self.fisher_rays!r}")
+        gch = self.global_chunk()
+        key = (asked, self.P, gch)
+        kept = self._fisher_sel
+        if kept is not None and kept[0] == key and kept[1].match([self.ray_weight]):
+            return kept[2]
+        dev = self.device
+        rays = None if self.ray_weight is None else torch.nonzero(self.ray_weight > 0).flatten()
+        n_kept = self.P if rays is None else int(rays.numel())
+        total = int(all_sum_float(n_kept, dev))                                # over the processes that share the rays
+        if asked >= total or not n_kept:
+            n = n_kept
+        else:                                     # This process's share of the subset, at least one ray.
+            n = min(n_kept, max(1, round(asked * n_kept / total)))
+        if n >= n_kept:
+            if rays is None:
+                chunks = [(slice(i, min(i + gch, self.P)), None) for i in range(0, self.P, gch)]
+            else:
+                chunks = [(rays[i:i + gch], None) for i in range(0, n_kept, gch)]
+        else:
+            gen = torch.Generator().manual_seed(FISHER_RAYS_SEED + rank())
+            edge = torch.arange(n + 1, dtype=torch.int64) * n_kept // n         # the strata's boundaries
+            size = edge[1:] - edge[:-1]
+            pos = edge[:-1] + (torch.rand(n, generator=gen, dtype=torch.float64) * size).long()
+            pos = torch.minimum(pos, edge[1:] - 1).to(dev)
+            pick = pos if rays is None else rays[pos]
+            count = size.to(dev, self.M.dt)
+            chunks = [(pick[i:i + gch], count[i:i + gch]) for i in range(0, n, gch)]
+        self.fisher_subset_info = dict(rays=int(all_sum_float(n, dev)), asked=asked, kept=total)
+        self._fisher_sel = (key, _Keys([self.ray_weight]), chunks)
+        return chunks
+
+    def subset_fisher(self, idx):
+        """Returns the Fisher information of the loss for the global parameters idx from the ray subset of fisher_rays
+        (fisher_subset), plus the penalties' exact Hessian. Each sampled ray counts for the rays it stands for. Like
+        global_system, it keeps the data's part in last_fisher_data for the step measure. Use global_system for the full
+        Fisher information, for example for standard errors."""
+        M = self.M
+        cache, dmu, dRb = self.global_derivatives(idx)
+        g0 = self.g.clone()
+        dtex = None
+        if M.shape_model in VIEW_TEXTURES and self.ray_view is not None and M.tex_nb == 1:
+            dtex = []
+            for r in range(M.R):
+                x0, x1 = M.slices[r]["x"]
+
+                def fac(xx, r=r, x0=x0, x1=x1):
+                    return M.texture_factor(torch.cat([g0[:x0], xx, g0[x1:]]), r)
+                J = torch.func.jacfwd(fac)(g0[x0:x1])                                   # (views, edges, Kf, x params)
+                dtex.append([J[..., k].to(M.dt) for k in range(x1 - x0)])
+        F = torch.zeros(len(idx), len(idx), device=M.dev, dtype=torch.float64)
+        for sl, count in self.fisher_subset(len(idx)):
+            Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb, dtex)
+            w = self.weight(sl, m.clamp_min(MODEL_FLOOR))
+            F += torch.einsum('pk,apk,bpk->ab', w if count is None else w * count[:, None], Jg, Jg).double()
+            del Jg
+        all_sum(F)
+        gp = g0.clone().requires_grad_(True)
+        pen = self.spline_penalty(gp)
+        if torch.is_tensor(pen):
+            gpen, = torch.autograd.grad(pen, gp, create_graph=True)
+            Hpen = torch.stack([torch.autograd.grad(gpen[i], gp, retain_graph=True)[0] for i in idx])[:, idx]
+            self.last_fisher_data = (list(idx), F.clone())          # without the penalties, for the step measure
+            F += Hpen.detach()
+        return F
 
     def lattice_search(self, r, half_width=LATTICE_HALF_WIDTH, step=LATTICE_COARSE_STEP, rel_tol=LATTICE_TOL):
         """Material r's lattice parameter: the loss on a grid of relative spacing `step` over a0 * (1 +- half_width),
