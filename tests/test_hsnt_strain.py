@@ -1259,3 +1259,119 @@ def test_elastic_anisotropy():
     tf.E = torch.zeros_like(E_true); tf.sync()
     l0 = tf.data_loss(); tf.volume_step(); l1 = tf.data_loss()
     assert l1 < l0
+
+
+def _lean_fit(case, dtype, seed=7):
+    """A small FitB on the CPU for the lean_syncs checks: one bcc material, three chunks of rays, eight views (five rays
+    each, so that chunks see different views), per-ray strains with a spread along the beam, and counts from the model.
+    case: 'powder', 'views' (a global cubic4 texture), 'field' (a texture field), 'anisotropic' (elastic anisotropy and
+    a global texture) or 'floor' (a global texture that brings view 0, and so the first chunk, to CUBIC4_FLOOR)."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4, CUBIC4_FLOOR, P4_MIN
+    lam = np.linspace(1.6, 4.4, 400)
+    nb = 2 if case == 'field' else 1
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device='cpu', dtype=dtype, shape_model=None if case == 'powder' else 'cubic4', texture_basis=nb)
+    gen = torch.Generator().manual_seed(seed)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]; ne = sl['h'][1] - sl['h'][0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3 + 0.1 * torch.rand(ne, generator=gen, dtype=torch.float64)
+    g[sl['c'][0]] = 0.2
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    if case != 'powder':
+        g[sl['x'][0]:sl['x'][1]] = 0.05 * torch.randn(sl['x'][1] - sl['x'][0], generator=gen, dtype=torch.float64)
+    if case == 'floor':
+        # a texture whose term is -3 in view 0 and small in the other views: the 200 reflection (k4 = 0.4) of view 0
+        # reaches the floor, so the first chunk takes the dense sum and the other chunks the windowed sum
+        Y = harmonics4(torch.as_tensor(M.view_dirs))                                    # (8 views, 9)
+        target = torch.tensor([-3.0, 0.1, 0.2, -0.1, 0.0, 0.1, -0.2, 0.3], dtype=torch.float64)
+        c = torch.linalg.pinv(Y) @ target
+        g[sl['x'][0]:sl['x'][1]] = c
+        kA = M.mats[0]['k4'][None, :] * (Y @ c)[:, None]
+        hit = ((1 + torch.minimum(kA * P4_MIN, kA)) <= CUBIC4_FLOOR).any(1)
+        assert hit.tolist() == [True] + [False] * 7
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 2 if case == 'anisotropic' else 1, generator=gen, dtype=torch.float64)
+    if case == 'anisotropic':
+        M.set_dec(0, 0.8 + 0.4 * torch.rand(ne, generator=gen, dtype=torch.float64), 0.05 * torch.randn(ne, generator=gen, dtype=torch.float64))
+    kw = dict(dtype=dtype)
+    fit = FitB(M, torch.ones(P, M.K, **kw), g, W.to(dtype), torch.zeros(1, M.K, **kw), eps=eps.to(dtype), chunk=16)
+    fit.ray_view = torch.arange(P) // 5
+    fit.eps_sd = (3e-4 * torch.rand(P, 1, generator=gen, dtype=torch.float64)).to(dtype)
+    if case == 'field':
+        q = torch.rand(P, generator=gen, dtype=torch.float64)
+        fit.tex_Q = [torch.stack([q, 1 - q], 1).to(dtype)]
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m.double(), generator=gen).to(dtype) / 50.0
+    return fit
+
+
+def _lean_outputs(fit):
+    """The quantities the lean_syncs option touches, at the fit's current state."""
+    M = fit.M
+    out = {}
+    cache = fit._state(fit.g)
+    out['mu'], out['band'], out['kappa'] = cache
+    fit.use_memo = False
+    out['loss'] = torch.tensor(fit.data_loss())
+    eps2 = fit.eps * 1.3
+    out['loss_eps'] = torch.tensor(fit.data_loss(eps=eps2))
+    with torch.no_grad():
+        out['mean'] = torch.cat([fit.mean(s, cache=cache)[0] for s in fit.chunks()])
+        out['ray_loss'] = torch.cat([fit.ray_loss(s, fit.W[s], eps2[s], cache, eps_all=eps2) for s in fit.chunks()])
+        G, F, dev = [], [], []
+        for s in fit.chunks():
+            g_, f_ = fit.ray_system(s, cache, deviance=dev)
+            G.append(g_); F.append(f_)
+    out['G'], out['F'], out['dev'] = torch.cat(G), torch.cat(F), torch.tensor(sum(float(v) for v in dev))
+    idx = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i]) and not (M.res_sl[0] <= i < M.res_sl[1])]
+    out['gs_grad'], out['gs_F'] = fit.global_system(idx)
+    out['gg'] = fit.global_grad(idx)
+    full = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]
+    out['gs_grad_kernel'], out['gs_F_kernel'] = fit.global_system(full)
+    g0 = fit.g.clone()
+    with torch.no_grad():
+        out['lattice'] = torch.tensor(fit.lattice_search(0, half_width=0.002))
+    fit.g = g0
+    return out
+
+
+@pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic', 'floor'])
+@pytest.mark.parametrize('dtype', [torch.float64, torch.float32])
+def test_lean_syncs_matches_default(case, dtype):
+    """FitB.lean_syncs (the band kept between passes, one window width and one cubic4 floor decision per pass) gives the
+    default path's spectra, losses, ray systems, global systems, global gradient and lattice search, to rounding; a
+    pass's window width holds every chunk's own window, in single and double precision; and with 'floor' some chunks
+    take the dense sum and others the windowed sum, as on the default path."""
+    from mbirtorch.hsnt.strain.model import WINDOW_BUCKET
+    fit = _lean_fit(case, dtype)
+    M = fit.M
+    ref = _lean_outputs(fit)
+    fit.lean_syncs = True
+    got = _lean_outputs(fit)
+    tol = 1e-12 if dtype == torch.float64 else 1e-6
+    for k in ref:
+        a, b = ref[k].double(), got[k].double()
+        assert torch.allclose(a, b, rtol=tol, atol=tol * float(a.abs().max())), k
+    # the pass's width against each chunk's own, with the strains in either precision
+    widths = fit._window_widths(fit.g, fit.eps)
+    assert all(w % WINDOW_BUCKET == 0 for w in widths)
+    for s in fit.chunks():
+        for e_ in (fit.eps[s], fit.eps[s].double()):
+            lo, hi, wd = M.window_extent(fit.g, 0, e_, fit.eps_sd[s])
+            assert int(M.window_width(lo, hi, wd)) <= widths[0]
+    if case == 'floor':
+        floors = [fit.window_plan(s, fit.g, fit.eps)[0].floor for s in fit.chunks()]
+        assert floors == [True, False, False]
+    # the band is built again only when the resolution kernel's values change
+    built = []
+    band = M.band
+    M.band = lambda g_: built.append(1) or band(g_)
+    fit.data_loss(); fit.data_loss()
+    assert built == []
+    fit.lean_syncs = False
+    fit.data_loss()
+    del M.band
+    assert built == [1]

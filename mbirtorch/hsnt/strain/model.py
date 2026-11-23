@@ -141,14 +141,19 @@ CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvatu
 LEGENDRE_DEGREE = 8          # the smooth part's polynomial degree (the spline's effective degrees of freedom
                              # on the real Fe cube, q79, were 8.9)
 LEGENDRE_CURVATURE = 1e-2    # the smooth part's curvature penalty weight relative to FitB.ridge (q79 used 1.1e-2)
+WINDOW_BUCKET = 8            # lean_syncs: a pass's window width is rounded up to a multiple of this many fine bins
+WINDOW_SLACK = 2             # lean_syncs: fine bins added to a pass's window width, because a strain in single or double
+                             # precision can move a window by one bin at either end
 
 
-def edge_step(off, hf, width=None):
+def edge_step(off, hf, width=None, where=False):
     """Each fine bin's share below a Bragg edge: off is the edge's position less the bin's lower end, hf the bin width
     (the edge a sharp step, so the share is clamp(off / hf, 0, 1)). With width (the standard deviation of the edge's
     position, broadcastable to off), the share's expectation over a Gaussian edge position:
     (G(off) - G(off - hf)) / hf with G(u) = u Phi(u / width) + width phi(u / width). It is the sum of the edges of a ray
-    whose strain along the beam has that spread (to second order in the spread; see FitB.eps_sd)."""
+    whose strain along the beam has that spread (to second order in the spread; see FitB.eps_sd). where=True gives the
+    same values without waiting for the GPU: it evaluates the spread's formula on every element, so use it only for
+    small arrays such as a window's (lean_syncs)."""
     sharp = (off / hf).clamp(0, 1)
     if width is None:
         return sharp
@@ -156,26 +161,40 @@ def edge_step(off, hf, width=None):
     # only bins within EDGE_SPREAD_REACH widths of the edge differ from the sharp step: elsewhere the share is 0 or 1 to
     # the dtype's precision, so the error functions are evaluated there alone
     near = (w > EDGE_SPREAD_MIN * hf) & (off > -EDGE_SPREAD_REACH * w) & (off < hf + EDGE_SPREAD_REACH * w)
-    o, ww = off[near], w[near]
+    o, ww = _near_values(near, off, w, hf, where)
     G = lambda u: u * 0.5 * torch.erfc(-u / (ww * math.sqrt(2))) + ww * torch.exp(-0.5 * (u / ww) ** 2) / math.sqrt(2 * math.pi)
+    if where:
+        return torch.where(near, (G(o) - G(o - hf)) / hf, sharp)
     return sharp.index_put((near,), (G(o) - G(o - hf)) / hf)
 
 
-def edge_step_slopes(off, hf, width=None):
+def edge_step_slopes(off, hf, width=None, where=False):
     """The derivatives of edge_step(off, hf, width) with respect to off and to width, as edge_step evaluates it (the
-    sharp step's slope 1 / hf inside the bin, the spread step's within EDGE_SPREAD_REACH widths of the edge)."""
+    sharp step's slope 1 / hf inside the bin, the spread step's within EDGE_SPREAD_REACH widths of the edge). where:
+    as for edge_step."""
     d_off = ((off > 0) & (off < hf)).to(off.dtype) / hf
     d_w = torch.zeros_like(off)
     if width is None:
         return d_off, d_w
     w = torch.as_tensor(width, dtype=off.dtype, device=off.device).clamp_min(1e-12 * hf).expand_as(off)
     near = (w > EDGE_SPREAD_MIN * hf) & (off > -EDGE_SPREAD_REACH * w) & (off < hf + EDGE_SPREAD_REACH * w)
-    o, ww = off[near], w[near]
+    o, ww = _near_values(near, off, w, hf, where)
     Phi = lambda u: 0.5 * torch.erfc(-u / (ww * math.sqrt(2)))
     phi = lambda u: torch.exp(-0.5 * (u / ww) ** 2) / math.sqrt(2 * math.pi)
+    if where:
+        return torch.where(near, (Phi(o) - Phi(o - hf)) / hf, d_off), torch.where(near, (phi(o) - phi(o - hf)) / hf, d_w)
     d_off = d_off.index_put((near,), (Phi(o) - Phi(o - hf)) / hf)
     d_w = d_w.index_put((near,), (phi(o) - phi(o - hf)) / hf)
     return d_off, d_w
+
+
+def _near_values(near, off, w, hf, where):
+    """The offsets and spreads at which edge_step evaluates the spread's formula. Without where, the elements near the
+    edge alone. With where, every element, with the others set to an offset of 0 and a spread of one bin width, so that
+    the formula and its derivatives stay finite where torch.where discards them."""
+    if not where:
+        return off[near], w[near]
+    return torch.where(near, off, torch.zeros_like(off)), torch.where(near, w, torch.full_like(off, hf))
 
 
 def _window_terms(off, w, hf, t, ee, h, valid, kp4, A):
@@ -393,6 +412,17 @@ def bin_intervals(lam):
     return lam - np.concatenate([[0.5 * med], half_right]), lam + np.concatenate([half_right, [0.5 * med]])
 
 
+class WindowPlan:
+    """What FitB.window_plan has worked out in advance for one material and one chunk of rays (lean_syncs), so that
+    Hybrid2._ray_spectrum need not wait for the GPU to decide it. width is the window width in fine bins, at least the
+    chunk's own (None: the chunk's own, read from the GPU). floor is True when a ray of the chunk could reach
+    CUBIC4_FLOOR (None: decided from the chunk on the GPU). Any plan also makes the window's edge steps use torch.where."""
+    __slots__ = ("width", "floor")
+
+    def __init__(self, width=None, floor=None):
+        self.width, self.floor = width, floor
+
+
 class Hybrid2:
     """Structure of the stage-B model: grids, the banded resolution operator, materials and the parameter layout.
     Global parameter vector g: per material [a, h (n_e), c0, c1, smooth block (n_smooth)], then res (s0, s1, t0, t1),
@@ -412,6 +442,7 @@ class Hybrid2:
         phi = np.interp(lamf, lam, np.asarray(dose_per_bin, dtype=np.float64))
         f64 = dict(device=device, dtype=torch.float64)
         self.hf = hf
+        self.f0 = float(lamf[0])        # the fine grid's first wavelength as a Python number (no read from the GPU)
         self.dense_spectra = False      # True: spectra sums every edge over every fine bin (a check on _ray_spectrum)
         self.lam = torch.as_tensor(lam, **f64); self.lamf = torch.as_tensor(lamf, **f64)
         self.lam_lo = torch.as_tensor(lo, **f64); self.lam_hi = torch.as_tensor(hi, **f64)
@@ -517,14 +548,14 @@ class Hybrid2:
             self.lb[s0:s1] = 0.0; self.ub[s0:s1] = 0.0
 
     # -- spectra and their parameter derivatives
-    def spectra(self, g, eps=None, views=None, tex=None, sd=None):
+    def spectra(self, g, eps=None, views=None, tex=None, sd=None, plan=None):
         """mu (R, Kf), float64; or (Pc, R, Kf) in the model's dtype with per-pixel dilations eps (Pc, R): the edge
         positions are computed in float64, the per-pixel arrays (pixels x edges x bins) in the model's dtype. With
         shape_model 'cubic4' and views (Pc,) (each pixel's view), each pixel's edges carry its view's texture factor
         (texture_factor; tex: given factors per material (views, edges, Kf), e.g. a phantom's true textures, which
         are then summed over every bin); without views the spectra are a random
         powder's. sd (Pc, R): each ray's spread of strain along the beam; each edge is then the sum of the ray's shifted
-        edges (edge_step)."""
+        edges (edge_step). plan: one WindowPlan per material for these rays (FitB.window_plan), or None."""
         x = self.lamf / self.lam_ref
         out = []
         for r, (m, sl) in enumerate(zip(self.mats, self.slices)):
@@ -540,7 +571,8 @@ class Hybrid2:
                 shape = shape * self.linked_shape(self.lamf[:, None], e[None, :], h[None, :], m["mult"][None, :], xp)
                 out.append(x * x * ((step * shape) @ h) + smooth)
             else:
-                fast = None if self.dense_spectra or tex is not None else self._ray_spectrum(g, r, eps, views, sd, x, smooth)
+                fast = None if self.dense_spectra or tex is not None else \
+                    self._ray_spectrum(g, r, eps, views, sd, x, smooth, plan=None if plan is None else plan[r])
                 if fast is not None:
                     out.append(fast)
                     continue
@@ -558,7 +590,68 @@ class Hybrid2:
                 out.append((x * x).to(dt) * torch.einsum('pek,e->pk', step * shape, h.to(dt)) + smooth.to(dt))
         return torch.stack(out, 0) if eps is None else torch.stack(out, 1)
 
-    def _ray_spectrum(self, g, r, eps, views, sd, x, smooth, with_da=False):
+    def _ray_edges(self, g, r, eps, sd):
+        """Material r's unstrained edges e (n_e,), float64; and under the per-ray dilations eps (Pc, R), each ray's
+        strain per edge (Pc, n_e or 1), its edges ee (Pc, n_e) in the model's dtype, and the spreads of its edges
+        (Pc, n_e) or None without sd."""
+        m, sl = self.mats[r], self.slices[r]; dt = self.dt
+        e = 2.0 * g[sl["a"]] / torch.sqrt(m["ns"])                                      # unstrained edges (n_e,)
+        e_r, af = self._lattice_strain(r, eps)
+        ee = (e[None, :] * (1 + e_r.double())).to(dt)                                   # (Pc, n_e)
+        width = None if sd is None else ee * af * sd[:, r:r + 1].to(dt)
+        return e, e_r, ee, width
+
+    def _texture_term(self, g, r, views):
+        """Each ray's cubic4 texture term A (Pc,), float64, for material r: the sum over the degree-4 harmonics of the
+        ray's view times the ray's mean coefficients. None without a view-dependent texture or without views."""
+        sl = self.slices[r]
+        if isinstance(views, RayTexture):
+            x0 = sl["x"][0]
+            return ((self._harmonics_views()[views.views] @ g[x0:x0 + 9 * self.tex_nb].reshape(9, self.tex_nb))
+                    * views.Q[r].double()).sum(1)
+        if self.shape_model in VIEW_TEXTURES and views is not None:
+            x0 = sl["x"][0]
+            return (self._harmonics_views() @ g[x0:x0 + 9])[views]
+        return None
+
+    def floor_rays(self, r, A):
+        """For texture terms A (Pc,) of material r, True for each ray whose cubic4 factor could reach CUBIC4_FLOOR at
+        some wavelength (Pc,), bool."""
+        kA = (self.mats[r]["k4"][None, :] * A[:, None]).detach()
+        return ((1 + torch.minimum(kA * P4_MIN, kA)) <= CUBIC4_FLOOR).any(1)
+
+    def _edge_extent(self, e, ee, width):
+        """The smallest and the largest of each edge over the rays (n_e,) and the largest spread of each edge (n_e,),
+        float64."""
+        eed = ee.detach().double()
+        wd = torch.zeros_like(e) if width is None else width.detach().double().amax(0)
+        return eed.amin(0), eed.amax(0), wd
+
+    def _window_bins(self, lo_e, hi_e, wd, f0):
+        """Each edge's window from its extent (_edge_extent): the first fine bin k0 and the bin k1 just past the last
+        (n_e,), long. f0 is the fine grid's first wavelength."""
+        Kf = self.Kf
+        lo = lo_e - 0.5 * self.hf - EDGE_SPREAD_REACH * wd
+        hi = hi_e + 0.5 * self.hf + EDGE_SPREAD_REACH * wd
+        k0 = (torch.floor((lo - f0) / self.hf) - 1).clamp(0, Kf).long()
+        k1 = (torch.ceil((hi - f0) / self.hf) + 2).clamp(0, Kf).long()
+        return k0, torch.maximum(k1, k0)
+
+    def window_extent(self, g, r, eps, sd=None):
+        """Material r's window extent over the rays with dilations eps (Pc, R) and spreads sd: the smallest and the
+        largest of each edge and the largest spread of each edge (n_e,), float64. FitB.window_plan combines the extents
+        of all rays into one window width."""
+        with torch.no_grad():
+            e, _, ee, width = self._ray_edges(g, r, eps, sd)
+            return self._edge_extent(e, ee, width)
+
+    def window_width(self, lo_e, hi_e, wd):
+        """The widest window over the edges, in fine bins, as a tensor (no read from the GPU), for an extent from
+        window_extent."""
+        k0, k1 = self._window_bins(lo_e, hi_e, wd, self.f0)
+        return (k1 - k0).max()
+
+    def _ray_spectrum(self, g, r, eps, views, sd, x, smooth, with_da=False, plan=None):
         """Material r's spectra (Pc, Kf) under per-ray dilations eps, equal to spectra's per-edge sum but without
         per-edge arrays over all fine bins. Each edge has a window: the bins its rays' edges reach (their spread over the
         rays, plus EDGE_SPREAD_REACH widths of the strain's spread). Below the window every ray's edge is fully present,
@@ -566,39 +659,31 @@ class Hybrid2:
         the ray's texture term). Within the window the edges are summed bin by bin. Returns None, so that spectra sums
         every bin, for a shape model linked to the heights (extinction, texture) or when a ray's cubic4 factor could
         reach CUBIC4_FLOOR. with_da=True also returns the spectra's derivative with respect to the lattice parameter a
-        (Pc, Kf), in closed form: every edge moves in proportion to a."""
+        (Pc, Kf), in closed form: every edge moves in proportion to a. plan: a WindowPlan for these rays (lean_syncs);
+        a wider window than the rays' own gives the same sums, since its extra bins are masked."""
         if self.shape_model in ("extinction", "texture"):
             return None
         m, sl = self.mats[r], self.slices[r]; dt = self.dt
         h = g[sl["h"][0]:sl["h"][1]]; t = g[sl["t"][0]:sl["t"][1]]
-        e = 2.0 * g[sl["a"]] / torch.sqrt(m["ns"])                                      # unstrained edges (n_e,)
-        e_r, af = self._lattice_strain(r, eps)
-        ee = (e[None, :] * (1 + e_r.double())).to(dt)                                   # (Pc, n_e)
-        width = None if sd is None else ee * af * sd[:, r:r + 1].to(dt)
-        A = None                                                                         # each ray's texture term
-        if isinstance(views, RayTexture):
-            x0 = sl["x"][0]
-            A = ((self._harmonics_views()[views.views] @ g[x0:x0 + 9 * self.tex_nb].reshape(9, self.tex_nb))
-                 * views.Q[r].double()).sum(1)
-        elif self.shape_model in VIEW_TEXTURES and views is not None:
-            x0 = sl["x"][0]
-            A = (self._harmonics_views() @ g[x0:x0 + 9])[views]
+        e, e_r, ee, width = self._ray_edges(g, r, eps, sd)
+        A = self._texture_term(g, r, views)                                               # each ray's texture term
         st = (self.lamf[None, :] / e[:, None]).clamp(0.0, 1.0)
         p4 = (35 * st ** 4 - 30 * st ** 2 + 3) / 8                                         # (n_e, Kf)
         if A is not None:
-            kA = (m["k4"][None, :] * A[:, None]).detach()
-            if bool(((1 + torch.minimum(kA * P4_MIN, kA)) <= CUBIC4_FLOOR).any()):
+            if plan is not None and plan.floor is not None:
+                if plan.floor:
+                    return None
+            elif bool(self.floor_rays(r, A).any()):
                 return None
         with torch.no_grad():
-            eed = ee.detach().double()
-            wd = torch.zeros_like(e) if width is None else width.detach().double().amax(0)
-            f0 = float(self.lamf[0]); Kf = self.Kf
-            lo = eed.amin(0) - 0.5 * self.hf - EDGE_SPREAD_REACH * wd
-            hi = eed.amax(0) + 0.5 * self.hf + EDGE_SPREAD_REACH * wd
-            k0 = (torch.floor((lo - f0) / self.hf) - 1).clamp(0, Kf).long()
-            k1 = (torch.ceil((hi - f0) / self.hf) + 2).clamp(0, Kf).long()
-            k1 = torch.maximum(k1, k0)
-            wb = max(int((k1 - k0).max()), 1)
+            f0 = float(self.lamf[0]) if plan is None else self.f0; Kf = self.Kf
+            k0, k1 = self._window_bins(*self._edge_extent(e, ee, width), f0)
+            if plan is None or plan.width is None:
+                wb = max(int((k1 - k0).max()), 1)
+            else:
+                wb = plan.width
+                # the plan's width covers every chunk of its pass; a narrower one would drop bins, so stop on the GPU
+                torch._assert_async((k1 - k0).max() <= wb)
             idx = k0[:, None] + torch.arange(wb, device=k0.device)[None, :]               # (n_e, wb)
             valid = idx < k1[:, None]
             idx = idx.clamp(max=Kf - 1)
@@ -634,7 +719,7 @@ class Hybrid2:
         lw = lam[idx]                                                                    # (n_e, wb)
         off = (e[:, None] - lw + 0.5 * self.hf).to(dt)[None] + (e[None, :] * e_r.double()).to(dt)[:, :, None]
         w3 = None if width is None else width[:, :, None].to(dt)
-        step = edge_step(off, self.hf, w3)
+        step = edge_step(off, self.hf, w3, where=plan is not None)
         shape0 = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
         shape = shape0
         if A is not None:
@@ -659,7 +744,7 @@ class Hybrid2:
                 dBqA = ((td * hd * k4)[:, None] * lam[None, :] * below * dp4)
                 dout = dout + Ad[:, None] * dC1.to(dt)[None, :] + (Ad[:, None] * qa) @ BqA.detach().to(dt) \
                     + (Ad[:, None] * q.detach()) @ dBqA.to(dt)
-            s_off, s_w = edge_step_slopes(off.detach(), self.hf, None if w3 is None else w3.detach())
+            s_off, s_w = edge_step_slopes(off.detach(), self.hf, None if w3 is None else w3.detach(), where=plan is not None)
             ad = a.to(dt)
             dstep = s_off * (ee.detach() / ad)[:, :, None]                                   # the edge moves by edge / a
             if w3 is not None:
@@ -674,9 +759,9 @@ class Hybrid2:
             dout = dout.index_add(1, idx.reshape(-1), dwin.reshape(dwin.shape[0], -1))
         return mu, (x * x).to(dt)[None, :] * dout
 
-    def spectra_da(self, g, eps, r, views=None, sd=None):
+    def spectra_da(self, g, eps, r, views=None, sd=None, plan=None):
         """Material r's per-ray spectra and their derivative with respect to its lattice parameter a, both (Pc, Kf), in
-        closed form; None when the windowed sum does not apply (see _ray_spectrum)."""
+        closed form; None when the windowed sum does not apply (see _ray_spectrum). plan: as for spectra."""
         if self.dense_spectra:
             return None
         sl = self.slices[r]
@@ -684,7 +769,7 @@ class Hybrid2:
         c = g[sl["c"][0]:sl["c"][1]]; s_ = g[sl["s"][0]:sl["s"][1]]
         nbs = self.nb_shape[r] if getattr(self, "nb_shape", None) is not None and self.nb_shape[r] is not None else 1.0
         smooth = c[0] * nbs + c[1] * x + self.B.double() @ s_
-        return self._ray_spectrum(g, r, eps, views, sd, x, smooth, with_da=True)
+        return self._ray_spectrum(g, r, eps, views, sd, x, smooth, with_da=True, plan=None if plan is None else plan[r])
 
     def edge_terms(self, g, eps, r, sd=None):
         """Material r's edge terms under per-pixel dilations eps (Pc, R): (Pc, n_edges, Kf) in the model's dtype, each the
@@ -885,6 +970,10 @@ class FitB:
         # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
         self.contamination_newton = False
         self.last_step_se = float('inf')      # the last global step's RMS in standard errors (global_step)
+        # lean_syncs: the passes over the rays wait less often for the GPU. The resolution band and the spectra without
+        # strain are kept from one pass to the next while g does not change, and each pass works out the window widths
+        # and the cubic4 floor of all its chunks at once (window_plan). The results are the same up to rounding.
+        self.lean_syncs = False
 
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
@@ -1032,15 +1121,148 @@ class FitB:
 
     def _state(self, g):
         M = self.M
+        if getattr(self, "lean_syncs", False):
+            return self._state_kept(g)
         return M.spectra(g).to(M.dt), M.band_matrix(M.band(g)), M.kappa(g).to(M.dt)
 
-    def mean(self, sl, g=None, W=None, f=None, eps=None, cache=None):
+    @staticmethod
+    def _traced(g):
+        """True when g carries derivatives, so that nothing computed from it may be kept. That is the case under
+        automatic differentiation, inside a torch.func transform, and for a forward-mode dual tensor."""
+        if g.requires_grad:
+            return True
+        try:
+            if torch._C._functorch.is_functorch_wrapped_tensor(g):
+                return True
+        except AttributeError:
+            pass
+        return torch.autograd.forward_ad.unpack_dual(g).tangent is not None
+
+    @staticmethod
+    def _model_parts(M):
+        """The model's tensors, other than g, that the spectra and the edge positions depend on and that a caller may
+        replace: each material's tabulated non-Bragg shape and its elastic factors (Hybrid2.set_tabulated, set_dec).
+        A kept result is used again only while these are the same tensors."""
+        nbs = getattr(M, "nb_shape", None) or [None] * M.R
+        return tuple(nbs) + tuple(m.get(k) for m in M.mats for k in ("alpha", "beta"))
+
+    @staticmethod
+    def _same(a, b):
+        """True when two tuples hold the same objects, compared by identity."""
+        return len(a) == len(b) and all(x is y for x, y in zip(a, b))
+
+    def _state_kept(self, g):
+        """_state with lean_syncs. The spectra without strain and the contamination's attenuations are kept while g
+        is the same tensor and has not changed. The band is kept while the resolution kernel's values do not change."""
+        M = self.M
+        if self._traced(g):
+            return M.spectra(g).to(M.dt), M.band_matrix(M.band(g)), M.kappa(g).to(M.dt)
+        parts = self._model_parts(M)
+        kept = getattr(self, "_state_memo", None)
+        if kept is not None and kept[0] is M and kept[1] is g and kept[2] == g._version and self._same(kept[4], parts):
+            return kept[3]
+        state = (M.spectra(g).to(M.dt), self._band_kept(g), M.kappa(g).to(M.dt))
+        self._state_memo = (M, g, g._version, state, parts)
+        return state
+
+    def _band_kept(self, g):
+        """The band as a dense matrix (Hybrid2.band_matrix) at g, computed again only when the resolution kernel's
+        values or the model's dtype change (lean_syncs). Reading the kernel's values waits for the GPU once."""
+        M = self.M
+        key = (M.dt, tuple(g[M.res_sl[0]:M.res_sl[1]].detach().tolist()))
+        kept = getattr(self, "_band_memo", None)
+        if kept is not None and kept[0] is M and kept[1] == key:
+            return kept[2]
+        with torch.no_grad():
+            band = M.band_matrix(M.band(g.detach()))
+        self._band_memo = (M, key, band)
+        return band
+
+    def window_plan(self, sl, g, eps_all):
+        """Returns one WindowPlan per material for the rays sl, to pass to Hybrid2.spectra, or None without
+        lean_syncs. eps_all holds the strains of all rays, and the rays sl are a part of them. The window width is then
+        the widest over all rays, so one width serves every chunk of a pass. With eps_all None, each chunk finds its
+        own width."""
+        M = self.M
+        if not getattr(self, "lean_syncs", False) or M.dense_spectra or M.shape_model in ("extinction", "texture"):
+            return None
+        widths = None if eps_all is None else self._window_widths(g, eps_all)
+        hits = self._floor_hits(g)
+        plan = []
+        start, stop, _ = sl.indices(self.T.shape[0])
+        for r in range(M.R):
+            floor = None
+            if hits[r] is not None:
+                h = hits[r]; floor = bool(np.searchsorted(h, start) < np.searchsorted(h, stop))
+            plan.append(WindowPlan(None if widths is None else widths[r], floor))
+        return plan
+
+    def _window_widths(self, g, eps_all):
+        """Per material, a window width in fine bins that holds the window of any chunk of the rays with strains
+        eps_all (all rays) and the current spreads: the widest window over all rays, plus WINDOW_SLACK, rounded up to a
+        multiple of WINDOW_BUCKET. It is kept while g, eps_all and the spreads do not change, and computing it waits
+        for the GPU once."""
+        M = self.M; sd = self.eps_sd
+        key = [g, eps_all, sd]
+        parts = self._model_parts(M)
+        kept = getattr(self, "_width_memo", None)
+        if kept is not None and kept[0] is M and self._same(kept[4], parts) and \
+                all(a is b and (b is None or v == b._version) for a, b, v in zip(kept[1], key, kept[2])):
+            return kept[3]
+        gd = g.detach()
+        with torch.no_grad():
+            wide = []
+            for r in range(M.R):
+                lo = hi = wd = None
+                for s in self.chunks():
+                    l_, h_, w_ = M.window_extent(gd, r, eps_all[s], None if sd is None else sd[s])
+                    lo = l_ if lo is None else torch.minimum(lo, l_)
+                    hi = h_ if hi is None else torch.maximum(hi, h_)
+                    wd = w_ if wd is None else torch.maximum(wd, w_)
+                wide.append(M.window_width(lo, hi, wd))
+            wide = torch.stack(wide).tolist()
+        widths = [WINDOW_BUCKET * math.ceil((max(int(w), 1) + WINDOW_SLACK) / WINDOW_BUCKET) for w in wide]
+        self._width_memo = (M, key, [None if t is None else t._version for t in key], widths, parts)
+        return widths
+
+    def _floor_hits(self, g):
+        """Per material, the sorted indices (numpy) of the rays whose cubic4 factor could reach CUBIC4_FLOOR, or None
+        without a texture term. They are kept while g, the views and the texture's ray weights do not change, and
+        finding them waits for the GPU once."""
+        M = self.M
+        if M.shape_model not in VIEW_TEXTURES or self.ray_view is None:
+            return [None] * M.R                     # no texture term (Hybrid2._texture_term returns None)
+        tq = tuple(self.tex_Q) if self.tex_Q is not None else ()
+        key = [g, self.ray_view] + list(tq)
+        y4 = M._harmonics_views() if M.shape_model in VIEW_TEXTURES and M.view_dirs is not None else None
+        kept = getattr(self, "_floor_memo", None)
+        if kept is not None and kept[0] is M and kept[4] is y4 and len(kept[1]) == len(key) and \
+                all(a is b and (b is None or v == b._version) for a, b, v in zip(kept[1], key, kept[2])):
+            return kept[3]
+        gd = g.detach()
+        with torch.no_grad():
+            flags = [[] for _ in range(M.R)]
+            for s in self.chunks():
+                views = self._views(s)
+                for r in range(M.R):
+                    A = M._texture_term(gd, r, views)
+                    flags[r].append(None if A is None else M.floor_rays(r, A))
+            hits = [None if not f or f[0] is None else torch.nonzero(torch.cat(f)).flatten().cpu().numpy() for f in flags]
+        self._floor_memo = (M, key, [None if t is None else t._version for t in key], hits, y4)
+        return hits
+
+    def mean(self, sl, g=None, W=None, f=None, eps=None, cache=None, eps_all=None):
+        """The model (Pc, K) of the rays sl and its parts (E, n, beta, s) at the given parameters, the current ones by
+        default. eps_all: with lean_syncs, all rays' strains when eps is their slice sl (window_plan)."""
         M = self.M; g = self.g if g is None else g
         W = self.W[sl] if W is None else W; f = self.f if f is None else f
+        own = eps is None
         if eps is None and self.eps is not None:
             eps = self.eps[sl]
         mu, Rb, kap = self._state(g) if cache is None else cache
-        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(g, eps, self._views(sl), self._spectra_tex(g), self._sd(sl)).to(M.dt))
+        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(
+            g, eps, self._views(sl), self._spectra_tex(g), self._sd(sl),
+            plan=self.window_plan(sl, g, self.eps if own else eps_all)).to(M.dt))
         E = torch.exp(-X)
         n = M.apply_band(E, Rb)
         beta = torch.exp(-W @ kap.T)
@@ -1135,7 +1357,7 @@ class FitB:
         with torch.no_grad():
             for sl in self.chunks():
                 Ws = None if W is None else W[sl]; es = None if eps is None else eps[sl]
-                m = self.mean(sl, g, Ws, f, es, cache)[0]
+                m = self.mean(sl, g, Ws, f, es, cache, eps_all=eps)[0]
                 tot += float(self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64))
         tot = all_sum_float(tot, self.T.device)
         if current:
@@ -1161,14 +1383,15 @@ class FitB:
             m, E, n, beta, s = self.mean(sl, cache=cache)
             mm = m.clamp_min(1e-12)
             cols = []
-            mus = mu if self.eps is None else M.spectra(self.g, self.eps[sl], sd=self._sd(sl)).to(M.dt)
+            plan = self.window_plan(sl, self.g, self.eps)
+            mus = mu if self.eps is None else M.spectra(self.g, self.eps[sl], sd=self._sd(sl), plan=plan).to(M.dt)
             for r in range(R):
                 mur = mus[r] if self.eps is None else mus[:, r]
                 cols.append(-s * M.apply_band(E * mur, Rb) - torch.einsum('jk,pj,j->pk', self.f, beta, kap[:, r]))
             if self.eps is not None:
                 for r in range(R):
                     tg = torch.zeros_like(self.eps[sl]); tg[:, r] = 1
-                    _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, sd=self._sd(sl)), (self.eps[sl].double(),), (tg.double(),))
+                    _, dmu = torch.func.jvp(lambda e_: M.spectra(self.g, e_, sd=self._sd(sl), plan=plan), (self.eps[sl].double(),), (tg.double(),))
                     dX = W[:, r:r + 1] * dmu[:, r].to(M.dt)
                     cols.append(-s * M.apply_band(E * dX, Rb))
             Jac = torch.stack(cols, 2)
@@ -1267,10 +1490,11 @@ class FitB:
         T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
-        mus = M.spectra(self.g, eps, self._views(sl), self._spectra_tex(self.g), self._sd(sl)).to(M.dt)  # (Pc, R, Kf)
+        plan = self.window_plan(sl, self.g, self.eps)
+        mus = M.spectra(self.g, eps, self._views(sl), self._spectra_tex(self.g), self._sd(sl), plan=plan).to(M.dt)  # (Pc, R, Kf)
         cols_w, cols_u, cols_t = [], [], []
         packed = eps.shape[1] == 2 * R                                                # each ray's mean trace in R..2R
-        spec = lambda e_: M.spectra(self.g, e_, self._views(sl), self._spectra_tex(self.g), self._sd(sl))
+        spec = lambda e_: M.spectra(self.g, e_, self._views(sl), self._spectra_tex(self.g), self._sd(sl), plan=plan)
         for r in range(R):
             tg = torch.zeros_like(eps); tg[:, r] = 1
             _, dmu = torch.func.jvp(spec, (eps.double(),), (tg.double(),))
@@ -1306,9 +1530,9 @@ class FitB:
         h = self.g[slr["h"][0]:slr["h"][1]].to(M.dt); k4 = M.mats[r]["k4"].to(M.dt)
         return ((h * k4)[None, :, None] * terms * p4[None] * (fac > CUBIC4_FLOOR).to(M.dt)).sum(1)
 
-    def ray_loss(self, sl, W, eps, cache):
-        """Deviance of each ray in sl at maps W and strains eps (no penalties)."""
-        return self.deviance_terms(sl, self.mean(sl, W=W, eps=eps, cache=cache)[0], self.T[sl]).sum(1, dtype=torch.float64)
+    def ray_loss(self, sl, W, eps, cache, eps_all=None):
+        """Deviance of each ray in sl at maps W and strains eps (no penalties). eps_all: as for mean."""
+        return self.deviance_terms(sl, self.mean(sl, W=W, eps=eps, cache=cache, eps_all=eps_all)[0], self.T[sl]).sum(1, dtype=torch.float64)
 
     # -- contamination on a multiscale dictionary: f_j = A c_j, c >= 0, each atom switched on by its own score test
     def build_atoms(self, widths=(1, 8, 32, 128)):
@@ -1474,6 +1698,7 @@ class FitB:
         terms = {}                                                                   # per material: x^2 step shape
         out = []
         tex = self._texture(self.g); views = self._views(sl)
+        plan = None if eps is None else self.window_plan(sl, self.g, self.eps)
         for i in idx:
             if i < M.res_sl[0]:                                                      # a material parameter
                 r = next(rr for rr, slc in enumerate(M.slices) if slc["a"] <= i < slc["s"][1])
@@ -1523,7 +1748,7 @@ class FitB:
                     dm = terms[r][:, i - slr["h"][0]]
                     out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 elif eps is not None and i == slr["a"] and \
-                        (mu_da := M.spectra_da(self.g, eps, r, self._views(sl), self._sd(sl))) is not None:
+                        (mu_da := M.spectra_da(self.g, eps, r, self._views(sl), self._sd(sl), plan=plan)) is not None:
                     # the lattice parameter: its closed-form derivative (every edge moves in proportion to a)
                     dm = mu_da[1]
                     out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
@@ -1531,7 +1756,7 @@ class FitB:
                     # an edge parameter (a, h, t, x) under per-pixel strain: its derivative moves with each pixel's
                     # edges (the smooth part is not dilated, so the unstrained derivative serves for c and s)
                     tg = torch.zeros_like(self.g); tg[i] = 1
-                    _, dm = torch.func.jvp(lambda gg: M.spectra(gg, eps, self._views(sl), sd=self._sd(sl))[:, r], (self.g,), (tg,))
+                    _, dm = torch.func.jvp(lambda gg: M.spectra(gg, eps, self._views(sl), sd=self._sd(sl), plan=plan)[:, r], (self.g,), (tg,))
                     out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 else:
                     out.append(_BandLater(E * (W[:, r:r + 1] * dmu[i][r][None, :])))
@@ -1636,7 +1861,7 @@ class FitB:
         assert not any(M.res_sl[0] <= i < M.res_sl[1] for i in idx), 'global_grad holds the resolution kernel fixed'
         gp = self.g.clone().requires_grad_(True)
         with torch.no_grad():
-            band = M.band_matrix(M.band(self.g))
+            band = self._band_kept(self.g) if getattr(self, "lean_syncs", False) else M.band_matrix(M.band(self.g))
         grad = torch.zeros_like(self.g); dev = 0.0
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))

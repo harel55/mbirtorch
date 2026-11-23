@@ -1297,7 +1297,7 @@ class TomoFit:
         cache = self.fit._state(self.fit.g); tot = 0.0
         with torch.no_grad():
             for sl in self.fit.chunks():
-                tot += float(self.fit.ray_loss(sl, W[sl], eps[sl], cache).sum())
+                tot += float(self.fit.ray_loss(sl, W[sl], eps[sl], cache, eps_all=eps).sum())
         return all_sum_float(tot, V.device)
 
     def loss(self, V=None, E=None, mask=None):
