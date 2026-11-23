@@ -927,6 +927,9 @@ def test_ray_spectrum_matches_dense(case, spread):
         M.dense_spectra = dense
         return M.spectra(gg, ee, views, sd=sd)
     a, b = run(False, g, eps), run(True, g, eps)
+    with torch.no_grad():                                 # the fused window kernel (no derivatives wanted)
+        c_ = run(False, g, eps)
+    assert torch.allclose(c_, b, rtol=0, atol=1e-10 * float(b.abs().max()))
     x = M.lamf / M.lam_ref
     assert M._ray_spectrum(g, 0, eps, views, sd, x, torch.zeros_like(x)) is not None    # the windowed path ran
     assert torch.allclose(a, b, rtol=0, atol=1e-10 * float(b.abs().max()))

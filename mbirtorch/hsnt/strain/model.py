@@ -132,6 +132,7 @@ CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a trunca
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
 VIEW_TEXTURES = ("cubic4",)      # shape models whose spectra depend on the view
 EDGE_SPREAD_MIN = 1e-3           # edge_step: an edge spread below this share of a fine bin is a sharp step
+WINDOW_COMPILE = True             # compile the windowed spectrum's assembly on a GPU (fused passes; no-gradient evaluations)
 EDGE_SPREAD_REACH = 8.0          # edge spread: bins farther than this many widths from an edge take the sharp step's share
 SHAPE_MODELS = (None, "extinction", "texture", "cubic4")   # the shape models Hybrid2 accepts
 CONTAM_INNER_ITERS = 300     # inner accelerated proximal-gradient iterations of the contamination Newton step
@@ -175,6 +176,49 @@ def edge_step_slopes(off, hf, width=None):
     d_off = d_off.index_put((near,), (Phi(o) - Phi(o - hf)) / hf)
     d_w = d_w.index_put((near,), (phi(o) - phi(o - hf)) / hf)
     return d_off, d_w
+
+
+def _window_terms(off, w, hf, t, ee, h, valid, kp4, A):
+    """The windowed spectrum's per-bin edge terms (Pc, n_e, wb): height x edge step x slope x cubic4 factor, for the
+    window offsets off. w (Pc, n_e, 1) the edge's spread (zeros for none), kp4 (n_e, wb) k4 x P4 or None, A (Pc,) the
+    rays' texture term or None. The same values as edge_step and spectra's window, evaluated on the whole window with
+    torch.where (the window is a few tens of bins), so torch.compile can fuse it (WINDOW_COMPILE)."""
+    sharp = (off / hf).clamp(0, 1)
+    ww = w.clamp_min(1e-12 * hf)
+    sq2 = math.sqrt(2.0); isq2pi = 1.0 / math.sqrt(2 * math.pi)
+    G = lambda u: u * 0.5 * torch.erfc(-u / (ww * sq2)) + ww * torch.exp(-0.5 * (u / ww) ** 2) * isq2pi
+    near = (w > EDGE_SPREAD_MIN * hf) & (off > -EDGE_SPREAD_REACH * ww) & (off < hf + EDGE_SPREAD_REACH * ww)
+    step = torch.where(near, (G(off) - G(off - hf)) / hf, sharp)
+    shape = 1 - t[None, :, None] * (off - 0.5 * hf) / ee[:, :, None]
+    if kp4 is not None:
+        shape = shape * (1 + kp4[None] * A[:, None, None]).clamp_min(CUBIC4_FLOOR)
+    return h[None, :, None] * step * shape * valid[None]
+
+
+def _assemble_spectrum(C0, Bq, q, C1, BqA, A, off, w, hf, t, ee, h, valid, kp4, idx, x2, smooth):
+    """The windowed spectrum (Pc, Kf) from its parts (see Hybrid2._ray_spectrum): below the windows the matrix
+    products C0 + q Bq (+ A C1 + (A q) BqA with a texture), the windows' bin-by-bin edge terms added at idx, times
+    x^2, plus the smooth part. One function, so torch.compile can fuse its passes over the (rays x bins) arrays."""
+    out = C0[None, :] + q @ Bq
+    if A is not None:
+        out = out + A[:, None] * C1[None, :] + (A[:, None] * q) @ BqA
+    win = _window_terms(off, w, hf, t, ee, h, valid, kp4, A)
+    out = out.index_add(1, idx, win.reshape(win.shape[0], -1))
+    return x2[None, :] * out + smooth[None, :]
+
+
+_assemble_compiled = None
+
+
+def _assemble_kernel(on_cuda):
+    """The compiled _assemble_spectrum on a GPU when WINDOW_COMPILE is set (compiled once, for any size), else the
+    plain function."""
+    global _assemble_compiled
+    if not (on_cuda and WINDOW_COMPILE):
+        return _assemble_spectrum
+    if _assemble_compiled is None:
+        _assemble_compiled = torch.compile(_assemble_spectrum, dynamic=True)
+    return _assemble_compiled
 
 
 def deviance_terms(m, T, d, open_beam_obs=None):
@@ -585,6 +629,22 @@ class Hybrid2:
             idx = idx.clamp(max=Kf - 1)
             below = (torch.arange(Kf, device=k0.device)[None, :] < k0[:, None]).double()   # (n_e, Kf)
         lam = self.lamf
+        if not torch.is_grad_enabled() and not with_da:
+            # no derivatives wanted: one fused (compiled) assembly of every part
+            q = 1 / ee
+            Bq = ((t * h)[:, None] * lam[None, :] * below).to(dt)
+            C1 = BqA = kp4 = Ad = None
+            if A is not None:
+                k4 = m["k4"]; Ad = A.to(dt)
+                C1 = (((1 - t) * h * k4) @ (below * p4)).to(dt)
+                BqA = ((t * h * k4)[:, None] * lam[None, :] * below * p4).to(dt)
+                kp4 = (k4[:, None] * p4.gather(1, idx)).to(dt)
+            lw = lam[idx]
+            off = (e[:, None] - lw + 0.5 * self.hf).to(dt)[None] + (e[None, :] * e_r.double()).to(dt)[:, :, None]
+            w3 = torch.zeros_like(off[..., :1]) if width is None else width[:, :, None]
+            return _assemble_kernel(off.is_cuda)(
+                (((1 - t) * h) @ below).to(dt), Bq, q, C1, BqA, Ad, off, w3, float(self.hf), t.to(dt), ee, h.to(dt),
+                valid.to(dt), kp4, idx.reshape(-1), (x * x).to(dt), smooth.to(dt))
         out = ((1 - t) * h) @ below                                                      # (Kf,)
         Bq = ((t * h)[:, None] * lam[None, :] * below)                                   # (n_e, Kf)
         q = 1 / ee
