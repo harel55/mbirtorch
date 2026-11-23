@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from scipy.stats import norm
 
-from .bragg import emg_median, legendre_columns, reflections
+from .bragg import legendre_columns, reflections
 from ._dist import all_sum, all_sum_float
 
 
@@ -132,11 +132,6 @@ CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a trunca
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
 VIEW_TEXTURES = ("cubic4",)      # shape models whose spectra depend on the view
 EDGE_SPREAD_MIN = 1e-3           # edge_step: an edge spread below this share of a fine bin is a sharp step
-BAND_BLOCK = 64                  # rows of the resolution band per block of its block-banded product (Hybrid2.block_band)
-BAND_DROP = 1e-9                 # block_band leaves out band values below this share of their row's sum (below float32's
-                                 # precision); the two-scale kernel then needs ~66 of the band's 461 slots
-BAND_BLOCK_FILL = 0.25           # band_operator uses the block-banded product when its blocks cover at most this share of
-                                 # the fine grid (2026-11-22: two-scale 9%, 2.7x faster; Ikeda-Carpenter 35%, no gain)
 WINDOW_COMPILE = True             # compile the windowed spectrum's assembly on a GPU (fused passes; no-gradient evaluations)
 EDGE_SPREAD_REACH = 8.0          # edge spread: bins farther than this many widths from an edge take the sharp step's share
 SHAPE_MODELS = (None, "extinction", "texture", "cubic4")   # the shape models Hybrid2 accepts
@@ -398,12 +393,6 @@ def bin_intervals(lam):
     return lam - np.concatenate([[0.5 * med], half_right]), lam + np.concatenate([half_right, [0.5 * med]])
 
 
-def _emg_cdf(x, sigma, tau):
-    z = x / sigma
-    r = sigma / tau
-    return 0.5 * torch.erfc(-z / math.sqrt(2.0)) - torch.exp(-x / tau + 0.5 * r * r + torch.special.log_ndtr(z - r))
-
-
 class Hybrid2:
     """Structure of the stage-B model: grids, the banded resolution operator, materials and the parameter layout.
     Global parameter vector g: per material [a, h (n_e), c0, c1, smooth block (n_smooth)], then res (s0, s1, t0, t1),
@@ -414,7 +403,7 @@ class Hybrid2:
     BAND = (-240, 220)                                   # fine-grid offsets of a bin's band: the tail is on the left
 
     def __init__(self, lam, dose_per_bin, lattices, smooth_degree=LEGENDRE_DEGREE, n_contam=2, device="cuda", dtype=torch.float32,
-                 pad=0.1, edge_slope=False, two_scale=False, shape_model=None, kernel="two_scale", texture_basis=1):
+                 pad=0.1, edge_slope=False, shape_model=None, texture_basis=1):
         self.dev, self.dt = device, dtype
         lam = np.asarray(lam, dtype=np.float64)
         lo, hi = bin_intervals(lam)
@@ -454,7 +443,7 @@ class Hybrid2:
         if shape_model not in SHAPE_MODELS:
             raise ValueError(f"shape_model must be one of {SHAPE_MODELS}, not {shape_model!r}")
         self.shape_model = shape_model
-        self.kernel = kernel
+        self.kernel = "ikeda_carpenter"                                    # the only resolution kernel (user 2026-11-22)
         self.slices, off = [], 0
         self.tex_nb = int(texture_basis)                                     # smooth texture field: basis functions (1: global)
         if self.tex_nb > 1 and shape_model != "cubic4":
@@ -488,31 +477,12 @@ class Hybrid2:
                 lb[sl["x"][0]:sl["x"][1]] = -CUBIC4_BOUND; ub[sl["x"][0]:sl["x"][1]] = CUBIC4_BOUND
             else:
                 lb[sl["x"][0]:sl["x"][1]] = ub[sl["x"][0]:sl["x"][1]] = 0.0
-        # widths within what the band holds: 5 sigma <= 48 fine bins, 5 tau <= ~240 at 4.4 A
-        # (s0, s1, t0, t1) of the EMG core; (w_b, sigma_b) of a broader Gaussian component (two-scale kernel)
-        # slots: (s0, s1, t0, t1) of the EMG core; (w0, b0, b1, w1) of the second component, by kernel:
-        #   two_scale: broad Gaussian, weight w0, width b0 (b1 = w1 = 0)
-        #   two_scale_lam: broad Gaussian, width sqrt(b0^2 + (b1 lam)^2), weight w0 + w1 (lam - 3 A)
-        #   two_tail: a second exponential tail of decay b0 + b1 lam, weight w0 + w1 (lam - 3 A), on the same Gaussian
-        #   ic: storage share exp(-(w0 / lam)^2), storage decay b0
-        lb[self.res_sl[0]:self.res_sl[1]] = [0.0, 0.0, 1e-6, 0.0, 0.0, 0.004, 0.0, 0.0]
-        ub[self.res_sl[0]:self.res_sl[1]] = [0.006, 0.002, 0.02, 0.008, 0.4 if two_scale else 0.0, 0.04 if two_scale else 0.004, 0.0, 0.0]
-        if kernel in ("two_scale_lam", "two_tail"):
-            lb[self.res_sl[0] + 4], ub[self.res_sl[0] + 4] = 0.0, 0.6
-            lb[self.res_sl[0] + 5], ub[self.res_sl[0] + 5] = (0.001, 0.04) if kernel == "two_scale_lam" else (0.0, 0.04)
-            lb[self.res_sl[0] + 6], ub[self.res_sl[0] + 6] = 0.0, 0.01
-            lb[self.res_sl[0] + 7], ub[self.res_sl[0] + 7] = -0.3, 0.3
-        if kernel == "ic":
-            # moderator storage tail (Ikeda-Carpenter): last two slots = (lam_R, t_s): storage share
-            # R(lam) = exp(-(lam_R / lam)^2), storage decay t_s (constant in time, so in wavelength)
-            lb[self.res_sl[0] + 4], ub[self.res_sl[0] + 4] = 0.0, 10.0
-            lb[self.res_sl[0] + 5], ub[self.res_sl[0] + 5] = 0.002, 0.04
-        if kernel == "ikeda_carpenter":
-            # slots (s0, s1, a0, a1, lam_R, t_s): Gaussian sqrt(s0^2 + (s1 lam)^2); the moderator's slowing-down pulse
-            # gamma-shaped, x^2 exp(-x / tau) with tau = a0 + a1 lam; its storage part an exponential of length t_s with
-            # the share R = exp(-(lam_R / lam)^2) (Ikeda and Carpenter 1985), all in wavelength units
-            lb[self.res_sl[0]:self.res_sl[0] + 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0002]
-            ub[self.res_sl[0]:self.res_sl[0] + 6] = [0.006, 0.002, 0.01, 0.004, 10.0, 0.04]
+        # the Ikeda-Carpenter kernel's slots (s0, s1, a0, a1, lam_R, t_s): Gaussian sqrt(s0^2 + (s1 lam)^2); the
+        # moderator's slowing-down pulse gamma-shaped, x^2 exp(-x / tau) with tau = a0 + a1 lam; its storage part an
+        # exponential of length t_s with the share R = exp(-(lam_R / lam)^2) (Ikeda and Carpenter 1985), all in
+        # wavelength units. The last two slots are unused and held at 0.
+        lb[self.res_sl[0]:self.res_sl[1]] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0002, 0.0, 0.0]
+        ub[self.res_sl[0]:self.res_sl[1]] = [0.006, 0.002, 0.01, 0.004, 10.0, 0.04, 0.0, 0.0]
         lb[self.kap_sl[0]:self.kap_sl[1]] = 0.0
         self.lb = torch.as_tensor(lb, **f64); self.ub = torch.as_tensor(ub, **f64)
 
@@ -803,30 +773,9 @@ class Hybrid2:
         return (1 + m["k4"][None, :, None] * p4[None] * A[:, None, None]).clamp_min(CUBIC4_FLOOR).to(self.dt)
 
     def band(self, g):
-        """Banded operator values (K, bw), float64, rows normalized."""
-        s0, s1, t0, t1, wb, sb, b1, w1 = [g[self.res_sl[0] + i] for i in range(8)]
-        if self.kernel == "ikeda_carpenter":
-            return self._band_ikeda_carpenter(s0, s1, t0, t1, wb, sb)
-        lamj = self.lamf[self.band_idx]                                               # (K, bw)
-        sigma = torch.sqrt(s0 * s0 + (s1 * lamj) ** 2).clamp_min(1e-6)
-        tau = (t0 + t1 * lamj).clamp_min(1e-7)
-        if self.kernel == "ic":
-            return self._band_ic(sigma, tau, lamj, wb, sb)
-        if self.kernel in ("two_scale_lam", "two_tail"):
-            w = (wb + w1 * (lamj - 3.0)).clamp(0.0, 0.8)
-            if self.kernel == "two_tail":
-                return self._band_mix(sigma, tau, lamj, w, (sb + b1 * lamj).clamp_min(1e-6))
-            sb = torch.sqrt(sb * sb + (b1 * lamj) ** 2)
-            wb = w
-        med = emg_median(sigma.detach(), tau.detach()).to(torch.float64)
-        hi = _emg_cdf(self.lam_hi[:, None] - lamj + med, sigma, tau)
-        lo = _emg_cdf(self.lam_lo[:, None] - lamj + med, sigma, tau)
-        core = (hi - lo).clamp_min(0)
-        sbc = sb.clamp_min(1e-6)
-        broad = 0.5 * (torch.erf((self.lam_hi[:, None] - lamj) / (math.sqrt(2.0) * sbc))
-                       - torch.erf((self.lam_lo[:, None] - lamj) / (math.sqrt(2.0) * sbc)))
-        Rb = ((1 - wb) * core + wb * broad).clamp_min(0) * self.phi[self.band_idx] * self.band_valid
-        return Rb / Rb.sum(1, keepdim=True).clamp_min(1e-30)
+        """Banded operator values (K, bw), float64, rows normalized: the Ikeda-Carpenter kernel's."""
+        s0, s1, a0, a1, lam_R, t_s = [g[self.res_sl[0] + i] for i in range(6)]
+        return self._band_ikeda_carpenter(s0, s1, a0, a1, lam_R, t_s)
 
     def _band_ikeda_carpenter(self, s0, s1, a0, a1, lam_R, t_s):
         """The Ikeda-Carpenter kernel: for each fine wavelength, the distribution of the measured minus the true
@@ -877,97 +826,13 @@ class Hybrid2:
                                       (self.K, self.Kf)).coalesce()
         return coo.to_sparse_csr()
 
-    def _band_mix(self, sigma, tau, lamj, w, taub):
-        """Two exponential tails on one Gaussian: (1 - w) EMG(sigma, tau) + w EMG(sigma, taub), centred on the
-        mixture's median (bisection on the fine grid, held fixed for derivatives)."""
-        def cdf(x, sg, ta, tb, ww):
-            return (1 - ww) * _emg_cdf(x, sg, ta) + ww * _emg_cdf(x, sg, tb)
-        with torch.no_grad():
-            idx = self.band_idx.reshape(-1)
-            pick = lambda v: torch.zeros(self.Kf, dtype=torch.float64, device=self.dev).index_put_((idx,), v.detach().reshape(-1))
-            sg_f, ta_f, tb_f, w_f = pick(sigma).clamp_min(1e-6), pick(tau).clamp_min(1e-7), pick(taub).clamp_min(1e-6), pick(w)
-            lo = -6 * sg_f; hi = 6 * sg_f + 10 * torch.maximum(ta_f, tb_f)
-            for _ in range(50):
-                mid = 0.5 * (lo + hi)
-                below = cdf(mid, sg_f, ta_f, tb_f, w_f) < 0.5
-                lo = torch.where(below, mid, lo); hi = torch.where(below, hi, mid)
-            med = (0.5 * (lo + hi))[self.band_idx]
-        hi_c = cdf(self.lam_hi[:, None] - lamj + med, sigma, tau, taub, w)
-        lo_c = cdf(self.lam_lo[:, None] - lamj + med, sigma, tau, taub, w)
-        Rb = (hi_c - lo_c).clamp_min(0) * self.phi[self.band_idx] * self.band_valid
-        return Rb / Rb.sum(1, keepdim=True).clamp_min(1e-30)
-
-    def _band_ic(self, sigma, tau, lamj, lam_R, ts):
-        """Two-exponential moderator kernel: a shared Gaussian (sigma) with a fast tail (tau, slowing down) and a slow
-        tail (ts, storage), the storage share R = exp(-(lam_R / lam)^2) (Ikeda-Carpenter's energy dependence), the
-        mixture centred on its own median (found by bisection, held fixed for derivatives like emg_median)."""
-        R = torch.exp(-(lam_R / lamj) ** 2)
-        ts_ = ts.clamp_min(1e-6) * torch.ones_like(tau)
-
-        def cdf(x):
-            return (1 - R) * _emg_cdf(x, sigma, tau) + R * _emg_cdf(x, sigma, ts_)
-        # the median depends only on the true wavelength: bisection on the fine grid (Kf points), then looked up
-        with torch.no_grad():
-            g_ = lambda v: v.detach()
-            lf = self.lamf
-            s0f = sigma.detach()
-            # sigma, tau and R on the fine grid, from their values in the band (each fine point appears in the band)
-            sig_f = torch.zeros(self.Kf, dtype=torch.float64, device=self.dev).index_put_((self.band_idx.reshape(-1),), g_(sigma).reshape(-1))
-            tau_f = torch.zeros_like(sig_f).index_put_((self.band_idx.reshape(-1),), g_(tau).reshape(-1))
-            R_f = torch.zeros_like(sig_f).index_put_((self.band_idx.reshape(-1),), g_(R).reshape(-1))
-            ts_f = g_(ts).clamp_min(1e-6) * torch.ones_like(sig_f)
-            sig_f = sig_f.clamp_min(1e-6); tau_f = tau_f.clamp_min(1e-7)
-            cdf_f = lambda x: (1 - R_f) * _emg_cdf(x, sig_f, tau_f) + R_f * _emg_cdf(x, sig_f, ts_f)
-            lo = -6 * sig_f; hi = 6 * sig_f + 10 * torch.maximum(tau_f, ts_f)
-            for _ in range(50):
-                mid = 0.5 * (lo + hi)
-                below = cdf_f(mid) < 0.5
-                lo = torch.where(below, mid, lo); hi = torch.where(below, hi, mid)
-            med = (0.5 * (lo + hi))[self.band_idx]
-        hi_c = cdf(self.lam_hi[:, None] - lamj + med)
-        lo_c = cdf(self.lam_lo[:, None] - lamj + med)
-        Rb = (hi_c - lo_c).clamp_min(0) * self.phi[self.band_idx] * self.band_valid
-        return Rb / Rb.sum(1, keepdim=True).clamp_min(1e-30)
-
-    def block_band(self, Rb, dtype=None, block=BAND_BLOCK):
-        """The band values Rb (K, bw) as a BlockBand: for each block of `block` rows, the fine-grid columns its rows reach
-        (from band_idx, so uneven bins work; values below BAND_DROP of their row's sum are left out) and the dense
-        (columns x rows) slice of the band over them. Duplicate indices at the grid's ends add up, as in sparse."""
-        dtype = self.dt if dtype is None else dtype
-        K, bw = Rb.shape; idx = self.band_idx
-        keep = Rb.abs() > BAND_DROP * Rb.abs().sum(1, keepdim=True)
-        Rb = Rb * keep
-        idx_lo = torch.where(keep, idx, torch.full_like(idx, self.Kf)); idx_hi = torch.where(keep, idx, torch.full_like(idx, -1))
-        nb = (K + block - 1) // block; Kp = nb * block
-        row_blk = torch.arange(K, device=Rb.device) // block
-        c0 = torch.full((nb,), self.Kf, device=Rb.device, dtype=torch.long).scatter_reduce(0, row_blk, idx_lo.min(1).values, 'amin')
-        c1 = torch.zeros(nb, device=Rb.device, dtype=torch.long).scatter_reduce(0, row_blk, idx_hi.max(1).values + 1, 'amax')
-        c0 = torch.minimum(c0, c1 - 1).clamp(0, self.Kf - 1)          # a block with no values keeps one column
-        W = max(int((c1 - c0).max()), 1)
-        cols = (c0[:, None] + torch.arange(W, device=Rb.device)[None, :]).clamp(max=self.Kf - 1)   # (nb, W)
-        blocks = torch.zeros(nb, W, block, device=Rb.device, dtype=dtype)
-        k = torch.arange(K, device=Rb.device)[:, None].expand(K, bw)
-        kk, mm = keep.nonzero(as_tuple=True)
-        blocks.index_put_((row_blk[kk], idx[kk, mm] - c0[row_blk[kk]], kk % block), Rb[kk, mm].to(dtype), accumulate=True)
-        return BlockBand(blocks, cols, K)
-
-    def band_operator(self, Rb, dtype=None):
-        """The fit's band product for the band values Rb: the block-banded one (block_band) when its blocks cover at most
-        BAND_BLOCK_FILL of the fine grid, else the dense matrix (band_matrix)."""
-        B = self.block_band(Rb, dtype)
-        return B if B.cols.shape[1] <= BAND_BLOCK_FILL * self.Kf else self.band_matrix(Rb, dtype)
-
     def band_matrix(self, Rb, dtype=None):
         """The band as a dense (K, Kf) matrix. A dense product is several times faster on a GPU than the sparse one
         (the band covers about a sixth of the fine grid), and the matrix is small (K x Kf)."""
         return self.sparse(Rb, dtype).to_dense()
 
     def apply_band(self, E, Rb):
-        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw), its sparse matrix, its dense matrix, or its
-        BlockBand (block_band, the fastest)."""
-        if isinstance(Rb, BlockBand):
-            out = torch.bmm(E[:, Rb.cols].permute(1, 0, 2), Rb.blocks.to(E.dtype))          # (blocks, Pc, block)
-            return out.permute(1, 0, 2).reshape(E.shape[0], -1)[:, :Rb.K]
+        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw), its sparse matrix, or its dense matrix."""
         if Rb.layout == torch.sparse_csr:
             return (Rb @ E.T).T
         S = Rb if Rb.shape == (self.K, self.Kf) else self.band_matrix(Rb, E.dtype)
@@ -975,16 +840,6 @@ class Hybrid2:
 
     def kappa(self, g):
         return g[self.kap_sl[0]:self.kap_sl[1]].reshape(self.J, self.R)
-
-
-class BlockBand:
-    """The resolution band as blocks of BAND_BLOCK consecutive rows, each a small dense (W x block) slice of the band with
-    the fine-grid columns it covers (Hybrid2.block_band). Hybrid2.apply_band multiplies a spectrum by it in one batched
-    product: about a quarter of the dense product's work, with the same result (2026-11-22: 4x faster on a GPU)."""
-    __slots__ = ("blocks", "cols", "K")
-
-    def __init__(self, blocks, cols, K):
-        self.blocks, self.cols, self.K = blocks, cols, K
 
 
 class _BandLater:
@@ -1177,7 +1032,7 @@ class FitB:
 
     def _state(self, g):
         M = self.M
-        return M.spectra(g).to(M.dt), M.band_operator(M.band(g)), M.kappa(g).to(M.dt)
+        return M.spectra(g).to(M.dt), M.band_matrix(M.band(g)), M.kappa(g).to(M.dt)
 
     def mean(self, sl, g=None, W=None, f=None, eps=None, cache=None):
         M = self.M; g = self.g if g is None else g
@@ -1781,7 +1636,7 @@ class FitB:
         assert not any(M.res_sl[0] <= i < M.res_sl[1] for i in idx), 'global_grad holds the resolution kernel fixed'
         gp = self.g.clone().requires_grad_(True)
         with torch.no_grad():
-            band = M.band_operator(M.band(self.g))
+            band = M.band_matrix(M.band(self.g))
         grad = torch.zeros_like(self.g); dev = 0.0
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))

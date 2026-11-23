@@ -2013,6 +2013,9 @@ class TomoFit:
         return float('nan'), 0.0
 
 
+IC_START_A0 = 1e-5              # warmup: the Ikeda-Carpenter kernel's starting slowing-down time constant (Angstrom)
+IC_START_LAM_R = 0.1            # warmup: its starting storage-share wavelength (Angstrom)
+IC_START_TS = 0.02              # warmup: its starting storage decay length (Angstrom)
 UNTYPED_LATTICES = ('fcc', 'bcc')  # warmup: the lattice types searched for a material with no given type (user 2026-11-22:
                                  # not diamond, whose edges are a subset of fcc's, so fcc data could be reported as diamond)
 UNTYPED_PAIR_COST = 1.0          # warmup: the pairing cost of a material with no given type (above any typed one's lattice mismatch)
@@ -2022,7 +2025,7 @@ INIT_SPECTRA_RESOLUTION = (0.005, 0.0)   # warmup with init_spectra: the kernel'
 def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_DEGREE, n_contam=2, chunk=1024, a_range=0.01,
            d0_from_data=False, anchor_scale=False, inflation=1.0, density_smooth=False, weights=None, elastic=None,
            eq_sd=EQUILIBRIUM_SD, cg_iters=CG_ITERS, kappa_prior=None, support=False, ray_mask=None, precond='fft',
-           density_prior='qggmrf', voxel_scale=1.0, kernel='two_scale', kernel_values=None, traction=False,
+           density_prior='qggmrf', voxel_scale=1.0, kernel_values=None, traction=False,
            smooth_sd=STRAIN_SMOOTH_SD, mask_method='median', mask_freeze=True, fraction=False, normalize=True, free_lattice=True,
            strain_prior='qggmrf', smooth_order=1,
            eq_stencil='corner',
@@ -2045,7 +2048,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     density_smooth adds the density smoothness prior. weights (views, C) select the strain model (None: a scalar
     dilation; beam_geometry tensor weights: the strain tensor) and elastic the equilibrium prior (see TomoFit).
     ray_mask (rays,) bool leaves the rays where it is False out of the reconstruction and the likelihood (FitB).
-    kernel: the resolution kernel's form (model.Hybrid2); kernel_values: its 8 parameters from a calibration (for
+    kernel_values: the Ikeda-Carpenter resolution kernel's 8 parameters (model.Hybrid2) from a calibration (for
     example on a Ni cylinder), held fixed; None fits the kernel from the warm start's estimate. traction: traction-free faces in the
     equilibrium prior (TomoFit; off by default); smooth_sd: the strain smoothness prior's standard deviation (None: no smoothness prior);
     mask_method, mask_freeze: how the material's own voxels are found (TomoFit). eq_stencil: the equilibrium prior's
@@ -2158,10 +2161,11 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     targets = np.stack(targets)
     if d0_from_data:
         a0 = [float(th[0]) for th in thetas]
-    M = Hybrid2(lam, d, lats, smooth_degree=smooth_degree, n_contam=n_contam, device=device, two_scale=True, kernel=kernel,
+    M = Hybrid2(lam, d, lats, smooth_degree=smooth_degree, n_contam=n_contam, device=device,
                 shape_model=shape_model, texture_basis=9 if texture_voxels is not None else texture_knots ** 3)
     g = torch.zeros(M.n_global, device=device, dtype=torch.float64)
-    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], 1e-5, resolution[1], 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, resolution[0], IC_START_A0, resolution[1], IC_START_LAM_R, IC_START_TS, 0.0, 0.0],
+                                              dtype=torch.float64)
     if kernel_values is not None:                       # a calibrated kernel, held fixed
         kv = torch.as_tensor(np.asarray(kernel_values, dtype=np.float64), device=device)
         g[M.res_sl[0]:M.res_sl[1]] = kv; M.lb[M.res_sl[0]:M.res_sl[1]] = kv; M.ub[M.res_sl[0]:M.res_sl[1]] = kv

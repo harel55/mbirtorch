@@ -64,8 +64,7 @@ def test_ikeda_carpenter_kernel():
     """The Ikeda-Carpenter kernel's rows are normalized and a sharp edge keeps its 50% point (median centring)."""
     from mbirtorch.hsnt.strain.model import Hybrid2
     lam = np.linspace(1.9, 4.41, 1400)
-    M = Hybrid2(lam, np.ones_like(lam), [('fcc', (3.52 * 0.99, 3.52 * 1.01))], smooth_degree=5, n_contam=1, device='cpu',
-                two_scale=True, kernel='ikeda_carpenter')
+    M = Hybrid2(lam, np.ones_like(lam), [('fcc', (3.52 * 0.99, 3.52 * 1.01))], smooth_degree=5, n_contam=1, device='cpu')
     g = torch.zeros(M.n_global, dtype=torch.float64)
     g[M.res_sl[0]:M.res_sl[0] + 6] = torch.tensor([0.0, 0.0008, 0.001, 0.0004, 1.6, 0.004], dtype=torch.float64)
     Rb = M.band(g)
@@ -423,7 +422,7 @@ def _small_fit(seed=0):
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
-                device='cpu', two_scale=True, dtype=torch.float64)
+                device='cpu', dtype=torch.float64)
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
@@ -607,53 +606,13 @@ def test_d0_step_recovers_a_dilatation_field():
     assert float(res.abs().max()) < 0.05 * float(tf._eq_residual(tf.E, inner).abs().max())
 
 
-@pytest.mark.parametrize('block', [7, 64, 1000])
-def test_block_band_matches_dense(block):
-    """The block-banded resolution band (Hybrid2.block_band) gives the dense band's product and gradient (to the
-    BAND_DROP share it leaves out), on uneven wavelength bins whose count is not a multiple of the block, for blocks
-    smaller and larger than the band."""
-    from mbirtorch.hsnt.strain.model import Hybrid2
-    gen = torch.Generator().manual_seed(4)
-    lam = 1.5 + np.cumsum(0.008 + 0.006 * torch.rand(301, generator=gen, dtype=torch.float64).numpy())
-    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
-                device='cpu', two_scale=True, dtype=torch.float64)
-    g = torch.zeros(M.n_global, dtype=torch.float64)
-    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.003, 0.004, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
-    Rb = M.band(g)
-    E = torch.rand(23, M.Kf, generator=gen, dtype=torch.float64, requires_grad=True)
-    dense = M.apply_band(E, M.band_matrix(Rb, torch.float64))
-    blk = M.apply_band(E, M.block_band(Rb, torch.float64, block=block))
-    assert blk.shape == dense.shape
-    assert torch.allclose(blk, dense, rtol=0, atol=1e-8 * float(dense.abs().max()))
-    w = torch.rand(dense.shape, generator=gen, dtype=torch.float64)
-    g1, = torch.autograd.grad((dense * w).sum(), E)
-    g2, = torch.autograd.grad((blk * w).sum(), E)
-    assert torch.allclose(g1, g2, rtol=0, atol=1e-8 * float(g1.abs().max()))
-
-
-def test_band_operator_choice():
-    """band_operator uses the block-banded product for a narrow kernel (two-scale: a few tens of columns carry the
-    weight) and the dense matrix for the Ikeda-Carpenter kernel's long tails."""
-    from mbirtorch.hsnt.strain.model import Hybrid2, BlockBand
-    lam = np.linspace(1.035, 6.027, 1420)
-    kinds = {}
-    for kern, vals in (('two_scale', [0.0, 0.0015, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0]),
-                       ('ikeda_carpenter', [0, 0.00118, 0.00039, 0.00059, 0, 0.0002, 0, 0])):
-        M = Hybrid2(lam, np.full_like(lam, 3838.0), [('bcc', (2.8665 * 0.98, 2.8665 * 1.02))], device='cpu',
-                    dtype=torch.float64, two_scale=True, kernel=kern)
-        g = torch.zeros(M.n_global, dtype=torch.float64)
-        g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(vals, dtype=torch.float64)
-        kinds[kern] = isinstance(M.band_operator(M.band(g)), BlockBand)
-    assert kinds == {'two_scale': True, 'ikeda_carpenter': False}
-
-
 def test_ray_spectrum_float32():
     """In single precision, with elastic anisotropy and the strain's spread (whose widths come in double precision), the
     no-gradient windowed spectrum runs and matches the dense sum."""
     from mbirtorch.hsnt.strain.model import Hybrid2
     lam = np.linspace(1.2, 4.4, 600)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
-                device='cpu', two_scale=True, dtype=torch.float32)
+                device='cpu', dtype=torch.float32)
     gen = torch.Generator().manual_seed(6)
     g = torch.zeros(M.n_global, dtype=torch.float64); sl = M.slices[0]; ne = sl['h'][1] - sl['h'][0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
@@ -793,7 +752,7 @@ def test_spectra_float32():
     from mbirtorch.hsnt.strain.model import Hybrid2
     lam = np.linspace(2.0, 4.4, 300)
     mk = lambda dt: Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5,
-                            n_contam=1, device='cpu', two_scale=True, dtype=dt)
+                            n_contam=1, device='cpu', dtype=dt)
     M32, M64 = mk(torch.float32), mk(torch.float64)
     g = torch.zeros(M64.n_global, dtype=torch.float64)
     sl = M64.slices[0]
@@ -843,7 +802,7 @@ def _small_fit_cubic4(seed=0, coeffs=None):
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
-                device='cpu', two_scale=True, dtype=torch.float64, shape_model='cubic4')
+                device='cpu', dtype=torch.float64, shape_model='cubic4')
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
@@ -924,7 +883,7 @@ def test_texture_field_global_grad():
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
-                device='cpu', two_scale=True, dtype=torch.float64, shape_model='cubic4', texture_basis=2)
+                device='cpu', dtype=torch.float64, shape_model='cubic4', texture_basis=2)
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
@@ -960,7 +919,7 @@ def test_ray_spectrum_matches_dense(case, spread):
     lam = np.linspace(1.2, 4.4, 600)
     nb = 2 if case == 'field' else 1
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
-                device='cpu', two_scale=True, dtype=torch.float64, edge_slope=True,
+                device='cpu', dtype=torch.float64, edge_slope=True,
                 shape_model=None if case == 'powder' else 'cubic4', texture_basis=nb)
     gen = torch.Generator().manual_seed(5)
     g = torch.zeros(M.n_global, dtype=torch.float64)
@@ -1117,7 +1076,7 @@ def test_volume_step_retries_with_zero_mean_step():
     dev = pr.fwd(torch.zeros(N, N, N, 2)).device                 # the device the projector runs on
     lam = np.linspace(2.0, 4.4, 60)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
-                device=dev, two_scale=True)
+                device=dev)
     g = torch.zeros(M.n_global, dtype=torch.float64, device=dev)
     sl = M.slices[0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
@@ -1208,7 +1167,7 @@ def test_edge_spread():
     # each sharp edge is a ramp narrower than its nodes' spacing)
     lam = np.linspace(3.6, 4.5, 400)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
-                device='cpu', dtype=torch.float64, two_scale=True)
+                device='cpu', dtype=torch.float64)
     g = torch.zeros(M.n_global, dtype=torch.float64); sl = M.slices[0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3
     eps = torch.tensor([[1e-3], [-5e-4]], dtype=torch.float64); sd = torch.tensor([[2e-3], [5e-4]], dtype=torch.float64)
@@ -1220,7 +1179,7 @@ def test_edge_spread():
     pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
     dev = pr.fwd(torch.zeros(N, N, N, 2)).device
     M2 = Hybrid2(np.linspace(2.0, 4.4, 60), np.full(60, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3,
-                 n_contam=1, device=dev, two_scale=True)
+                 n_contam=1, device=dev)
     P = sum(pr.counts); kw = dict(device=dev)
     fit = FitB(M2, torch.ones(P, M2.K, **kw), torch.zeros(M2.n_global, dtype=torch.float64, **kw), torch.ones(P, 1, **kw),
                torch.zeros(1, M2.K, **kw), eps=torch.zeros(P, 1, **kw), chunk=512)
@@ -1283,7 +1242,7 @@ def test_elastic_anisotropy():
     wts = series_weights([(m_[0] if isinstance(m_[0], str) else tuple(m_[0][:3]), a_) for m_, a_ in [(mm, mm[1]) for mm in MOUNTS]])
     lam = np.linspace(2.0, 4.4, 80)
     M2 = Hybrid2(lam, np.full_like(lam, 200.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
-                 device=dev, two_scale=True)
+                 device=dev)
     ne2 = len(M2.mats[0]['ns']); M2.set_dec(0, torch.linspace(0.8, 1.3, ne2), torch.linspace(-0.1, 0.06, ne2))
     g = torch.zeros(M2.n_global, dtype=torch.float64, device=dev); s2 = M2.slices[0]
     g[s2['a']] = 2.8665; g[s2['h'][0]:s2['h'][1]] = 0.3; g[s2['c'][0]] = 0.2
