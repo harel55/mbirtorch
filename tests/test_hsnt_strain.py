@@ -417,6 +417,257 @@ def test_fft_preconditioner_symbol(order):
     assert torch.allclose(via, direct, atol=1e-10 * float(direct.abs().max()))
 
 
+# The largest relative difference allowed between the fft_compact output and the default 'fft' output in double
+# precision.  The two paths round differently.  The equilibrium prior's symbol entries are about eq_w = 1e10, so their
+# rounding is about 1e-6.  The softest blocks are about 3e4 (at zero frequency, where the ridge, the data and the
+# damping are all that is left).  The outputs therefore differ by about eq_w * eps / 3e4, which is about 1e-10.  This
+# bound leaves a margin of about 100, and a real error is far larger.
+FFT_COMPACT_REL_TOL = 1e-8
+
+
+class _RayProjector:
+    """A test projector whose back is the exact adjoint of fwd: each of P rays sums RAY_VOXELS random voxels with random
+    positive weights, in each of Q channels."""
+    RAY_VOXELS = 40
+
+    def __init__(self, n, P, Q, gen, dtype):
+        self.n, self.Q = n, Q
+        self.idx = torch.randint(0, n ** 3, (P, self.RAY_VOXELS), generator=gen)
+        self.wt = torch.rand(P, self.RAY_VOXELS, generator=gen, dtype=dtype)
+
+    def fwd(self, vols):
+        return (vols.reshape(-1, vols.shape[-1])[self.idx] * self.wt[..., None]).sum(1)
+
+    def back(self, rays):
+        out = torch.zeros(self.n ** 3, rays.shape[-1], dtype=rays.dtype)
+        out.index_add_(0, self.idx.reshape(-1), (self.wt[..., None] * rays[:, None, :]).reshape(-1, rays.shape[-1]))
+        return out.reshape(self.n, self.n, self.n, -1)
+
+
+def _fft_fit(n, R, stencil='corner', order=2, elastic=True, dtype=torch.float64, seed=0, proj=None):
+    """A TomoFit with only what the 'fft' preconditioner reads: a cube of material inside an empty volume, the package's
+    prior strengths, and random ray information and view weights.  proj None gives a _RayProjector.  Returns the fit and
+    the preconditioner's arguments (F, lam_, pV, dE_, fV, fE), on the projector's device."""
+    from mbirtorch.hsnt.strain.tomo import TomoFit, EQUILIBRIUM_SD, STRAIN_SMOOTH2_SD, STRAIN_PRIOR_SD
+    gen = torch.Generator().manual_seed(seed)
+    C = 6
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.precond = R, C, 'fft'
+    tf.proj = proj if proj is not None else _RayProjector(n, 4 * n * n, R * (1 + C), gen, dtype)
+    rays = tf.proj.fwd(torch.zeros(n, n, n, tf.proj.Q, dtype=dtype))
+    P, dev = rays.shape[0], rays.device                           # a package projector returns its rays on its device
+    V = torch.zeros(n, n, n, R, dtype=dtype)
+    a, b = n // 4, 3 * n // 4
+    V[a:b, a:b, a:b] = 0.5 + torch.rand(b - a, b - a, b - a, R, generator=gen, dtype=dtype)
+    tf.V = V.to(dev)
+    tf.lam_E, tf.smooth_E, tf.smooth_order = 0.5 / STRAIN_PRIOR_SD ** 2, 1.0 / STRAIN_SMOOTH2_SD ** 2, order
+    tf.elastic = [(200e9, 0.29), (70e9, 0.33)][:R] if elastic else None
+    tf.eq_w, tf.eq_stencil = 1.0 / EQUILIBRIUM_SD ** 2, stencil
+    tf.prior_scale = torch.tensor([1.0, 0.4][:R], dtype=dtype, device=dev)
+    tf.mask_method, tf.mask_freeze, tf._mask = 'median', True, None
+    tf.w_ray = torch.randn(P, C, generator=gen, dtype=dtype).to(dev)
+    F = (1e4 * torch.rand(P, 2 * R, 2 * R, generator=gen, dtype=dtype)).to(dev)
+    dE_ = (1e6 * (1 + torch.rand(n, n, n, R, C, generator=gen, dtype=dtype))).to(dev)
+    pV = torch.ones(n, n, n, R, dtype=dtype, device=dev)
+    fV, fE = torch.ones_like(pV, dtype=torch.bool), torch.ones(n, n, n, R, C, dtype=torch.bool, device=dev)
+    return tf, (F, 1e-3, pV, dE_, fV, fE)
+
+
+def _both_preconditioners(tf, args):
+    """The 'fft' preconditioner without and with fft_compact."""
+    tf.fft_compact = False
+    old = tf._fft_preconditioner(*args)
+    tf.fft_compact = True
+    return old, tf._fft_preconditioner(*args)
+
+
+@pytest.mark.parametrize("n,R", [(15, 1), (16, 2), (24, 1)])
+@pytest.mark.parametrize("stencil", ["corner", "central"])
+@pytest.mark.parametrize("order", [1, 2])
+@pytest.mark.parametrize("elastic", [True, False])
+def test_fft_compact_matches_full(n, R, stencil, order, elastic):
+    """In double precision, fft_compact gives the 'fft' preconditioner's output to rounding, and it stores the priors'
+    symbol as real numbers.  The test covers odd and even sides, one and two materials, both equilibrium stencils,
+    both smoothness orders, and fits with and without the equilibrium prior."""
+    tf, args = _fft_fit(n, R, stencil, order, elastic)
+    old, new = _both_preconditioners(tf, args)
+    g = torch.Generator().manual_seed(1)
+    rV = torch.randn(n, n, n, R, generator=g, dtype=torch.float64)
+    rE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
+    (zV0, zE0), (zV1, zE1) = old(rV, rE), new(rV, rE)
+    assert torch.equal(zV0, zV1)
+    rel = float((zE1 - zE0).norm() / zE0.norm())
+    assert rel < FFT_COMPACT_REL_TOL, rel
+    assert tf.fft_compact_storage == 'real', tf.symbol_imag_rel
+
+
+def test_fft_compact_cg_iterates():
+    """Conjugate gradients give the same iterates and residuals with the compact preconditioner as with the default
+    one.  The residual's tolerance is looser, because a small residual carries the rounding of the first one."""
+    n, R = 16, 2
+    tf, args = _fft_fit(n, R)
+    old, new = _both_preconditioners(tf, args)
+    full = torch.ones(n, n, n, R, dtype=torch.bool)
+    div = lambda Y: tf._divergence(Y, full).reshape(*Y.shape[:3], -1)
+    dE_ = args[3]
+    H = lambda xV, xE: (xV, 2 * tf.lam_E * xE + tf.smooth_E * tf._smooth_apply(xE)
+                        + tf.eq_w * torch.func.vjp(div, xE)[1](div(xE))[0] + 1e-3 * dE_ * xE)
+    g = torch.Generator().manual_seed(2)
+    bV = torch.zeros(n, n, n, R, dtype=torch.float64)
+    bE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
+    for iters in (1, 5, 15):
+        _, x0 = tf._cg_solve(H, old, bV, bE, iters); r0 = tf.last_cg_residual
+        _, x1 = tf._cg_solve(H, new, bV, bE, iters); r1 = tf.last_cg_residual
+        rel = float((x1 - x0).norm() / x0.norm())
+        assert rel < 1e-7 and abs(r1 - r0) <= 1e-4 * r0 + 1e-9, (iters, rel, r0, r1)
+
+
+@pytest.mark.parametrize("storage", ["chosen", "complex"])
+def test_fft_compact_float32(storage, monkeypatch):
+    """With single-precision volumes and rays, as in a fit, fft_compact gives the 'fft' preconditioner's output to
+    single-precision rounding.  This holds with the storage that the symbol selects and with complex storage forced."""
+    from mbirtorch.hsnt.strain import tomo
+    if storage == 'complex':
+        monkeypatch.setattr(tomo, 'SYMBOL_IMAG_TOL', -1.0)
+    n, R = 16, 2
+    tf, args = _fft_fit(n, R, dtype=torch.float32)
+    old, new = _both_preconditioners(tf, args)
+    assert storage == 'chosen' or tf.fft_compact_storage == 'complex'
+    g = torch.Generator().manual_seed(3)
+    rV, rE = torch.randn(n, n, n, R, generator=g), torch.randn(n, n, n, R, 6, generator=g)
+    z0, z1 = old(rV, rE)[1], new(rV, rE)[1]
+    assert z1.dtype == torch.float32
+    rel = float((z1 - z0).norm() / z0.norm())
+    assert rel < 1e-5, (rel, tf.fft_compact_storage, tf.symbol_imag_rel)
+
+
+def test_fft_compact_symbol_storage(monkeypatch):
+    """The half-spectrum symbol is the full symbol's half: its real part when it is stored as real numbers, and all of
+    it when complex storage is forced.  With complex storage, fft_compact still gives the 'fft' preconditioner's output
+    to rounding."""
+    from mbirtorch.hsnt.strain import tomo
+    n, R = 12, 2
+    tf, args = _fft_fit(n, R)
+    full = tf._prior_symbol()[:, :, :n // 2 + 1]
+    tol = 1e-14 * float(full.abs().max())
+    half = tf._prior_symbol_half()
+    assert tf.fft_compact_storage == 'real' and torch.allclose(half, full.real, rtol=0, atol=tol)
+    monkeypatch.setattr(tomo, 'SYMBOL_IMAG_TOL', -1.0)
+    half = tf._prior_symbol_half()
+    assert tf.fft_compact_storage == 'complex' and torch.allclose(half, full, rtol=0, atol=tol)
+    old, new = _both_preconditioners(tf, args)
+    g = torch.Generator().manual_seed(5)
+    rV = torch.randn(n, n, n, R, generator=g, dtype=torch.float64)
+    rE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
+    z0, z1 = old(rV, rE)[1], new(rV, rE)[1]
+    rel = float((z1 - z0).norm() / z0.norm())
+    assert rel < FFT_COMPACT_REL_TOL, rel
+
+
+def test_fft_compact_empty_material():
+    """A material without voxels gets no data block and no damping from fft_compact, as from the default 'fft'
+    preconditioner.  Here the second of two materials is empty, and the two outputs agree to rounding.  The test leaves
+    out the equilibrium prior.  With it, the empty material's softest block would be only its ridge, and the rounding
+    would come close to FFT_COMPACT_REL_TOL."""
+    n, R = 16, 2
+    tf, args = _fft_fit(n, R, elastic=False)
+    tf.V[..., 1] = 0
+    assert not bool(tf.material_voxels()[..., 1].any())
+    old, new = _both_preconditioners(tf, args)
+    g = torch.Generator().manual_seed(6)
+    rV = torch.randn(n, n, n, R, generator=g, dtype=torch.float64)
+    rE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
+    z0, z1 = old(rV, rE)[1], new(rV, rE)[1]
+    assert bool(torch.isfinite(z1).all())
+    rel = float((z1 - z0).norm() / z0.norm())
+    assert rel < FFT_COMPACT_REL_TOL, rel
+
+
+def test_fft_compact_leaves_fft_ray():
+    """fft_compact applies to precond='fft' only.  With precond='fft_ray' the default path runs, and its output is the
+    same with the option on and off."""
+    n, R = 12, 1
+    tf, args = _fft_fit(n, R)
+    tf.precond = 'fft_ray'
+    g = torch.Generator().manual_seed(7)
+    ray = torch.randn(n, n, n, R, 6, 6, generator=g, dtype=torch.complex128)
+    tf._ray_symbol = lambda F: ray                       # a stand-in for the data's strain symbol
+
+    def compact(*a, **k):
+        raise AssertionError("the compact preconditioner ran with precond='fft_ray'")
+    tf._fft_preconditioner_compact = compact
+    old, new = _both_preconditioners(tf, args)
+    rV = torch.randn(n, n, n, R, generator=g, dtype=torch.float64)
+    rE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
+    assert torch.equal(old(rV, rE)[1], new(rV, rE)[1])
+
+
+def _old_data_block(tf, F, own):
+    """The data strain block as _fft_preconditioner computes it, from C back-projections: (R, C, C) float64."""
+    R, C, V, w = tf.R, tf.C, tf.V, tf.w_ray
+    n, P_ = V.shape[0], F.shape[0]
+    dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
+    zero = torch.zeros(P_, R, device=V.device, dtype=V.dtype)
+    bUU = torch.stack([tf.proj.back(torch.cat([zero, (dUU[:, :, None] * (w[:, k:k + 1] * w)[:, None, :]).reshape(P_, R * C)], 1))
+                       [..., R:].reshape(n, n, n, R, C) for k in range(C)], -2)
+    return torch.stack([(V[..., r, None, None] ** 2 * bUU[..., r, :, :])[own[..., r]].double().mean(0)
+                        for r in range(R)])
+
+
+@pytest.mark.parametrize("fine", [False, True])
+def test_fft_compact_data_block_projectors(fine):
+    """The data strain block from one forward projection (the adjoint identity) matches the mean of the
+    back-projections to single-precision rounding.  The test uses a MultiProjector with mounts (fractional shifts and
+    a rotation) and a FineProjector."""
+    from mbirtorch.hsnt.strain.tomo import FineProjector
+    R, C = 1, 6
+    if fine:
+        proj = FineProjector(N // 2, MOUNTS[:2], R * (1 + C), channel_offsets=[0.0, 0.3], ror_mask=False, factor=2)
+    else:
+        proj = MultiProjector(N, MOUNTS, R * (1 + C), channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    tf, (F, *_) = _fft_fit(N, R, dtype=torch.float32, proj=proj)
+    own = tf.material_voxels()
+    new, old = tf._data_strain_block(F, own), _old_data_block(tf, F, own)
+    rel = float((new - old).abs().max() / old.abs().max())
+    assert rel < 1e-5, rel
+
+
+def _volume_step_fit(seed=0):
+    """A TomoFit for one volume step on a MultiProjector with mounts: one bcc material in a cube, flat data, random
+    strain tensors, random view weights and the equilibrium prior."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    C = 6
+    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    dev = pr.fwd(torch.zeros(N, N, N, 2)).device                 # the device the projector runs on
+    lam = np.linspace(2.0, 4.4, 60)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
+                device=dev)
+    g = torch.zeros(M.n_global, dtype=torch.float64, device=dev)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    P = sum(pr.counts)
+    kw = dict(device=dev)
+    fit = FitB(M, torch.ones(P, M.K, **kw), g, torch.ones(P, 1, **kw), torch.zeros(1, M.K, **kw),
+               eps=torch.zeros(P, 1, **kw), chunk=512)
+    gen = torch.Generator().manual_seed(seed)
+    V = torch.zeros(N, N, N, 1); V[3:9, 3:9, 3:9] = 0.05
+    E = 1e-4 * torch.randn(N, N, N, 1, C, generator=gen)
+    w = 2 * torch.rand(pr.V, C, generator=gen) - 1
+    return TomoFit(fit, pr, V.to(dev), E.to(dev), weights=w.to(dev), elastic=[(211e9, 0.29)])
+
+
+def test_volume_step_fft_compact():
+    """A volume step with fft_compact runs on the package projector, and it agrees with the default step: the Newton
+    decrement and the objective's decrease match to the precision of single-precision conjugate gradients."""
+    a, b = _volume_step_fit(), _volume_step_fit()
+    b.fft_compact = True
+    ua, da = a.volume_step()
+    ub, db = b.volume_step()
+    assert b.fft_compact_storage in ('real', 'complex') and math.isfinite(ub) and db > 0, (ub, db)
+    assert abs(ub - ua) <= 5e-2 * abs(ua) and abs(db - da) <= 5e-2 * abs(da), (ua, ub, da, db)
+
+
 def _small_fit(seed=0):
     """A small FitB on the CPU: one bcc material, per-ray dilations, one contamination component, counts from the model."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
