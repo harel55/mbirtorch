@@ -724,8 +724,9 @@ class TomoFit:
             return 0.5 * self.eq_w * (r.double() ** 2).sum() + self._d0_prior(Dm.double())
 
         def grad(D):
-            D = D.detach().requires_grad_(True)
-            return torch.autograd.grad(F(D), D)[0] * own
+            with torch.enable_grad():                          # also when the caller holds torch.no_grad()
+                D = D.detach().requires_grad_(True)
+                return torch.autograd.grad(F(D), D)[0] * own
 
         b = -grad(torch.zeros_like(self.D))                    # F is quadratic: grad F(D) = H D - b
         Hv = lambda v: grad(v) + b
