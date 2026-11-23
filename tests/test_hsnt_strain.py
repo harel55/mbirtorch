@@ -268,7 +268,8 @@ def test_qggmrf_strain_prior_curvature():
     assert float((fd - hv).norm()) < 1e-4 * float(hv.norm())
     for small in (1e-4 * E, torch.zeros_like(E)):
         for s_, c_ in zip(tf._strain_wts(small), tf._strain_wts(small, curvature=True)):
-            assert torch.allclose(s_, c_, rtol=1e-2)
+            assert torch.allclose(s_, c_, rtol=1e-2), \
+                f'largest relative difference {float(((s_ - c_).abs() / c_.abs()).max()):.3g}'
 
 
 @pytest.mark.parametrize("prior", ["quadratic", "qggmrf"])
@@ -1247,12 +1248,15 @@ def test_warmup_searches_unknown_materials(known):
         mu.append(m(p_).detach().numpy())
     mu = 0.08 * np.stack(mu) / np.stack(mu).mean(1, keepdims=True)
     V = torch.zeros(n, n, n, 2); V[2:6, 3:9, 3:9, 0] = 1; V[6:10, 3:9, 3:9, 1] = 1
-    T = torch.poisson(1e5 * torch.exp(-(proj.fwd(V).double() @ torch.as_tensor(mu)))) / 1e5
+    # The projector returns its rays on its own device, which is a GPU when there is one. The counts are drawn by the
+    # seeded CPU generator on every machine. The fit computes on the projector's device.
+    rays = proj.fwd(V); dev = rays.device.type
+    T = torch.poisson(1e5 * torch.exp(-(rays.cpu().double() @ torch.as_tensor(mu)))) / 1e5
     lat = [None, None]; a0 = [None, None]; init = None
     if known is not None:
         lat[known] = mats[known][0]; a0[known] = mats[known][1]
         init = [None, None]; init[known] = mu[known]
-    _, info = warmup(T.float(), lam, np.full(lam.size, 1e5), lat, a0, proj, device='cpu', init_spectra=init,
+    _, info = warmup(T.float().to(dev), lam, np.full(lam.size, 1e5), lat, a0, proj, device=dev, init_spectra=init,
                      d0_from_data=True, noise=None, normalize=False, a_range=0.01)      # not the search's +-2%
     for (lt, a), (lt_f, a_f) in zip(mats, info['found']):
         assert lt_f == lt and abs(a_f / a - 1) < 1e-3
@@ -1773,8 +1777,14 @@ def test_warmup_host_storage(device, noise):
         mu.append(m(p_).detach().numpy())
     mu = 0.08 * np.stack(mu) / np.stack(mu).mean(1, keepdims=True)
     V = torch.zeros(n, n, n, 2); V[4:6, 4:8, 4:8, 0] = 1; V[6:8, 4:8, 4:8, 1] = 1       # air 4 voxels on every side
+    # The projector returns its rays on its own device, which is a GPU when there is one. The fit must compute on that
+    # device, so a case that asks for another device cannot run on this machine.
+    rays = proj.fwd(V)
+    if rays.device.type != device:
+        pytest.skip(f'the projector computes on {rays.device.type}, not on {device}')
     torch.manual_seed(0)
-    T = (torch.poisson(1e5 * torch.exp(-(proj.fwd(V).double() @ torch.as_tensor(mu)))) / 1e5).float()
+    # The counts are drawn by the seeded CPU generator on every machine. Ta and Tb below put T where each case asks.
+    T = (torch.poisson(1e5 * torch.exp(-(rays.cpu().double() @ torch.as_tensor(mu)))) / 1e5).float()
     ray_mask = torch.ones(T.shape[0], dtype=torch.bool); ray_mask[:n] = False         # one detector row of view 0
     Ta = T.clone().to(device)                                       # the default storage's T, on the fit's device
     if device == 'cuda':                                            # the host storage's T, pinned on a GPU

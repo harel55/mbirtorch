@@ -45,6 +45,9 @@ SUPPORT_REL = 0.1               # the support: voxels whose 3 x 3 x 3 mean densi
 EQUILIBRIUM_SD = 1e-5           # the equilibrium prior's standard deviation of div(stress) / Young's modulus per voxel
 QGGMRF_P, QGGMRF_Q, QGGMRF_T = 2.0, 1.2, 1.0   # the edge-preserving density prior's exponents and threshold (the
 #                                              package's q-GGMRF defaults)
+QGGMRF_FLOOR_REL = 1e-7         # The q-GGMRF priors raise each absolute difference to at least this fraction of
+                                # QGGMRF_T times the prior's scale. The floor keeps the power q - p finite at a zero
+                                # difference.
 DENSITY_SMOOTH_REL = 0.2        # the density smoothness prior's standard deviation per neighbour difference, as a
                                 # fraction of the material's typical density inside the sample (warm-up volume)
 CG_ITERS = 30                   # conjugate-gradient iterations per volume step
@@ -1095,7 +1098,13 @@ class TomoFit:
     @staticmethod
     def _qggmrf_rho(delta, sx):
         """The q-GGMRF penalty of neighbour differences delta at scale sx (the value _strain_prior_value sums)."""
-        a = delta.abs().clamp_min(QGGMRF_T * sx * 1e-7)
+        return TomoFit._qggmrf_rho_floored(delta.abs().clamp_min(QGGMRF_T * sx * QGGMRF_FLOOR_REL), sx)
+
+    @staticmethod
+    def _qggmrf_rho_floored(a, sx):
+        """The q-GGMRF penalty at scale sx of absolute differences a that are already at or above the floor. The
+        function holds no clamp, so its derivatives at the floor do not depend on how torch differentiates a clamp at
+        its boundary. Use it to differentiate the penalty."""
         ds = (a / (QGGMRF_T * sx)) ** (QGGMRF_Q - QGGMRF_P)
         return a ** QGGMRF_P / (QGGMRF_P * sx ** QGGMRF_P) * ds / (1 + ds)
 
@@ -1115,8 +1124,10 @@ class TomoFit:
         for d in range(3):
             with torch.enable_grad():
                 # rho is even, so rho''(d) = rho''(|d|); the floor keeps zero differences at the quadratic curvature
-                x = self._sdiff(E, d).detach().double().abs().clamp_min(QGGMRF_T * sx * 1e-7).requires_grad_(True)
-                g = torch.autograd.grad(self._qggmrf_rho(x, sx).sum(), x, create_graph=True)[0]
+                x = self._sdiff(E, d).detach().double().abs().clamp_min(QGGMRF_T * sx * QGGMRF_FLOOR_REL).requires_grad_(True)
+                # x is already floored. A second clamp at the same floor would make the derivatives at the floor
+                # depend on torch's choice of gradient at the clamp's boundary.
+                g = torch.autograd.grad(self._qggmrf_rho_floored(x, sx).sum(), x, create_graph=True)[0]
                 h = torch.autograd.grad(g.sum(), x)[0]
             out.append(self._smooth_vs() * h.clamp_min(0).to(E.dtype))
         return out
@@ -1196,7 +1207,7 @@ class TomoFit:
             if not np.isfinite(sx):
                 continue
             for d in range(3):
-                a = V[..., r].diff(dim=d).double().abs().clamp_min(QGGMRF_T * sx * 1e-7)
+                a = V[..., r].diff(dim=d).double().abs().clamp_min(QGGMRF_T * sx * QGGMRF_FLOOR_REL)
                 ds = (a / (QGGMRF_T * sx)) ** (QGGMRF_Q - QGGMRF_P)
                 tot += float((a ** QGGMRF_P / (QGGMRF_P * sx ** QGGMRF_P) * ds / (1 + ds)).sum())
         return self.voxel_scale * tot
