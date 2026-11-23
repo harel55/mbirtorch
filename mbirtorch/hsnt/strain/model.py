@@ -28,6 +28,8 @@ replaces H by Bragg materials. Loss: Poisson deviance of the counts, sum_pk d_k 
 beam's counts per pixel in bin k; plus the L1 on f and a ridge on the splines.
 """
 import math
+import mmap
+import weakref
 
 import numpy as np
 import torch
@@ -141,6 +143,110 @@ CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvatu
 LEGENDRE_DEGREE = 8          # the smooth part's polynomial degree (the spline's effective degrees of freedom
                              # on the real Fe cube, q79, were 8.9)
 LEGENDRE_CURVATURE = 1e-2    # the smooth part's curvature penalty weight relative to FitB.ridge (q79 used 1.1e-2)
+# FitB's t_storage takes these values. 'device' keeps T as it is given, and 'host' keeps T in host memory.
+T_STORAGES = ("device", "host")
+STORE_BLOCK_RAYS = 65536     # FitB copies the transmission into its storage this many rays at a time.
+# FitB's t_dtype takes this value to store T in float16. The default, None, keeps T's own dtype.
+T_HALF = "float16"
+# float16 storage refuses a transmission with a value beyond plus or minus this number, the largest finite float16.
+HALF_MAX = float(torch.finfo(torch.float16).max)
+# Positive float16 values below this number, the smallest normal float16, keep fewer significant bits.
+HALF_TINY = float(torch.finfo(torch.float16).tiny)
+HALF_SAMPLE_RAYS = 4096      # half_rounding samples at most this many rays for its logged statistics.
+# pinned_empty passes this cudaHostRegister flag (cudaHostRegisterPortable), so every GPU treats the memory as pinned.
+HOST_REGISTER_PORTABLE = 1
+
+
+def half_rounding(T, d):
+    """half_rounding measures what float16 storage does to the transmission T (rays, bins) at the counts per bin d
+    (bins,). FitB logs the result. It returns the smallest and the largest value of T. It also samples every k-th ray,
+    at most HALF_SAMPLE_RAYS rays. Over the sample, it returns the share of positive values below HALF_TINY, the root
+    mean square relative rounding error of the positive values, and the median counts per bin (T times d). It raises
+    ValueError when a value of T lies beyond plus or minus HALF_MAX, because float16 cannot hold that value."""
+    lo, hi = (float(v) for v in torch.aminmax(T))
+    if max(hi, -lo) > HALF_MAX:
+        raise ValueError(f"float16 storage needs every value of the transmission within +-{HALF_MAX}. "
+                         f"The values range from {lo} to {hi}.")
+    x = T[::max(1, T.shape[0] // HALF_SAMPLE_RAYS)].double()
+    xp = x[x > 0]
+    rel = (xp.half().double() - xp) / xp
+    counts = x * torch.as_tensor(d, device=x.device, dtype=torch.float64)
+    return dict(min=lo, max=hi, sampled_rays=int(x.shape[0]),
+                tiny_share=float((xp < HALF_TINY).double().mean()) if xp.numel() else 0.0,
+                rms_relative_rounding=float(rel.pow(2).mean().sqrt()) if xp.numel() else 0.0,
+                median_counts_per_bin=float(counts.median()))
+
+
+def _compute_device(dev):
+    """_compute_device returns the torch device dev. When dev names a GPU without an index, it returns the current
+    GPU with its index."""
+    d = torch.device(dev)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return d
+
+
+def pinned_empty(shape, dtype, device=None):
+    """pinned_empty returns an uninitialized host tensor that is pinned (page-locked) for fast copies to a GPU. Use it
+    for a large host array that is copied to the GPU in parts, such as the transmission T with t_storage 'host'.
+    torch.empty(..., pin_memory=True) rounds each pinned block up to a power of two of bytes, and it keeps freed blocks
+    pinned. So it can pin up to twice the size of a large tensor. pinned_empty pins only the pages that the tensor
+    covers. The pages are unpinned when the tensor and all its views are freed. device is the GPU that the tensor is
+    copied to. The default, None, means the current GPU. When device is not a GPU, when CUDA is missing, or when
+    pinning fails, the tensor is pageable, and its is_pinned() returns False."""
+    shape = tuple(int(s) for s in shape)
+    np_dtype = torch.empty(0, dtype=dtype).numpy().dtype
+    nbytes = int(np.prod(shape, dtype=np.int64)) * np_dtype.itemsize
+    if nbytes == 0 or not torch.cuda.is_available():
+        return torch.empty(shape, dtype=dtype)
+    dev = _compute_device("cuda" if device is None else device)
+    if dev.type != "cuda":
+        return torch.empty(shape, dtype=dtype)
+    page = mmap.PAGESIZE
+    span = -(-nbytes // page) * page                  # The pinned range covers the tensor's bytes in whole pages.
+    buf = np.empty(span + page, np.uint8)             # The extra page lets the pinned range start on a page boundary.
+    start = -buf.ctypes.data % page
+    arr = buf[start:start + nbytes].view(np_dtype).reshape(shape)
+    ptr = arr.ctypes.data
+    with torch.cuda.device(dev):
+        err = int(torch.cuda.cudart().cudaHostRegister(ptr, span, HOST_REGISTER_PORTABLE))
+    if err != 0:
+        _clear_cuda_error(dev)
+        return torch.from_numpy(arr)
+    # The tensor keeps arr alive, and arr keeps buf alive. So buf is freed only after the tensor and all its views.
+    # The finalizer runs before numpy frees buf's memory. It does not run at exit, when the process frees everything.
+    weakref.finalize(buf, _unpin, ptr, dev).atexit = False
+    return torch.from_numpy(arr)
+
+
+def _unpin(ptr, dev):
+    """_unpin unpins the host memory at ptr that pinned_empty pinned. It first waits for the GPU dev to finish its
+    queued work, because a copy from that memory may still be running."""
+    try:
+        torch.cuda.synchronize(dev)
+    finally:
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+
+
+def _clear_cuda_error(dev):
+    """_clear_cuda_error clears the error flag that a failed CUDA runtime call leaves behind. Torch would otherwise
+    report that error at its next kernel launch. The function launches a small kernel on dev. The kernel's launch
+    check reads the flag and clears it, and the function drops the error that the check raises."""
+    try:
+        torch.ones(1, device=dev).add_(1)
+    except Exception:
+        pass
+
+
+_COPY_STREAMS = {}           # _copy_stream keeps the side stream of each GPU in this dictionary.
+
+
+def _copy_stream(device):
+    """_copy_stream returns the side stream on which FitB prefetches chunks of the transmission to device. Each GPU
+    has one such stream."""
+    if device not in _COPY_STREAMS:
+        _COPY_STREAMS[device] = torch.cuda.Stream(device)
+    return _COPY_STREAMS[device]
 
 
 def edge_step(off, hf, width=None):
@@ -855,12 +961,37 @@ class FitB:
     derivatives by the chain rule through the banded operator, contamination per bin."""
 
     def __init__(self, model, T, g, W, f, eps=None, chunk=1024, ridge=None, z=None, alpha=0.05, inflation=1.0,
-                 ray_mask=None):
+                 ray_mask=None, t_storage="device", t_dtype=None, t_prefetch=False):
         """ray_mask (rays,) bool: only the rays where it is True enter the likelihood (use it to leave out detector
-        regions the model does not describe, such as a sample holder); None uses every ray."""
-        self.M = model; self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
-        self.ray_weight = None if ray_mask is None else ray_mask.to(T.device, T.dtype)
-        self.n_points = int(all_sum_float((T.shape[0] if ray_mask is None else int(ray_mask.sum())) * T.shape[1], T.device))
+        regions the model does not describe, such as a sample holder); None uses every ray.
+        t_storage says where the transmission T is kept. 'device' (the default) keeps T as it is given, and the fit
+        computes on T's device. 'host' keeps T in host memory, pinned when the model computes on a GPU, and the fit
+        computes on the model's device. Each pass over the rays then copies its chunks of T to that device. The
+        results are the same, and the GPU memory falls by the size of T. Use 'host' when T does not fit on the GPU
+        next to the fit. A pinned host T in the storage's dtype, such as one from pinned_empty, is kept as it is. Any
+        other T is copied into a tensor from pinned_empty, which pins only T's own pages. Host memory must hold T.
+        t_dtype None (the default) keeps T's own dtype. T_HALF ('float16') stores T in float16 on the storage that
+        t_storage says (the model's device for 'device'), which halves T's memory and its copies. Each chunk is then
+        converted to the model's dtype before use. This is not exact: the rounding is about 2^-11 of T, so its share
+        of the error grows with the counts per bin (half_rounding, logged in t_half_info). Keep the default for
+        noiseless data and very high counts.
+        t_prefetch True, with t_storage 'host' on a GPU, starts the copy of the next chunk on a side stream while the
+        current one is in use, so that the copies overlap the computation. The numbers are the same. It is off by
+        default."""
+        if t_storage not in T_STORAGES:
+            raise ValueError(f"t_storage must be one of {T_STORAGES}, not {t_storage!r}")
+        if t_dtype not in (None, T_HALF):
+            raise ValueError(f"t_dtype must be None or {T_HALF!r}, not {t_dtype!r}")
+        self.M = model; self.t_storage = t_storage; self.t_dtype = t_dtype
+        self._t_default = t_storage == "device" and t_dtype is None      # The default storage keeps T as it is given.
+        self._device = T.device if self._t_default else _compute_device(model.dev)
+        self._T_ratio = None             # Outside the default, T_chunk applies a shared open beam's ratio O / b.
+        self.t_half_info = None          # This holds half_rounding's statistics when T is converted to float16.
+        self.t_prefetch = bool(t_prefetch) and t_storage == "host" and self._device.type == "cuda"
+        self._pending = None             # _fetch keeps the prefetched rows, their copy, its event and T's version here.
+        self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
+        self.ray_weight = None if ray_mask is None else ray_mask.to(self.device, self._t_cdt)
+        self.n_points = int(all_sum_float((self.P if ray_mask is None else int(ray_mask.sum())) * T.shape[1], self.device))
         # variance inflation of pixel sums from spatially correlated counts (noise.py); scales score variances
         self.inflation = float(inflation)
         self.eps = None if eps is None else eps.clone()
@@ -870,7 +1001,7 @@ class FitB:
         self.eps_sd = None               # (rays, R) each ray's spread of strain along the beam (TomoFit.refresh_spread)
         self.tex_Q = None                # texture field: per material, the rays' basis weights (rays, nb) (TomoFit.sync)
         self.chunk = chunk
-        self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
+        self.ridge = (1e-3 * all_sum_float(self.P, self.device) * float(model.d.mean())) if ridge is None else ridge
         self.z = norm.isf(alpha / (2 * model.K)) if z is None else z
         self.lam1 = torch.zeros_like(self.f); self.dispersion = 1.0
         self.history = []
@@ -885,6 +1016,94 @@ class FitB:
         # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
         self.contamination_newton = False
         self.last_step_se = float('inf')      # the last global step's RMS in standard errors (global_step)
+
+    # -- The measured transmission T (rays, bins). The passes read it one chunk at a time through T_chunk. They take the
+    # number of rays from P and the compute device from device. So the storage of T can change without changing them.
+    @property
+    def T(self):
+        """T returns the transmission (rays, bins) as it is stored. Passes over the rays read it through T_chunk."""
+        return self._T
+
+    @T.setter
+    def T(self, value):
+        # T_chunk returns chunks in this dtype. It is T's own dtype, or the model's dtype with float16 storage.
+        self._t_cdt = value.dtype if self.t_dtype is None else self.M.dt
+        self._pending = None                 # A chunk that was prefetched from an earlier T must not be used.
+        self._T = self._store(value)
+
+    def _store(self, value):
+        """_store returns value (rays, bins) in the form that this fit keeps. The default storage keeps value itself.
+        The other storages need a certain place and dtype. With t_storage 'host', the place is host memory, pinned when
+        the fit computes on a GPU. With t_dtype T_HALF, the dtype is float16. _store keeps a value that already has
+        the storage's place and dtype, and it copies any other value into a new tensor (pinned_empty for pinned
+        memory)."""
+        if self._t_default:
+            return value
+        host = self.t_storage == "host"
+        where = torch.device("cpu") if host else self._device
+        dtype = torch.float16 if self.t_dtype == T_HALF else value.dtype
+        pin = host and self._device.type == "cuda"
+        if dtype == torch.float16 and value.dtype != torch.float16:
+            self.t_half_info = half_rounding(value, self.M.d)
+        if not (value.device == where and value.dtype == dtype and (not pin or value.is_pinned())):
+            out = (pinned_empty(value.shape, dtype, self._device) if pin
+                   else torch.empty(value.shape, dtype=dtype, device=where))
+            for i in range(0, value.shape[0], STORE_BLOCK_RAYS):
+                out[i:i + STORE_BLOCK_RAYS].copy_(value[i:i + STORE_BLOCK_RAYS])
+            value = out
+        self.t_pinned = pin and bool(value.is_pinned())     # Without pinning, each chunk's copy is synchronous.
+        return value
+
+    def T_chunk(self, sl):
+        """T_chunk returns the transmission of the rays sl on the device where the fit computes."""
+        if self._t_default:
+            return self._T[sl]
+        x = self._fetch(sl) if self.t_prefetch else self._T[sl].to(self._device, non_blocking=True)
+        if x.dtype != self._t_cdt:           # With float16 storage, the device converts the chunk after the copy.
+            x = x.to(self._t_cdt)
+        if self._T_ratio is not None:        # With a shared open beam, this repeats refresh_open_beam's expression.
+            x = (x.double() * self._T_ratio[self.shared_open_beam["pix"][sl]]).to(self._t_cdt)
+        return x
+
+    def _fetch(self, sl):
+        """_fetch returns the stored rows sl, copied to the compute device, for t_prefetch. If the previous call
+        prefetched these rows from the same, unchanged T, _fetch waits for that copy instead of copying again. Before
+        it returns, it starts to copy the next rows on a side stream. The next rows are as many rows as sl holds, and
+        they follow sl. At the end of T, the next rows are the first chunk of the next pass."""
+        main = torch.cuda.current_stream(self._device)
+        start, stop, step = sl.indices(self.P)
+        pending, self._pending = self._pending, None
+        if pending is not None and step == 1 and pending[0] == (start, stop) and pending[3] == self._T._version:
+            x, done = pending[1], pending[2]
+            main.wait_event(done)                 # The computation on x starts after its copy has finished.
+            x.record_stream(main)                 # x's memory is not reused before the main stream is done with it.
+        else:
+            x = self._T[sl].to(self._device, non_blocking=True)
+        if step != 1:
+            return x
+        nxt = (stop, min(2 * stop - start, self.P)) if stop < self.P else (0, min(self.chunk, self.P))
+        side = _copy_stream(self._device)
+        with torch.cuda.stream(side):
+            y = self._T[nxt[0]:nxt[1]].to(self._device, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+        self._pending = (nxt, y, done, self._T._version)
+        return x
+
+    @property
+    def P(self):
+        """P returns the number of rays."""
+        return self._T.shape[0]
+
+    @property
+    def device(self):
+        """device returns the device on which the fit computes."""
+        return self._T.device if self._t_default else self._device
+
+    def _data_tensors(self):
+        """_data_tensors returns the tensors that hold the data. The state key of the remembered data loss includes
+        them. So a new tensor, or an in-place change of one, makes the remembered loss stale."""
+        return (self._T,) if self._t_default else (self._T, self._T_ratio)
 
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
@@ -908,14 +1127,14 @@ class FitB:
         (divided by the counts' dispersion, like the dose); pixel (rays,) long: each ray's detector pixel; exposure
         (rays,): each ray's view exposure relative to the open beam. self.T must be the measured transmission, the
         sample counts over exposure x open beam."""
-        dev = self.T.device
+        dev = self.device
         O = torch.as_tensor(open_beam, device=dev, dtype=torch.float64)
         pix = torch.as_tensor(pixel, device=dev, dtype=torch.long)
         s_ = torch.as_tensor(exposure, device=dev, dtype=torch.float64)
         self.T_measured = self.T
         S_sum = torch.zeros_like(O)                                             # sum over the views of the sample counts
         for sl in self.chunks():
-            S = self.T[sl].double() * s_[sl, None] * O[pix[sl]]
+            S = self.T_chunk(sl).double() * s_[sl, None] * O[pix[sl]]
             if self.ray_weight is not None:
                 S = S * self.ray_weight[sl, None]
             S_sum.index_add_(0, pix[sl], S)
@@ -924,7 +1143,9 @@ class FitB:
 
     def refresh_open_beam(self):
         """Moves the Poisson bound of the shared open beam's likelihood to the current state: the open beam's estimate b
-        per pixel and bin, each ray's dose s_v b, and the transmission T O / b. A no-op without a shared open beam."""
+        per pixel and bin, each ray's dose s_v b, and the transmission T O / b. A no-op without a shared open beam.
+        With t_storage 'host' or t_dtype T_HALF, T stays the measured transmission, and T_chunk multiplies each chunk by
+        O / b."""
         ob = self.shared_open_beam
         if ob is None:
             return
@@ -945,6 +1166,9 @@ class FitB:
         ob["b"] = (ob["O"] + ob["S_sum"]) / (1 + A)
         ob["A"] = A
         ratio = (ob["O"] / ob["b"].clamp_min(1e-12))
+        if not self._t_default:              # T_chunk applies the ratio to each chunk, so no second full T is built.
+            self._T_ratio = ratio
+            return
         T = torch.empty_like(self.T_measured)
         for sl in self.chunks():
             T[sl] = (self.T_measured[sl].double() * ratio[ob["pix"][sl]]).to(T.dtype)
@@ -963,7 +1187,7 @@ class FitB:
             for sl in self.chunks():
                 d = self.dose(sl)
                 mu = self.mean(sl, cache=cache)[0].double() * d
-                y = self.T[sl].double() * d
+                y = self.T_chunk(sl).double() * d
                 tot += float(xlogy(y, mu).sum())
         return 2 * tot
 
@@ -995,7 +1219,7 @@ class FitB:
         return None if self.eps_sd is None else self.eps_sd[sl]
 
     def chunks(self):
-        P = self.T.shape[0]
+        P = self.P
         return [slice(i, min(i + self.chunk, P)) for i in range(0, P, self.chunk)]
 
     def _texture(self, g):
@@ -1107,7 +1331,8 @@ class FitB:
     # tied to the state's tensors and their version counters, so any change to them makes it stale.
     def _state_key(self):
         tex = tuple(self.tex_Q) if self.tex_Q is not None else (None,)     # the texture's ray weights change the loss too
-        return tuple((t, t._version if torch.is_tensor(t) else None) for t in (self.g, self.W, self.eps, self.f, self.T, self.ray_weight) + tex)
+        return tuple((t, t._version if torch.is_tensor(t) else None)
+                     for t in (self.g, self.W, self.eps, self.f) + self._data_tensors() + (self.ray_weight,) + tex)
 
     def remember_data_loss(self, value):
         """Record value as the data loss (the deviance, no penalties) at the current state."""
@@ -1136,8 +1361,8 @@ class FitB:
             for sl in self.chunks():
                 Ws = None if W is None else W[sl]; es = None if eps is None else eps[sl]
                 m = self.mean(sl, g, Ws, f, es, cache)[0]
-                tot += float(self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64))
-        tot = all_sum_float(tot, self.T.device)
+                tot += float(self.deviance_terms(sl, m, self.T_chunk(sl)).sum(dtype=torch.float64))
+        tot = all_sum_float(tot, self.device)
         if current:
             self.remember_data_loss(tot)
         return tot
@@ -1157,7 +1382,7 @@ class FitB:
         self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         cache = self._state(self.g); mu, Rb, kap = cache
         for sl in self.chunks():
-            T = self.T[sl]; W = self.W[sl]
+            T = self.T_chunk(sl); W = self.W[sl]
             m, E, n, beta, s = self.mean(sl, cache=cache)
             mm = m.clamp_min(1e-12)
             cols = []
@@ -1192,7 +1417,7 @@ class FitB:
         list to which the rays' deviance at the current state is appended (it costs nothing extra here)."""
         M = self.M
         Jac, m = self.ray_jacobian(sl, cache)
-        mm = m.clamp_min(1e-12); T = self.T[sl]
+        mm = m.clamp_min(1e-12); T = self.T_chunk(sl)
         grad = torch.einsum('pk,pkn->pn', self.residual(sl, T, mm), Jac).double()
         F = torch.einsum('pk,pka,pkb->pab', self.weight(sl, mm), Jac, Jac).double()
         if deviance is not None:
@@ -1240,7 +1465,7 @@ class FitB:
         global gradient (n) and Fisher information (n, n), penalties included. Needs per-ray strain."""
         M = self.M; R = M.R
         cache, dmu, dRb = self.global_derivatives(idx)
-        P = self.T.shape[0]; n = len(idx); dev = self.T.device
+        P = self.P; n = len(idx); dev = self.device
         gch = chunk or max(64, self.chunk // 4)
         G = torch.zeros(P, 2 * R, device=dev, dtype=torch.float64); Fw = torch.zeros(P, 2 * R, 2 * R, device=dev, dtype=torch.float64)
         C = torch.zeros(P, 2 * R, n, device=dev, dtype=torch.float32)
@@ -1248,7 +1473,7 @@ class FitB:
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
             Jw, m = self.ray_jacobian(sl, cache)                                      # (Pc, K, 2R)
             Jg, _ = self.global_jacobian(sl, cache, idx, dmu, dRb)                     # (n, Pc, K)
-            mm = m.clamp_min(1e-12); T = self.T[sl]
+            mm = m.clamp_min(1e-12); T = self.T_chunk(sl)
             r_ = self.residual(sl, T, mm); w_ = self.weight(sl, mm)
             G[sl] = torch.einsum('pk,pkn->pn', r_, Jw).double()
             Fw[sl] = torch.einsum('pk,pka,pkb->pab', w_, Jw, Jw).double()
@@ -1264,7 +1489,7 @@ class FitB:
         """d m / d (W, U) of the rays sl, (Pc, K, 2R), and the mean m (Pc, K). With each ray's mean trace in eps's columns
         R..2R (elastic anisotropy, Hybrid2.set_dec): d m / d (W, U, U_tr), (Pc, K, 3R), U_tr the projected trace."""
         M = self.M; R = M.R
-        T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
+        W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
         mus = M.spectra(self.g, eps, self._views(sl), self._spectra_tex(self.g), self._sd(sl)).to(M.dt)  # (Pc, R, Kf)
@@ -1308,7 +1533,7 @@ class FitB:
 
     def ray_loss(self, sl, W, eps, cache):
         """Deviance of each ray in sl at maps W and strains eps (no penalties)."""
-        return self.deviance_terms(sl, self.mean(sl, W=W, eps=eps, cache=cache)[0], self.T[sl]).sum(1, dtype=torch.float64)
+        return self.deviance_terms(sl, self.mean(sl, W=W, eps=eps, cache=cache)[0], self.T_chunk(sl)).sum(1, dtype=torch.float64)
 
     # -- contamination on a multiscale dictionary: f_j = A c_j, c >= 0, each atom switched on by its own score test
     def build_atoms(self, widths=(1, 8, 32, 128)):
@@ -1352,7 +1577,7 @@ class FitB:
         pear = 0.0; dev = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                T = self.T[sl]
+                T = self.T_chunk(sl)
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
                 dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
@@ -1422,8 +1647,8 @@ class FitB:
         cache = self._state(self.g); dv = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                dv += float(self.deviance_terms(sl, self.mean(sl, f=f, cache=cache)[0], self.T[sl]).sum(dtype=torch.float64))
-        return all_sum_float(dv, self.T.device)
+                dv += float(self.deviance_terms(sl, self.mean(sl, f=f, cache=cache)[0], self.T_chunk(sl)).sum(dtype=torch.float64))
+        return all_sum_float(dv, self.device)
 
     def loss_c(self, c):
         return self.loss_c_data(c) + float((self.lam_c * c).sum())
@@ -1441,7 +1666,7 @@ class FitB:
         pear = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                T = self.T[sl]
+                T = self.T_chunk(sl)
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
                 Dm = beta[:, None, :] - n[:, :, None]                                  # (Pc, K, J)
@@ -1457,7 +1682,7 @@ class FitB:
         def per_bin_loss(fT):
             tot = torch.zeros(M.K, device=M.dev, dtype=torch.float64)
             for sl in self.chunks():
-                tot += self.deviance_terms(sl, self.mean(sl, f=fT.T, cache=cache)[0], self.T[sl]).sum(0, dtype=torch.float64)
+                tot += self.deviance_terms(sl, self.mean(sl, f=fT.T, cache=cache)[0], self.T_chunk(sl)).sum(0, dtype=torch.float64)
             all_sum(tot)
             return tot + (self.lam1 * fT.T).sum(0).double()
         self.f = _projected_newton_rows(self.f.T.contiguous(), grad, F, per_bin_loss, cap=(0, CONTAM_MAX_SHARE)).T.contiguous()
@@ -1641,10 +1866,10 @@ class FitB:
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
             m = self.mean(sl, g=gp, cache=cache)[0]
-            dv = self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64)
+            dv = self.deviance_terms(sl, m, self.T_chunk(sl)).sum(dtype=torch.float64)
             grad += torch.autograd.grad(dv, gp)[0]; dev += float(dv)
         all_sum(grad)
-        self.remember_data_loss(all_sum_float(dev, self.T.device))
+        self.remember_data_loss(all_sum_float(dev, self.device))
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):
             grad += torch.autograd.grad(pen, gp)[0]
@@ -1685,16 +1910,16 @@ class FitB:
                     return M.texture_factor(torch.cat([g0[:x0], xx, g0[x1:]]), r)
                 J = torch.func.jacfwd(fac)(g0[x0:x1])                                   # (views, edges, Kf, x params)
                 dtex.append([J[..., k].to(M.dt) for k in range(x1 - x0)])
-        P = self.T.shape[0]; gch = max(64, self.chunk // 4); dev = 0.0
+        P = self.P; gch = max(64, self.chunk // 4); dev = 0.0
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
             Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb, dtex)
-            mm = m.clamp_min(1e-12); T = self.T[sl]
+            mm = m.clamp_min(1e-12); T = self.T_chunk(sl)
             grad += torch.einsum('pk,npk->n', self.residual(sl, T, mm), Jg).double()
             F += torch.einsum('pk,apk,bpk->ab', self.weight(sl, mm), Jg, Jg).double()
             dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
             del Jg
         all_sum(grad); all_sum(F)
-        self.remember_data_loss(all_sum_float(dev, self.T.device))
+        self.remember_data_loss(all_sum_float(dev, self.device))
         gp = g0.clone().requires_grad_(True)
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):

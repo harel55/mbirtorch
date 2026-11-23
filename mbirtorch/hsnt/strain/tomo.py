@@ -752,12 +752,12 @@ class TomoFit:
         if nt == 0:
             return 0.0
         self.sync(); cache = fit._state(fit.g); _, Rb, _ = cache
-        P = fit.T.shape[0]; Y = M._harmonics_views().to(self.V.dtype)
+        P = fit.P; Y = M._harmonics_views().to(self.V.dtype)
         a = torch.zeros(P, nt, device=self.V.device, dtype=self.V.dtype)        # sum_k r d_r per ray
         B = torch.zeros(P, nt, nt, device=self.V.device, dtype=self.V.dtype)    # sum_k w d_r d_r' per ray
         for sl in fit.chunks():
             m, E, n_, beta, s_ = fit.mean(sl, cache=cache)
-            mm = m.clamp_min(1e-12); T = fit.T[sl]
+            mm = m.clamp_min(1e-12); T = fit.T_chunk(sl)
             r_ = fit.residual(sl, T, mm); w_ = fit.weight(sl, mm)
             W = fit.W[sl]
             d = torch.stack([-s_ * M.apply_band(E * (W[:, r:r + 1] * fit.texture_curve(sl, r)), Rb) for r in self.tex_r], 2)
@@ -1311,15 +1311,15 @@ class TomoFit:
         fit, R, C = self.fit, self.R, self.C
         self.sync()
         cache = fit._state(fit.g)
-        P = fit.T.shape[0]
+        P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R                                   # (W, U) and, anisotropic, U_tr
-        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
+        G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
         devs = []
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
-        fit.remember_data_loss(all_sum_float(sum(devs), fit.T.device))          # the deviance at this synced state
+        fit.remember_data_loss(all_sum_float(sum(devs), fit.device))          # the deviance at this synced state
         G, F = G.float(), F.float()
         Ffull, F = F, F[:, :2 * R, :2 * R].contiguous()            # the preconditioners use the (W, U) part
         gT = G[:, 2 * R:] if self.anisotropic else None
@@ -1687,10 +1687,10 @@ class TomoFit:
         refine_rigid = list(range(1, len(proj.parts))) if refine_rigid is None else list(refine_rigid)
         self.sync()
         cache = fit._state(fit.g)
-        P = fit.T.shape[0]
+        P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R
-        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
+        G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache)
@@ -1763,10 +1763,10 @@ class TomoFit:
         series = list(range(len(proj.parts))) if series is None else list(series)
         self.sync()
         cache = fit._state(fit.g)
-        P = fit.T.shape[0]
+        P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R
-        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
+        G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache)
@@ -2031,7 +2031,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
            init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
-           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None):
+           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage='device', t_dtype=None, t_prefetch=False):
     """The pipeline's start: returns a TomoFit. Each material (an entry of lattices and a0) is one of three kinds. With a
     starting spectrum (a row of init_spectra, e.g. a known material's table), it starts from that spectrum at its a0.
     With a lattice type and a0 only, warm_start searches its lattice parameter within a0 * (1 +- a_range). With
@@ -2079,14 +2079,26 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     relative standard deviation height_sd (FitB.height_prior). dec (user 2026-11-22: elastic anisotropy): per material
     None, (alpha, beta) per reflection, or a function of the reflections' h^2 + k^2 + l^2 returning them; each
     reflection's lattice strain alpha eps + beta tr(strain) from the diffraction elastic constants (Hybrid2.set_dec);
-    it needs the strain-tensor weights."""
+    it needs the strain-tensor weights. t_storage is FitB's option. The default, 'device', keeps T as it is given, and
+    'host' keeps T in host memory during the fit. t_dtype is FitB's option too. The default, None, keeps T's dtype, and
+    'float16' stores T in float16 during the fit, which is not exact (see FitB). With either option, T may be given
+    in host memory, pinned for fast copies (model.pinned_empty). The noise measurement then copies T to the model's
+    device in parts, and the warm start's factorization copies T to that device as its memory plan allows. Both use
+    T as given, before any float16 rounding. t_prefetch is FitB's option as well. With 'host', it lets each pass's
+    copies overlap its computation, and the numbers stay the same."""
     from mbirtorch import hsnt
+    from .model import _compute_device
+    # The steps that read the whole T compute on t_dev. It is None (T's own device) by default, and the model's device
+    # with the options.
+    t_default = t_storage == 'device' and t_dtype is None
+    t_dev = None if t_default else _compute_device(device)
+    t_kw = {} if t_default else dict(t_storage=t_storage, t_dtype=t_dtype, t_prefetch=t_prefetch)
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n); side = int(round(math.sqrt(rpv)))
         noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool(),
-                                   detector_tiles)
+                                   detector_tiles, device=t_dev)
         phi = np.asarray(noise_info['dispersion_per_bin']) if per_bin_dispersion else noise_info['dispersion']
         if shared_open_beam is not None:              # the air rays' variance includes the open beam's: keep the detector's
             open_beam_obs = 1.0 / float(np.mean(np.asarray(shared_open_beam['exposure'], dtype=np.float64)))
@@ -2098,6 +2110,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         raise ValueError(f"noise must be None or 'measure', not {noise!r}")
     R = len(lattices)
     dev = str(T.device) if T.is_cuda else None   # a GPU tensor is factored on its own GPU, without a host copy
+    if dev is None and t_dev is not None and t_dev.type == 'cuda':
+        dev = str(t_dev)                          # With the options, T in host memory is factored on the model's GPU.
     # the counts per bin as the strain fit's likelihood counts them (the open beam over the noise dispersion), so the
     # warm start weights each bin as the fit does
     open_beam = np.broadcast_to(np.asarray(d, dtype=np.float64), (T.shape[-1],))
@@ -2194,10 +2208,12 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     Mx = np.linalg.lstsq(targets.T, H0_local.T.astype(np.float64), rcond=None)[0].T
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
     # the pipeline's per-ray fits of the maps to the initial spectra (no strain yet)
-    fit0 = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), chunk=chunk)
+    fit0 = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), chunk=chunk, **t_kw)
     fit0.open_beam_obs = open_beam_obs
     for _ in range(INIT_PIXEL_STEPS):
         fit0.pixel_step()
+    T_fit = fit0.T                     # The fit below reuses the T that fit0 stores, so it makes no second copy.
+    half_info = fit0.t_half_info       # fit0 measured the float16 rounding when it converted T.
     Wr = fit0.W; del fit0
     # least-squares reconstruction of the ray maps (CGLS), clipped to >= 0
     n = proj.n; pr = proj.with_q(R)
@@ -2209,8 +2225,10 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         x += al * p; r_ -= al * q; s = pr.back(r_); gnew = float((s * s).sum())
         p = s + (gnew / gam) * p; gam = gnew
     V = x.clamp_min(0)
-    fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
-               ray_mask=ray_mask)
+    fit = FitB(M, T_fit, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
+               ray_mask=ray_mask, **t_kw)
+    if fit.t_half_info is None:
+        fit.t_half_info = half_info
     if h_tab:
         fit.height_prior = dict(targets=h_tab, sd=height_sd)
     if shared_open_beam is not None:                  # exact: each pixel's open beam profiled out (open_beam_obs not used)
@@ -2224,7 +2242,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         assert weights is not None, 'a view-dependent texture needs the strain-tensor weights (they hold the beam directions)'
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n)
         M.view_dirs = directions_from_weights(weights)
-        fit.ray_view = torch.arange(T.shape[0] // rpv, device=T.device).repeat_interleave(rpv)
+        fit.ray_view = torch.arange(T.shape[0] // rpv, device=fit.device).repeat_interleave(rpv)
     if kappa_prior is not None:
         # the standard deviation as a multiple of the warm-up spectra's mean attenuation (kappa's own units)
         fit.kappa_prior = kappa_prior * float(np.abs(targets).mean())
