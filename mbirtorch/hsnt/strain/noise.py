@@ -24,17 +24,26 @@ SIGNIFICANCE = 3.0      # a correlation enters the inflation if it is this many 
 CHUNK = 4096            # rays per chunk
 VIEW_OUTLIER = 5.0      # a view's level is flagged when it is this many robust spreads from the median level
 DISPERSION_BLOCK = 64   # adjacent bin pairs averaged for the per-bin dispersion
+SPAN_FACTOR = 4         # _rows copies a block of T whole when the block holds at most this many rays per ray it needs.
 
 
 def _device(T, device):
-    """The device on which a function of this module computes: device, or T's own device when device is None."""
-    return T.device if device is None else torch.device(device)
+    """_device returns the device on which a function of this module computes. It is device, or T's own device when
+    device is None. A GPU without an index becomes the current GPU with its index."""
+    from .model import _compute_device
+    return T.device if device is None else _compute_device(device)
 
 
 def _rows(T, rows, dev):
-    """The rows of T (a slice or an index tensor) as a tensor on dev. T may be kept on another device, such as in host
-    memory, and then only these rows are copied."""
+    """_rows returns the rows of T (a slice or an index tensor) as a tensor on dev. T may be kept on another device,
+    such as in host memory. Then _rows copies the contiguous block of T from the first to the last of the rows, and it
+    gathers the rows on dev. When that block holds more than SPAN_FACTOR rays per ray needed, _rows instead gathers
+    the rows where T is kept and copies only them. Both ways give the same values."""
     if torch.is_tensor(rows):
+        if T.device != dev and rows.numel():
+            lo, hi = int(rows.min()), int(rows.max()) + 1
+            if hi - lo <= SPAN_FACTOR * rows.numel():
+                return T[lo:hi].to(dev, non_blocking=True)[rows.to(dev) - lo]
         rows = rows.to(T.device)
     return T[rows].to(dev)
 
@@ -54,8 +63,8 @@ def air_rays(T, shape, excluded=None, tiles=(1, 1), device=None):
     others'), and with tiles (rows, channels) each detector tile's own (a detector made of several sensors, such as a
     2 x 2 Timepix array, has a gain per sensor), from its brightest rays: at least 1 - AIR_QUANTILE of each image (or
     tile) must be air.
-    device is where the sums are computed. None (the default) uses T's device. Give the GPU when T is kept in host
-    memory, and each chunk of rays is then copied to it."""
+    device is where the sums are computed. The default, None, uses T's device. When T is kept in host memory, the
+    caller can give a GPU, and each chunk of rays is then copied to it."""
     from scipy import ndimage as nd
     P, K = T.shape
     dev = _device(T, device)

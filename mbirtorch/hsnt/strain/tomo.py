@@ -2079,15 +2079,17 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     relative standard deviation height_sd (FitB.height_prior). dec (user 2026-11-22: elastic anisotropy): per material
     None, (alpha, beta) per reflection, or a function of the reflections' h^2 + k^2 + l^2 returning them; each
     reflection's lattice strain alpha eps + beta tr(strain) from the diffraction elastic constants (Hybrid2.set_dec);
-    it needs the strain-tensor weights. t_storage is FitB's: 'device' (the default) keeps T as it is given, and 'host'
-    keeps T in host memory during the fit. t_dtype is FitB's too: None (the default) keeps T's dtype, and 'float16'
-    stores it in float16 during the fit (not exact; FitB). With either option, T may be given in host memory (pinned
-    for fast copies). The noise measurement then copies T to the model's device in chunks, and the warm start's
-    factorization copies T to that device as its memory plan allows. Both use T as given, before any float16
-    rounding. t_prefetch is FitB's: with 'host', each pass's copies overlap its computation (the same numbers)."""
+    it needs the strain-tensor weights. t_storage is FitB's option. The default, 'device', keeps T as it is given, and
+    'host' keeps T in host memory during the fit. t_dtype is FitB's option too. The default, None, keeps T's dtype, and
+    'float16' stores T in float16 during the fit, which is not exact (see FitB). With either option, T may be given
+    in host memory, pinned for fast copies (model.pinned_empty). The noise measurement then copies T to the model's
+    device in parts, and the warm start's factorization copies T to that device as its memory plan allows. Both use
+    T as given, before any float16 rounding. t_prefetch is FitB's option as well. With 'host', it lets each pass's
+    copies overlap its computation, and the numbers stay the same."""
     from mbirtorch import hsnt
     from .model import _compute_device
-    # the device for the steps that read the whole T: None (T's own) by default, the model's device with the options
+    # The steps that read the whole T compute on t_dev. It is None (T's own device) by default, and the model's device
+    # with the options.
     t_default = t_storage == 'device' and t_dtype is None
     t_dev = None if t_default else _compute_device(device)
     t_kw = {} if t_default else dict(t_storage=t_storage, t_dtype=t_dtype, t_prefetch=t_prefetch)
@@ -2109,7 +2111,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     R = len(lattices)
     dev = str(T.device) if T.is_cuda else None   # a GPU tensor is factored on its own GPU, without a host copy
     if dev is None and t_dev is not None and t_dev.type == 'cuda':
-        dev = str(t_dev)                          # host storage: T in host memory is factored on the model's GPU
+        dev = str(t_dev)                          # With the options, T in host memory is factored on the model's GPU.
     # the counts per bin as the strain fit's likelihood counts them (the open beam over the noise dispersion), so the
     # warm start weights each bin as the fit does
     open_beam = np.broadcast_to(np.asarray(d, dtype=np.float64), (T.shape[-1],))
@@ -2210,8 +2212,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     fit0.open_beam_obs = open_beam_obs
     for _ in range(INIT_PIXEL_STEPS):
         fit0.pixel_step()
-    T_fit = fit0.T                     # T as FitB stores it (T itself by default), so the fit below makes no second copy
-    half_info = fit0.t_half_info       # the float16 rounding statistics, measured when fit0 converted T
+    T_fit = fit0.T                     # The fit below reuses the T that fit0 stores, so it makes no second copy.
+    half_info = fit0.t_half_info       # fit0 measured the float16 rounding when it converted T.
     Wr = fit0.W; del fit0
     # least-squares reconstruction of the ray maps (CGLS), clipped to >= 0
     n = proj.n; pr = proj.with_q(R)
