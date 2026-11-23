@@ -2230,3 +2230,67 @@ def test_lean_syncs_no_gpu_waits(case):
     finally:
         torch.cuda.set_sync_debug_mode('default')
     assert abs(float(tot) - ref) <= 1e-5 * abs(ref)
+
+
+def test_prolong():
+    """prolong (coarse-to-fine): factor 1 returns its input unchanged, which is the default path. Mode 'constant'
+    copies each coarse voxel into its block of fine voxels. Mode 'trilinear' reproduces a linear field at the fine
+    voxel centres between the outermost coarse centres. The weighted form keeps a strain that is constant over a
+    material's voxels constant up to the faces, where the plain form dilutes it. The weighted form also equals its
+    definition, computed from whole-tensor interpolations, where some fine voxels hold no material."""
+    from mbirtorch.hsnt.strain.tomo import prolong, PROLONG_WEIGHT_MIN
+    n, f = 6, 2
+    x = torch.rand(n, n, n, 2, 3, generator=torch.Generator().manual_seed(0))
+    for mode in ('constant', 'trilinear'):
+        assert torch.equal(prolong(x, 1, mode), x)
+        assert torch.equal(prolong(x, 1, mode, weight=torch.rand(n, n, n, 2, 1)), x)
+    xc = prolong(x, f, 'constant')
+    assert xc.shape == (f * n, f * n, f * n, 2, 3)
+    blocks = xc.reshape(n, f, n, f, n, f, 2, 3).permute(0, 2, 4, 1, 3, 5, 6, 7).reshape(n, n, n, f ** 3, 2, 3)
+    assert torch.equal(blocks, x[:, :, :, None].expand(n, n, n, f ** 3, 2, 3))
+    # a linear field at the coarse voxel centres (i + 0.5) / n, against its values at the fine centres (j + 0.5) / (f n)
+    cc = (torch.arange(n, dtype=torch.float64) + 0.5) / n; cf = (torch.arange(f * n, dtype=torch.float64) + 0.5) / (f * n)
+    lin = lambda c: 0.3 + 1.1 * c[:, None, None] - 0.7 * c[None, :, None] + 2.0 * c[None, None, :]
+    xt = prolong(lin(cc)[..., None], f, 'trilinear')[..., 0]
+    inner = slice(f // 2, f * n - f // 2)
+    assert torch.allclose(xt[inner, inner, inner], lin(cf)[inner, inner, inner], rtol=0, atol=1e-12)
+    # a constant strain in a cube of material, with zero strain and no material outside
+    V = torch.zeros(n, n, n, 1); V[1:5, 1:5, 1:5] = 1.0
+    E = torch.zeros(n, n, n, 1, 6); E[1:5, 1:5, 1:5] = 1e-3
+    own = prolong(V, f, 'trilinear') > 0
+    Ew = prolong(E, f, 'trilinear', weight=V[..., None])
+    assert torch.allclose(Ew[own], torch.full_like(Ew[own], 1e-3), rtol=1e-5, atol=0)
+    assert float(prolong(E, f, 'trilinear')[own].min()) < 0.9e-3
+    # the weighted form against its definition, with an empty slab of coarse voxels where the plain form is used
+    gen = torch.Generator().manual_seed(1)
+    xd = torch.rand(n, n, n, 2, 3, generator=gen, dtype=torch.float64)
+    wd = torch.rand(n, n, n, 2, 1, generator=gen, dtype=torch.float64); wd[:2] = 0
+    for mode in ('constant', 'trilinear'):
+        den = prolong(wd, f, mode)
+        ref = torch.where(den > PROLONG_WEIGHT_MIN, prolong(wd * xd, f, mode) / den.clamp_min(PROLONG_WEIGHT_MIN),
+                          prolong(xd, f, mode))
+        assert bool((den <= PROLONG_WEIGHT_MIN).any())
+        assert torch.allclose(prolong(xd, f, mode, weight=wd), ref, rtol=1e-12, atol=0)
+    assert prolong(torch.zeros(0, n, n, 2), f).shape == (0, f * n, f * n, 2)
+    for bad in (dict(factor=1.5), dict(factor=f, mode='cubic'), dict(factor=f, weight=V),
+                dict(factor=f, weight=torch.ones(n, n, n, 2, 1))):
+        with pytest.raises(ValueError):
+            prolong(E, **bad)
+
+
+def test_prolong_projections():
+    """A coarse volume copied into blocks (prolong 'constant') and projected on a detector f times finer, then averaged
+    over f x f detector blocks, gives f times the coarse projection, because each projector measures lengths in its own
+    pixels. The match is exact at views along the grid's axes (0 and 90 degrees), where each voxel's shadow covers
+    whole detector pixels. The coarse-to-fine continuation relies on this when it divides each spectrum by f."""
+    from mbirtorch.hsnt.strain.tomo import prolong
+    n, f = 6, 2
+    ang = np.array([0.0, np.pi / 2])
+    series = [(((0, 1, 2), (1, 1, 1), (0.0, 0.0, 0.0)), ang), (((1, 2, 0), (1, 1, 1), (0.0, 0.0, 0.0)), ang)]
+    cp = MultiProjector(n, series, 1, channel_offsets=[0.0, 0.0], ror_mask=False)
+    fp = MultiProjector(f * n, series, 1, channel_offsets=[0.0, 0.0], ror_mask=False)
+    xc = torch.rand(n, n, n, 1, generator=torch.Generator().manual_seed(3))
+    pc = cp.fwd(xc).cpu()
+    pf = fp.fwd(prolong(xc, f, 'constant')).cpu()
+    pb = pf.reshape(cp.V, n, f, n, f, 1).mean((2, 4)).reshape(-1, 1)
+    assert torch.allclose(pb, f * pc, rtol=1e-5, atol=1e-5 * float(pc.abs().max()))
