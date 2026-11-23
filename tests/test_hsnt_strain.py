@@ -2307,7 +2307,20 @@ BAND_TEST_ATTENUATION = 3.0    # The rays' attenuation reaches up to this value,
 BAND_ERROR_RATIO = 2.0         # The 3xtf32 product's errors are at most this many times the float32 product's.
 TF32_ERROR_RATIO = 10.0        # One TF32 product's errors are at least this many times the float32 product's.
 BAND_FIT_RTOL = 1e-5           # In test_band_3xtf32_fit, a pass over the chunks matches data_loss to this tolerance.
+# In test_band_3xtf32_fit, the 3xtf32 fit's data loss differs from the float64 twin's by at most this many float32
+# epsilons times the root sum of squares of the counts d T. The float32 deviance terms round at about that size.
+FIT_LOSS_ROUNDING = 8.0
+# In test_band_3xtf32_fit, each error is compared with the larger of the default's error and this many float32
+# epsilons. The floor keeps short vectors, such as the global gradient, from failing on rounding alone.
+FIT_ERROR_FLOOR = 64.0
 TF32_TEST_DECADES = 20         # test_tf32_split draws values over this many decades on either side of 1.
+TF32_TEST_SHAPE = (64, 33)     # test_tf32_split splits a matrix of this shape.
+TF32_TEST_WIDTH = 36           # test_tf32_split also pads each half of the split to this many columns.
+# test_mm_3xtf32_padding multiplies a matrix with TF32_SPLIT_ROWS plus this many rows, so that the split takes two
+# blocks of rows, by a matrix of MM_TEST_SIZES (inner, outer). Neither size is a multiple of TF32_ALIGN.
+MM_TEST_EXTRA_ROWS = 5
+MM_TEST_SIZES = (101, 53)
+TF32_NO_PADDING = 1            # With TF32_ALIGN at this value, _mm_3xtf32 pads no rows.
 
 
 def _band_test_case(kernel):
@@ -2391,11 +2404,12 @@ def test_band_3xtf32_accuracy(kernel):
 def test_tf32_split():
     """_tf32_pair splits a float32 matrix x into [hi | lo]. Both halves have their low TF32_DROPPED_BITS mantissa bits
     clear. hi is the nearest TF32 number to x, within half a TF32 step, and hi + lo equals x within half a step of
-    half a step. Zeros of either sign and values over many magnitudes are checked. On a GPU, the compiled split
-    (_tf32_pair_kernel) gives the same bits as the plain one, also for a transposed input."""
+    half a step. Zeros of either sign and values over many magnitudes are checked. With a width, each half is followed
+    by zero columns up to that width. On a GPU, the compiled split (_tf32_pair_kernel) gives the same bits as the plain
+    one, also for a transposed input and with a width."""
     from mbirtorch.hsnt.strain.model import _tf32_pair, _tf32_pair_kernel, TF32_DROPPED_BITS
     gen = torch.Generator().manual_seed(8)
-    shape = (64, 33)
+    shape = TF32_TEST_SHAPE
     x = (torch.randn(shape, generator=gen, dtype=torch.float64)
          * 10.0 ** torch.randint(-TF32_TEST_DECADES, TF32_TEST_DECADES + 1, shape, generator=gen)).float()
     x[0, :2] = torch.tensor([0.0, -0.0])
@@ -2409,10 +2423,46 @@ def test_tf32_split():
     xd, hd, ld = x.double(), hi.double(), lo.double()
     assert bool(((xd - hd).abs() <= half * xd.abs()).all())
     assert bool(((xd - hd - ld).abs() <= half * half * xd.abs()).all())
+    w = TF32_TEST_WIDTH
+    pw = _tf32_pair(x, w)
+    assert pw.shape == (shape[0], 2 * w)
+    assert torch.equal(pw[:, :k], hi) and torch.equal(pw[:, w:w + k], lo)
+    assert not pw[:, k:w].any() and not pw[:, w + k:].any()
     if torch.cuda.is_available():
         xc = x.cuda()
         assert torch.equal(_tf32_pair_kernel(True)(xc).cpu(), p)
         assert torch.equal(_tf32_pair_kernel(True)(xc.T).cpu(), _tf32_pair(x.T.contiguous()))
+        assert torch.equal(_tf32_pair_kernel(True)(xc, w).cpu(), pw)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='the check needs a GPU')
+def test_mm_3xtf32_padding(monkeypatch):
+    """_mm_3xtf32 pads its factors with zeros to rows of a multiple of TF32_ALIGN numbers. The sizes here are not
+    multiples of TF32_ALIGN, and the rows take two blocks of the split. The result has the right shape, and its largest
+    relative error against a float64 product is at most BAND_ERROR_RATIO times the float32 product's. This holds with
+    the padding and without it (TF32_NO_PADDING). The band product _band_3xtf32 returns a contiguous result."""
+    import mbirtorch.hsnt.strain.model as model
+    gen = torch.Generator().manual_seed(10)
+    rows, (inner, outer) = model.TF32_SPLIT_ROWS + MM_TEST_EXTRA_ROWS, MM_TEST_SIZES
+    assert inner % model.TF32_ALIGN and outer % model.TF32_ALIGN
+    A = torch.rand(rows, inner, generator=gen).cuda()
+    B = torch.rand(inner, outer, generator=gen).cuda()
+    ref = A.double() @ B.double()
+    matmul = torch.backends.cuda.matmul
+    before = matmul.allow_tf32
+    try:
+        matmul.allow_tf32 = False
+        e32 = _errors(A @ B, ref)[0]
+        for align in (model.TF32_ALIGN, TF32_NO_PADDING):
+            monkeypatch.setattr(model, 'TF32_ALIGN', align)
+            x3 = model._mm_3xtf32(A, B)
+            band = model._band_3xtf32(A, B.T)
+            assert x3.shape == band.shape == (rows, outer) and band.is_contiguous()
+            assert matmul.allow_tf32 is False
+            e3 = max(_errors(x, ref)[0] for x in (x3, band))
+            assert e3 <= BAND_ERROR_RATIO * e32, ('TF32_ALIGN', align, '3xtf32', e3, 'float32', e32)
+    finally:
+        matmul.allow_tf32 = before
 
 
 def test_band_precision_option():
@@ -2446,10 +2496,14 @@ def test_band_precision_option():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='the check needs a GPU')
 def test_band_3xtf32_fit():
     """A float32 fit on the GPU is as accurate with band_precision '3xtf32' as with the default. A float64 twin of the
-    fit, with the same data, maps and strains, gives the reference. The data loss, the ray systems, the global gradient
-    and the global system differ from the twin's by at most BAND_ERROR_RATIO times the default's differences, relative
-    to each quantity's largest value. The global system includes the resolution kernel, whose band derivatives have
-    both signs. With lean_syncs, a pass of the data loss with '3xtf32' does not wait for the GPU."""
+    fit, with the same data, maps and strains, gives the reference. The ray systems, the global gradient and the global
+    system differ from the twin's by at most BAND_ERROR_RATIO times the default's differences, relative to each
+    quantity's largest value. Differences below FIT_ERROR_FLOOR float32 epsilons count as that floor. The global system
+    includes the resolution kernel, whose band derivatives have both signs. The data loss differs from the twin's by at
+    most the float32 rounding of its terms (FIT_LOSS_ROUNDING). The loss is one number, and its rounding is not
+    caused by the band product, so it is not compared with the default's difference. The data loss remembered before
+    the option is set is not used after it. With lean_syncs, a pass of the data loss with '3xtf32' does not wait for
+    the GPU."""
     fit = _lean_fit('views', torch.float32, device='cuda')
     twin = _lean_fit('views', torch.float64, device='cuda')
     twin.T, twin.W, twin.eps, twin.eps_sd = (x.double() for x in (fit.T, fit.W, fit.eps, fit.eps_sd))
@@ -2459,7 +2513,7 @@ def test_band_3xtf32_fit():
 
     def outputs(f):
         f.use_memo = False
-        out = {'loss': torch.tensor(f.data_loss())}
+        out = {'loss': torch.tensor(f.data_loss(), dtype=torch.float64)}
         cache = f._state(f.g)
         with torch.no_grad():
             G, F = zip(*[f.ray_system(s, cache) for s in f.chunks()])
@@ -2469,13 +2523,23 @@ def test_band_3xtf32_fit():
         return {k: v.double() for k, v in out.items()}
     ref = outputs(twin)
     f32 = outputs(fit)
+    fit.use_memo = True
+    fit.remember_data_loss(f32['loss'])
+    assert fit.recall_data_loss() == float(f32['loss'])
     M.band_precision = '3xtf32'
+    assert fit.recall_data_loss() is None                         # the remembered loss was taken in float32
     x3 = outputs(fit)
     assert not torch.equal(x3['G'], f32['G'])                     # the option changed the band products
+    eps32 = torch.finfo(torch.float32).eps
     for key in ref:
+        if key == 'loss':
+            continue
         scale = float(ref[key].abs().max())
         e32, e3 = (float((x[key] - ref[key]).abs().max()) / scale for x in (f32, x3))
-        assert e3 <= BAND_ERROR_RATIO * e32, (key, '3xtf32', e3, 'float32', e32)
+        assert e3 <= BAND_ERROR_RATIO * max(e32, FIT_ERROR_FLOOR * eps32), (key, '3xtf32', e3, 'float32', e32)
+    counts = sum(float((fit.dose(s) * fit.T_chunk(s)).double().pow(2).sum()) for s in fit.chunks()) ** 0.5
+    e32, e3 = (abs(float(x['loss'] - ref['loss'])) for x in (f32, x3))
+    assert e3 <= FIT_LOSS_ROUNDING * eps32 * counts, ('loss', '3xtf32', e3, 'float32', e32, 'counts', counts)
     fit.lean_syncs = True
     cache = fit._state(fit.g)
     loss = fit.data_loss()                      # this pass works out the plan and compiles the windowed sum

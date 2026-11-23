@@ -170,6 +170,9 @@ TF32_HALF_STEP = 1 << (TF32_DROPPED_BITS - 1)
 TF32_MASK = -(1 << TF32_DROPPED_BITS)    # This int32 clears the low TF32_DROPPED_BITS bits and keeps the others.
 TF32_SPLIT_ROWS = 32768      # The 3xtf32 product splits this many rows of its left factor at a time.
 TF32_SPLIT_COMPILE = True    # On a GPU, the 3xtf32 product splits its factors with one compiled kernel.
+# The 3xtf32 product pads the rows of its factors and of its result with zeros to a multiple of this many float32
+# numbers (16 bytes). The fastest TF32 kernels of a Hopper GPU need rows that start on 16-byte boundaries.
+TF32_ALIGN = 4
 
 
 def half_rounding(T, d):
@@ -366,12 +369,18 @@ def _tf32_round(x):
     return ((x.view(torch.int32) + TF32_HALF_STEP) & TF32_MASK).view(torch.float32)
 
 
-def _tf32_pair(x):
+def _tf32_pair(x, width=None):
     """Returns [hi | lo] (rows, 2 cols) for a float32 matrix x (rows, cols). hi is x rounded to TF32 (_tf32_round). lo
     is the remainder x - hi, which float32 holds exactly, rounded to TF32. Both are exact TF32 numbers, and hi + lo
-    equals x to 2^-22 of |x|."""
+    equals x to 2^-22 of |x|. With width (at least cols), zero columns fill each half to width columns, and the result
+    is (rows, 2 width)."""
     hi = _tf32_round(x)
-    return torch.cat([hi, _tf32_round(x - hi)], 1)
+    lo = _tf32_round(x - hi)
+    pad = 0 if width is None else width - x.shape[1]
+    if pad:
+        hi = torch.nn.functional.pad(hi, (0, pad))
+        lo = torch.nn.functional.pad(lo, (0, pad))
+    return torch.cat([hi, lo], 1)
 
 
 _tf32_pair_compiled = None
@@ -408,21 +417,24 @@ def _mm_3xtf32(A, B, fused=True):
     [hi_A | lo_A] and [lo_B; hi_B] gives the two small terms, and a second product adds hi_A hi_B to them. TF32 is
     enabled for these two products alone (_tf32_products). The split takes TF32_SPLIT_ROWS rows of A at a time, so it
     needs at most twice the memory of that many rows. fused says whether the split may use the compiled kernel
-    (_tf32_pair_kernel)."""
-    k = A.shape[1]
+    (_tf32_pair_kernel). The factors are padded with zeros to rows of a multiple of TF32_ALIGN numbers, and the zeros
+    add nothing to the result. When n is not a multiple of TF32_ALIGN, the result is a view whose rows are padded."""
+    (m, k), n = A.shape, B.shape[1]
+    k_pad, n_pad = (-(-x // TF32_ALIGN) * TF32_ALIGN for x in (k, n))    # k and n rounded up to multiples of TF32_ALIGN
     split = _tf32_pair_kernel(fused)
     with torch.no_grad():
-        Bp = split(B.detach().T)                                   # (n, 2k): [hi | lo] of B's columns
-        B_hi = Bp[:, :k].T                                         # (k, n)
-        B_swap = torch.cat([Bp[:, k:], Bp[:, :k]], 1).T            # (2k, n): lo_B above hi_B
-        out = torch.empty(A.shape[0], B.shape[1], dtype=torch.float32, device=A.device)
-        for i in range(0, A.shape[0], TF32_SPLIT_ROWS):
-            Ap = split(A.detach()[i:i + TF32_SPLIT_ROWS])          # (rows, 2k): [hi | lo] of A's rows
+        Bp = split(B.detach().T, k_pad)                                    # (n, 2 k_pad): [hi | lo] of B's columns
+        Bp = torch.nn.functional.pad(Bp, (0, 0, 0, n_pad - n))             # (n_pad, 2 k_pad): zero rows below
+        B_hi = Bp[:, :k_pad].T                                             # (k_pad, n_pad)
+        B_swap = torch.cat([Bp[:, k_pad:], Bp[:, :k_pad]], 1).T            # (2 k_pad, n_pad): lo_B above hi_B
+        out = torch.empty(m, n_pad, dtype=torch.float32, device=A.device)
+        for i in range(0, m, TF32_SPLIT_ROWS):
+            Ap = split(A.detach()[i:i + TF32_SPLIT_ROWS], k_pad)           # (rows, 2 k_pad): [hi | lo] of A's rows
             o = out[i:i + TF32_SPLIT_ROWS]
             with _tf32_products():
-                torch.mm(Ap, B_swap, out=o)                        # hi_A lo_B + lo_A hi_B
-                o.addmm_(Ap[:, :k], B_hi)                          # plus hi_A hi_B
-    return out
+                torch.mm(Ap, B_swap, out=o)                                # hi_A lo_B + lo_A hi_B
+                o.addmm_(Ap[:, :k_pad], B_hi)                              # plus hi_A hi_B
+    return out if n_pad == n else out[:, :n]
 
 
 class _Band3xTF32(torch.autograd.Function):
@@ -432,7 +444,7 @@ class _Band3xTF32(torch.autograd.Function):
     @staticmethod
     def forward(ctx, E, St):
         ctx.save_for_backward(E, St)
-        return _mm_3xtf32(E, St)
+        return _mm_3xtf32(E, St).contiguous()          # apply_band's callers get a contiguous result
 
     @staticmethod
     @once_differentiable
@@ -455,11 +467,12 @@ def _band_3xtf32_applies(E, S):
 
 def _band_3xtf32(E, S):
     """Returns E @ S.T by three TF32 products (_mm_3xtf32), for E (Pc, Kf) in float32 on a GPU and the dense band S
-    (K, Kf). Under automatic differentiation, the derivative with respect to E uses three TF32 products too."""
+    (K, Kf). Under automatic differentiation, the derivative with respect to E uses three TF32 products too. The result
+    is contiguous."""
     St = S.T.to(torch.float32)
     if torch.is_grad_enabled() and (E.requires_grad or St.requires_grad):
         return _Band3xTF32.apply(E, St)
-    return _mm_3xtf32(E, St)
+    return _mm_3xtf32(E, St).contiguous()
 
 
 def deviance_terms(m, T, d, open_beam_obs=None):
@@ -1792,8 +1805,11 @@ class FitB:
     # tied to the state's tensors and their version counters, so any change to them makes it stale.
     def _state_key(self):
         tex = tuple(self.tex_Q) if self.tex_Q is not None else (None,)     # the texture's ray weights change the loss too
+        # A change of Hybrid2.band_precision changes the loss's rounding, so the precision is part of the state too.
+        precision = (getattr(self.M, "band_precision", None),)
         return tuple((t, t._version if torch.is_tensor(t) else None)
-                     for t in (self.g, self.W, self.eps, self.f) + self._data_tensors() + (self.ray_weight,) + tex)
+                     for t in (self.g, self.W, self.eps, self.f) + self._data_tensors() + (self.ray_weight,) + tex
+                     + precision)
 
     def remember_data_loss(self, value):
         """Record value as the data loss (the deviance, no penalties) at the current state."""
