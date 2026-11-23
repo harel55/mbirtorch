@@ -1918,3 +1918,315 @@ def test_host_prefetch():
         busy = torch.tanh(busy @ busy)
     torch.cuda.synchronize()
     assert torch.equal(torch.cat(got).cpu(), torch.cat([Tbig, Tbig]))
+
+
+def _lean_fit(case, dtype, seed=7, device='cpu'):
+    """Returns a small FitB for the lean_syncs checks. It has one bcc material, three chunks of rays and eight views.
+    Each view has five rays, so that chunks see different views. The rays have strains with a spread along the beam,
+    and the counts come from the model. case is 'powder', 'views' (a global cubic4 texture), 'field' (a texture field),
+    'anisotropic' (elastic anisotropy, a global texture and a free edge slope) or 'floor' (a global texture that brings
+    view 0, and so the first chunk, to CUBIC4_FLOOR). The cases 'field' and 'anisotropic' have a nonzero edge slope t.
+    device is where the fit's arrays live."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4, CUBIC4_FLOOR, P4_MIN
+    lam = np.linspace(1.6, 4.4, 400)
+    nb = 2 if case == 'field' else 1
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device=device, dtype=dtype, shape_model=None if case == 'powder' else 'cubic4', texture_basis=nb,
+                edge_slope=case == 'anisotropic')
+    gen = torch.Generator().manual_seed(seed)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]; ne = sl['h'][1] - sl['h'][0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3 + 0.1 * torch.rand(ne, generator=gen, dtype=torch.float64)
+    g[sl['c'][0]] = 0.2
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    if case in ('field', 'anisotropic'):
+        g[sl['t'][0]:sl['t'][1]] = torch.linspace(-0.2, 0.3, ne, dtype=torch.float64)      # a nonzero edge slope
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    if case != 'powder':
+        g[sl['x'][0]:sl['x'][1]] = 0.05 * torch.randn(sl['x'][1] - sl['x'][0], generator=gen, dtype=torch.float64)
+    if case == 'floor':
+        # a texture whose term is -3 in view 0 and small in the other views: the 200 reflection (k4 = 0.4) of view 0
+        # reaches the floor, so the first chunk takes the dense sum and the other chunks the windowed sum
+        Y = harmonics4(torch.as_tensor(M.view_dirs))                                    # (8 views, 9)
+        target = torch.tensor([-3.0, 0.1, 0.2, -0.1, 0.0, 0.1, -0.2, 0.3], dtype=torch.float64)
+        c = torch.linalg.pinv(Y) @ target
+        g[sl['x'][0]:sl['x'][1]] = c
+        kA = M.mats[0]['k4'].cpu()[None, :] * (Y @ c)[:, None]
+        hit = ((1 + torch.minimum(kA * P4_MIN, kA)) <= CUBIC4_FLOOR).any(1)
+        assert hit.tolist() == [True] + [False] * 7
+    P = 40
+    W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
+    eps = 1e-3 * torch.randn(P, 2 if case == 'anisotropic' else 1, generator=gen, dtype=torch.float64)
+    if case == 'anisotropic':
+        M.set_dec(0, 0.8 + 0.4 * torch.rand(ne, generator=gen, dtype=torch.float64), 0.05 * torch.randn(ne, generator=gen, dtype=torch.float64))
+    kw = dict(dtype=dtype, device=device)
+    fit = FitB(M, torch.ones(P, M.K, **kw), g.to(device), W.to(**kw), torch.zeros(1, M.K, **kw), eps=eps.to(**kw),
+               chunk=16)
+    fit.ray_view = (torch.arange(P) // 5).to(device)
+    fit.eps_sd = (3e-4 * torch.rand(P, 1, generator=gen, dtype=torch.float64)).to(**kw)
+    if case == 'field':
+        q = torch.rand(P, generator=gen, dtype=torch.float64)
+        fit.tex_Q = [torch.stack([q, 1 - q], 1).to(**kw)]
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m.double().cpu(), generator=gen).to(**kw) / 50.0
+    return fit
+
+
+def _pixel_step_result(fit):
+    """Runs one pixel_step and returns the new maps, the new strains and the number of window extents that the step
+    computed (Hybrid2.window_extent). The fit's maps and strains are then set back to their values before the step."""
+    M = fit.M
+    W0, e0 = fit.W.clone(), fit.eps.clone()
+    calls = []
+    extent = M.window_extent
+    M.window_extent = lambda *a, **k: calls.append(1) or extent(*a, **k)
+    try:
+        fit.pixel_step()
+    finally:
+        del M.window_extent
+    out = (fit.W.clone(), fit.eps.clone(), len(calls))
+    fit.W, fit.eps = W0, e0
+    return out
+
+
+def _lean_outputs(fit):
+    """Returns the quantities that the lean_syncs option touches, at the fit's current state."""
+    M = fit.M
+    out = {}
+    cache = fit._state(fit.g)
+    out['mu'], out['band'], out['kappa'] = cache
+    fit.use_memo = False
+    loss = fit.data_loss()
+    assert isinstance(loss, float)
+    out['loss'] = torch.tensor(loss)
+    eps2 = fit.eps * 1.3
+    out['loss_eps'] = torch.tensor(fit.data_loss(eps=eps2))
+    with torch.no_grad():
+        out['mean'] = torch.cat([fit.mean(s, cache=cache)[0] for s in fit.chunks()])
+        out['ray_loss'] = torch.cat([fit.ray_loss(s, fit.W[s], eps2[s], cache, eps_all=eps2) for s in fit.chunks()])
+        G, F, dev = [], [], []
+        for s in fit.chunks():
+            g_, f_ = fit.ray_system(s, cache, deviance=dev)
+            G.append(g_); F.append(f_)
+    out['G'], out['F'], out['dev'] = torch.cat(G), torch.cat(F), torch.tensor(sum(float(v) for v in dev))
+    idx = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i]) and not (M.res_sl[0] <= i < M.res_sl[1])]
+    out['gs_grad'], out['gs_F'] = fit.global_system(idx)
+    out['gg'] = fit.global_grad(idx)
+    full = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]
+    out['gs_grad_kernel'], out['gs_F_kernel'] = fit.global_system(full)
+    # the contamination's passes: a trial loss, and the Pearson dispersion and thresholds of a step (state restored)
+    fit.build_atoms()
+    out['loss_c'] = torch.tensor(fit.loss_c_data(0.01 * torch.ones_like(fit.c)))
+    f0, lam0, disp0 = fit.f.clone(), fit.lam1.clone(), fit.dispersion
+    fit.contamination_step()
+    assert isinstance(fit.dispersion, float)
+    out['dispersion'], out['lam1'] = torch.tensor(fit.dispersion), fit.lam1.clone()
+    fit.f, fit.lam1, fit.dispersion = f0, lam0, disp0
+    g0 = fit.g.clone()
+    with torch.no_grad():
+        out['lattice'] = torch.tensor(fit.lattice_search(0, half_width=0.002))
+    fit.g = g0
+    return out
+
+
+@pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic', 'floor'])
+@pytest.mark.parametrize('dtype', [torch.float64, torch.float32])
+def test_lean_syncs_matches_default(case, dtype):
+    """FitB.lean_syncs (the band kept between passes, one window width and one cubic4 floor decision per pass) gives the
+    default path's spectra, losses, ray systems, global systems, global gradient and lattice search, to rounding. A
+    pass's window width holds every chunk's own window, in single and in double precision. With 'floor', some chunks
+    take the dense sum and others the windowed sum, as on the default path. A pixel_step works out one window width for
+    the whole step, and in double precision it gives the default path's maps and strains."""
+    from mbirtorch.hsnt.strain.model import WINDOW_BUCKET
+    fit = _lean_fit(case, dtype)
+    M = fit.M
+    ref = _lean_outputs(fit)
+    fit.lean_syncs = True
+    got = _lean_outputs(fit)
+    tol = 1e-12 if dtype == torch.float64 else 1e-6
+    for k in ref:
+        a, b = ref[k].double(), got[k].double()
+        assert torch.allclose(a, b, rtol=tol, atol=tol * float(a.abs().max())), k
+    # the pass's width against each chunk's own, with the strains in either precision
+    widths = fit._window_widths(fit.g, fit.eps)
+    assert all(w % WINDOW_BUCKET == 0 for w in widths)
+    for s in fit.chunks():
+        for e_ in (fit.eps[s], fit.eps[s].double()):
+            lo, hi, wd = M.window_extent(fit.g, 0, e_, fit.eps_sd[s])
+            assert int(M.window_width(lo, hi, wd)) <= widths[0]
+    if case == 'floor':
+        floors = [fit.window_plan(s, fit.g, fit.eps)[0].floor for s in fit.chunks()]
+        assert floors == [True, False, False]
+    # pixel_step writes each chunk's new strains into fit.eps. With lean_syncs, it still works out the window width once
+    # for the whole step, which is one window extent per chunk and material. pixel_step fits the strain along the beam
+    # alone, so the case with traces ('anisotropic') is left out.
+    if case != 'anisotropic':
+        fit.lean_syncs = False
+        W_ref, e_ref, _ = _pixel_step_result(fit)
+        fit.lean_syncs = True
+        W_got, e_got, n_extents = _pixel_step_result(fit)
+        assert n_extents == len(fit.chunks()) * M.R
+        assert not torch.equal(e_ref, fit.eps)                                         # the step moved the strains
+        if dtype == torch.float64:
+            assert _close(W_got, W_ref, 1e-9) and _close(e_got, e_ref, 1e-9)
+    # the band is built again only when the resolution kernel's values change
+    built = []
+    band = M.band
+    M.band = lambda g_: built.append(1) or band(g_)
+    fit.data_loss(); fit.data_loss()
+    assert built == []
+    fit.lean_syncs = False
+    fit.data_loss()
+    del M.band
+    assert built == [1]
+
+
+def test_lean_syncs_volume_step():
+    """A tomographic fit with several chunks of rays and a strain spread along the beam, with FitB.lean_syncs, with
+    FitB.closed_form_strain and with both: each gives the default path's data loss at a trial state (to rounding), and
+    a volume step that lowers the objective as much."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    dev = pr.fwd(torch.zeros(N, N, N, 2)).device
+    lam = np.linspace(2.0, 4.4, 80)
+    M = Hybrid2(lam, np.full_like(lam, 200.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
+                device=dev)
+    g = torch.zeros(M.n_global, dtype=torch.float64, device=dev); s = M.slices[0]
+    g[s['a']] = 2.8665; g[s['h'][0]:s['h'][1]] = 0.3; g[s['c'][0]] = 0.2
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64,
+                                              device=dev)
+    P = sum(pr.counts); kw = dict(device=dev)
+    V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
+    E_true = 1.5e-3 * torch.randn(N, N, N, 1, 1, generator=torch.Generator().manual_seed(6)).to(dev) * (V[..., None] > 0)
+
+    def run(lean, closed=False):
+        fit = FitB(M, torch.ones(P, M.K, **kw), g, torch.ones(P, 1, **kw), torch.zeros(1, M.K, **kw),
+                   eps=torch.zeros(P, 1, **kw), chunk=512)
+        tf = TomoFit(fit, pr, V.clone(), E_true.clone()); tf.sync(); tf.edge_spread = True; tf.refresh_spread()
+        with torch.no_grad():
+            fit.T = torch.cat([fit.mean(c)[0] for c in fit.chunks()])              # noiseless data at the truth
+        fit.lean_syncs = lean; fit.closed_form_strain = closed
+        tf.E = 0.5 * E_true; tf.sync(); tf.refresh_spread()                         # the spread at the start
+        trial = tf.data_loss(V, 0.8 * E_true)
+        l0 = tf.loss(); tf.volume_step(); l1 = tf.loss()                           # data + prior
+        assert isinstance(trial, float)
+        return trial, l0, l1
+    assert len(range(0, P, 512)) > 1                                                 # several chunks
+    ref = run(False)
+    for got in (run(True), run(False, True), run(True, True)):                       # lean, closed form, both
+        assert abs(got[0] - ref[0]) <= 1e-5 * abs(ref[0]) and abs(got[1] - ref[1]) <= 1e-5 * abs(ref[1])
+        assert got[2] < got[1] and abs(got[2] - ref[2]) <= 1e-3 * abs(ref[1])
+
+
+def _close(got, ref, tol):
+    """True when got equals ref to relative tolerance tol, with an absolute floor of tol times ref's largest value.
+    It is a check for the closed-form strain derivatives."""
+    a, b = got.double(), ref.double()
+    return torch.allclose(a, b, rtol=tol, atol=tol * float(b.abs().max()))
+
+
+@pytest.mark.parametrize('dtype', [torch.float64, torch.float32])
+def test_closed_form_strain_matches_jvp(dtype):
+    """Hybrid2.spectra_de gives the spectra and their forward-mode derivatives with respect to each ray's strain along
+    the beam and its mean trace. The check has two materials (one with elastic anisotropy), a nonzero edge slope, a
+    global cubic4 texture and a strain spread, and it runs with and without a window plan. ray_jacobian with
+    FitB.closed_form_strain equals the default path, and a chunk with a ray at CUBIC4_FLOOR falls back to forward
+    mode."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, WindowPlan, harmonics4
+    lam = np.linspace(1.6, 4.4, 400)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01)),
+                                               ('fcc', (3.6149 * 0.99, 3.6149 * 1.01))],
+                smooth_degree=5, n_contam=1, device='cpu', dtype=dtype, shape_model='cubic4')
+    gen = torch.Generator().manual_seed(11)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    for r, a0 in enumerate((2.8665, 3.6149)):
+        sl = M.slices[r]; ne = sl['h'][1] - sl['h'][0]
+        g[sl['a']] = a0; g[sl['h'][0]:sl['h'][1]] = 0.2 + 0.1 * torch.rand(ne, generator=gen, dtype=torch.float64)
+        g[sl['c'][0]] = 0.1
+        # a nonzero edge slope, of opposite signs in the two materials, so that the slope's terms are checked
+        g[sl['t'][0]:sl['t'][1]] = (1 - 2 * r) * torch.linspace(-0.2, 0.3, ne, dtype=torch.float64)
+        g[sl['x'][0]:sl['x'][1]] = 0.05 * torch.randn(9, generator=gen, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    ne0 = M.slices[0]['h'][1] - M.slices[0]['h'][0]
+    M.set_dec(0, 0.8 + 0.4 * torch.rand(ne0, generator=gen, dtype=torch.float64),
+              0.05 * torch.randn(ne0, generator=gen, dtype=torch.float64))
+    P = 40
+    eps = (1e-3 * torch.randn(P, 4, generator=gen, dtype=torch.float64)).to(dtype)    # strains (R), mean traces (R)
+    sd = (3e-4 * torch.rand(P, 2, generator=gen, dtype=torch.float64)).to(dtype)
+    views = torch.arange(P) // 5
+    tol = 1e-9 if dtype == torch.float64 else 1e-4
+    for plan in (None, [WindowPlan(64, False), WindowPlan(64, False)]):
+        for r in range(2):
+            mu, d_eps, d_tau = M.spectra_de(g, eps, r, views, sd, plan=plan)
+            ok = {'mu': _close(mu, M.spectra(g, eps, views, sd=sd)[:, r], tol)}
+            for col, got in ((r, d_eps), (2 + r, d_tau)):
+                tg = torch.zeros(eps.shape, dtype=torch.float64); tg[:, col] = 1
+                _, dm = torch.func.jvp(lambda e_: M.spectra(g, e_, views, sd=sd)[:, r], (eps.double(),), (tg,))
+                ok[f'column {col}'] = _close(got, dm, tol)
+            assert all(ok.values()), (r, ok)
+        assert M.spectra_de(g, eps[:, :2], 0, views, sd, plan=plan)[2] is None              # no trace columns
+    # ray_jacobian: view 0's texture brings material 0 to the floor, so the first chunk falls back to forward mode
+    Y = harmonics4(torch.as_tensor(M.view_dirs))
+    x0, x1 = M.slices[0]['x']
+    g[x0:x1] = torch.linalg.pinv(Y) @ torch.tensor([-3.0, 0.1, 0.2, -0.1, 0.0, 0.1, -0.2, 0.3], dtype=torch.float64)
+    W = (0.5 + torch.rand(P, 2, generator=gen, dtype=torch.float64)).to(dtype)
+    fit = FitB(M, torch.ones(P, M.K, dtype=dtype), g, W, torch.zeros(1, M.K, dtype=dtype), eps=eps, chunk=16)
+    fit.ray_view = views; fit.eps_sd = sd
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m.double(), generator=gen).to(dtype) / 50.0
+    for lean in (False, True):
+        fit.lean_syncs = lean; fit.closed_form_strain = False
+        cache = fit._state(fit.g)
+        with torch.no_grad():
+            ref = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+            fit.closed_form_strain = True
+            got = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+            assert [fit._ray_jacobian_closed(s, cache) is None for s in fit.chunks()] == [True, False, False]
+        for (J0, m0), (J1, m1) in zip(ref, got):
+            assert J1.shape == J0.shape == (J0.shape[0], M.K, 6)
+            assert _close(J1, J0, tol) and _close(m1, m0, tol)
+
+
+@pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic'])
+def test_closed_form_strain_ray_jacobian(case):
+    """ray_jacobian with FitB.closed_form_strain equals the default path for a powder, a global texture, a texture
+    field and elastic anisotropy, with and without lean_syncs. The texture field and the anisotropic case have a
+    nonzero edge slope."""
+    fit = _lean_fit(case, torch.float64)
+    for lean in (False, True):
+        fit.lean_syncs = lean; fit.closed_form_strain = False
+        cache = fit._state(fit.g)
+        with torch.no_grad():
+            ref = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+            fit.closed_form_strain = True
+            got = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+        for (J0, m0), (J1, m1) in zip(ref, got):
+            assert _close(J1, J0, 1e-9) and _close(m1, m0, 1e-9)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='the check needs a GPU')
+@pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic'])
+def test_lean_syncs_no_gpu_waits(case):
+    """With FitB.lean_syncs, a pass of the data loss over the chunks of rays does not wait for the GPU once the pass's
+    window widths and cubic4 floor decisions are known. torch.cuda.set_sync_debug_mode makes any wait raise an error.
+    The pass gives the same loss as data_loss."""
+    fit = _lean_fit(case, torch.float32, device='cuda')
+    fit.lean_syncs = True; fit.use_memo = False
+    cache = fit._state(fit.g)
+    ref = fit.data_loss()                       # this pass works out the plan and compiles the windowed sum
+    fit.data_loss()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode('error')
+    try:
+        with torch.no_grad():
+            tot = 0.0
+            for s in fit.chunks():
+                m = fit.mean(s, cache=cache)[0]
+                tot += fit._chunk_total(fit.deviance_terms(s, m, fit.T[s]).sum(dtype=torch.float64))
+    finally:
+        torch.cuda.set_sync_debug_mode('default')
+    assert abs(float(tot) - ref) <= 1e-5 * abs(ref)

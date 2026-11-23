@@ -1391,8 +1391,8 @@ class TomoFit:
         cache = self.fit._state(self.fit.g); tot = 0.0
         with torch.no_grad():
             for sl in self.fit.chunks():
-                tot += float(self.fit.ray_loss(sl, W[sl], eps[sl], cache).sum())
-        return all_sum_float(tot, V.device)
+                tot += self.fit._chunk_total(self.fit.ray_loss(sl, W[sl], eps[sl], cache, eps_all=eps).sum())
+        return all_sum_float(float(tot), V.device)
 
     def loss(self, V=None, E=None, mask=None):
         return self.data_loss(V, E) + self.prior(self.V if V is None else V, self.E if E is None else E, mask)
@@ -1413,7 +1413,7 @@ class TomoFit:
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
-        fit.remember_data_loss(all_sum_float(sum(devs), fit.device))          # the deviance at this synced state
+        fit.remember_data_loss(all_sum_float(float(sum(devs)), fit.device))     # the deviance at this synced state
         G, F = G.float(), F.float()
         Ffull, F = F, F[:, :2 * R, :2 * R].contiguous()            # the preconditioners use the (W, U) part
         gT = G[:, 2 * R:] if self.anisotropic else None
