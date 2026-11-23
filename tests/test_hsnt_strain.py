@@ -2687,3 +2687,101 @@ def test_lean_passes_mount_and_view_steps():
         assert g_ <= max(LEAN_NOISE_MARGIN * n_, floor), (got, noise)
     assert ref[0] == again[0]
     assert all(abs(p_lean - (p_ref - 1.0)) < 1e-9 for p_ref, p_lean in zip(ref[0], lean[0])), (ref[0], lean[0])
+
+
+ONE_MODEL_RTOL = 1e-5            # one_model_views against a model per view: the largest difference relative to the largest
+                                 # value, and the adjoint identity's relative error
+ONE_MODEL_SEED = 20261123        # the random volumes, rays and per-view offsets of the one_model_views tests
+ONE_MODEL_OFFSET = 0.5           # each view's own channel offset is uniform between -ONE_MODEL_OFFSET and ONE_MODEL_OFFSET
+ONE_MODEL_ROW_OFFSET = 0.3       # the detector row offset of the one_model_views tests (a fractional shift along the axis)
+ONE_MODEL_CHANNEL_OFFSET = 0.25  # the projector's own channel offset in test_one_model_views
+ONE_MODEL_MOUNT_SHIFT = (2.6, -0.45, 0.35)   # a new mount shift (voxels) with fractional parts, set in place
+
+
+def _max_rel(a, b):
+    """The largest difference between a and b, relative to the largest magnitude of b."""
+    a, b = torch.as_tensor(a).double().cpu(), torch.as_tensor(b).double().cpu()
+    return float((a - b).abs().max() / b.abs().max())
+
+
+def test_view_offset_model(any_device):
+    """MultiAxisModelWithViewOffsets, one model whose views each have their own channel offset, projects and back
+    projects like one MultiAxisParallelModel per view, to float32 rounding. On the CPU it runs the package's torch code,
+    and on a GPU the Triton kernels. Its back projection is the adjoint of its projection."""
+    import mbirtorch
+    from mbirtorch.hsnt.strain.tomo import MultiAxisModelWithViewOffsets
+    rng = np.random.default_rng(ONE_MODEL_SEED)
+    views, rows, channels = 6, 10, 9
+    az = np.linspace(0, np.pi, views, endpoint=False)
+    offsets = rng.uniform(-ONE_MODEL_OFFSET, ONE_MODEL_OFFSET, views)
+    one = MultiAxisModelWithViewOffsets((views, rows, channels), np.stack([az, np.zeros(views), offsets], 1))
+    per = [mbirtorch.MultiAxisParallelModel((1, rows, channels), np.array([[a, 0.0]]), compile_mode='off') for a in az]
+    for m, o in zip([one] + per, [0.0] + list(offsets)):
+        m.configure_devices(devices=[any_device])
+        m.set_params(no_warning=True, verbose=0, det_channel_offset=float(o), det_row_offset=ONE_MODEL_ROW_OFFSET,
+                     use_ror_mask=False)
+    vol = rng.random(tuple(one.get_params('recon_shape'))).astype(np.float32)
+    sino = rng.random((views, rows, channels)).astype(np.float32)
+    fwd, back = np.asarray(one.forward_project(vol)), np.asarray(one.back_project(sino))
+    assert _max_rel(fwd, np.concatenate([np.asarray(m.forward_project(vol)) for m in per])) <= ONE_MODEL_RTOL
+    assert _max_rel(back, sum(np.asarray(m.back_project(sino[v:v + 1])) for v, m in enumerate(per))) <= ONE_MODEL_RTOL
+    a, b = float((fwd.astype(np.float64) * sino).sum()), float((vol.astype(np.float64) * back).sum())
+    assert abs(a - b) <= ONE_MODEL_RTOL * abs(a)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='the Triton kernels need a GPU')
+def test_view_offset_model_uses_kernels():
+    """On a GPU where the package's multiaxis Triton kernels are usable, MultiAxisModelWithViewOffsets projects with
+    them, and it keeps the attributes that the package reads from them."""
+    from mbirtorch.kernel_availability import multiaxis_back_kernel_usable, multiaxis_forward_kernel_usable
+    from mbirtorch.triton_multiaxis import _multiaxis_back_view_batch_triton, _multiaxis_forward_view_batch_triton
+    from mbirtorch.hsnt.strain.tomo import MultiAxisModelWithViewOffsets
+    views, side = 4, 6
+    m = MultiAxisModelWithViewOffsets((views, side, side), np.zeros((views, 3)))
+    m.configure_devices(devices=['cuda'])
+    if not (multiaxis_forward_kernel_usable(m)[0] and multiaxis_back_kernel_usable(m)[0]):
+        pytest.skip('the multiaxis Triton kernels are not usable on this GPU')
+    fwd, back = m._view_batch_bodies()
+    assert fwd.body is _multiaxis_forward_view_batch_triton and back.body is _multiaxis_back_view_batch_triton
+    assert fwd._mbirtorch_no_compile and back._mbirtorch_no_compile and back._adds_into_output
+
+
+def test_one_model_views():
+    """Projector, MultiProjector and FineProjector with one_model_views=True project and back project like the default
+    path (one model per view) to float32 rounding. The views have random fractional channel offsets of their own, and
+    the series have fractional mount shifts. The match holds after the offsets and mounts change in place, and the
+    back projection is the adjoint of the projection. The option survives with_q."""
+    from mbirtorch.hsnt.strain.tomo import Projector, FineProjector
+    rng = np.random.default_rng(ONE_MODEL_SEED)
+    gen = torch.Generator().manual_seed(ONE_MODEL_SEED)
+    n, Q = 10, 3
+    th = np.linspace(0, np.pi, 7, endpoint=False)
+    vo = rng.uniform(-ONE_MODEL_OFFSET, ONE_MODEL_OFFSET, th.size)
+    x = torch.rand(n, n, n, Q, generator=gen)
+    y = torch.rand(th.size * n * n, Q, generator=gen)
+    for row_offset in (0.0, ONE_MODEL_ROW_OFFSET):
+        old = Projector(n, th, Q, ONE_MODEL_CHANNEL_OFFSET, False, vo, row_offset)
+        new = Projector(n, th, Q, ONE_MODEL_CHANNEL_OFFSET, False, vo, row_offset, one_model_views=True)
+        assert len(old.models) == th.size and len(new.models) == 1
+        fwd, back = new.fwd(x).cpu(), new.back(y).cpu()
+        assert _max_rel(fwd, old.fwd(x)) <= ONE_MODEL_RTOL and _max_rel(back, old.back(y)) <= ONE_MODEL_RTOL
+        a, b = float((fwd.double() * y.double()).sum()), float((x.double() * back.double()).sum())
+        assert abs(a - b) <= ONE_MODEL_RTOL * abs(a)
+        wider = new.with_q(Q + 1)
+        assert wider.one_model_views and len(wider.models) == 1
+    extra = [rng.uniform(-ONE_MODEL_OFFSET, ONE_MODEL_OFFSET, len(ANGLES)) for _ in MOUNTS]
+    offsets = [0.0, 0.3, -0.2]
+    for make, side in ((lambda **k: MultiProjector(N, MOUNTS, 2, channel_offsets=offsets, ror_mask=False, **k), N),
+                       (lambda **k: FineProjector(N // 2, MOUNTS, 2, channel_offsets=offsets, ror_mask=False, **k), N)):
+        old, new = make(view_extra=extra), make(view_extra=extra, one_model_views=True)
+        assert all(len(p.models) == len(ANGLES) for _, p in old.parts) and all(len(p.models) == 1 for _, p in new.parts)
+        vol = torch.rand(side, side, side, 2, generator=gen)
+        rays = torch.rand(sum(old.counts), 2, generator=gen)
+        for _ in range(2):
+            assert _max_rel(new.fwd(vol), old.fwd(vol)) <= ONE_MODEL_RTOL
+            assert _max_rel(new.back(rays), old.back(rays)) <= ONE_MODEL_RTOL
+            changed = rng.uniform(-ONE_MODEL_OFFSET, ONE_MODEL_OFFSET, len(ANGLES))
+            for p in (old, new):
+                p.set_view_offsets(1, changed)
+                p.set_mount(2, shift=ONE_MODEL_MOUNT_SHIFT)
+        assert new.with_q(3).one_model_views
