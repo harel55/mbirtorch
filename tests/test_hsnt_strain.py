@@ -2508,10 +2508,11 @@ class _LeanProjector:
         return out.reshape(self.n, self.n, self.n, -1)
 
 
-def _lean_tomo_fit(texture, normalize):
+def _lean_tomo_fit(texture, normalize, t_storage='device'):
     """A small tomographic fit on the CPU for the lean_passes checks: one bcc material in a cube, the strain tensor with
     the equilibrium prior, the strain's spread along the rays, two contamination components and, with texture, the
-    per-voxel cubic4 texture. Its data are Poisson counts from a true state, and the fit starts from another state."""
+    per-voxel cubic4 texture. Its data are Poisson counts from a true state, and the fit starts from another state.
+    t_storage is passed to FitB."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
     from mbirtorch.hsnt.strain.tomo import TomoFit, STRAIN_SMOOTH2_SD
     n, nv, rpv = LEAN_N, LEAN_VIEWS, LEAN_RAYS_PER_VIEW
@@ -2531,7 +2532,8 @@ def _lean_tomo_fit(texture, normalize):
                      2 * d[:, 0] * d[:, 2]], 1).float()
     P = nv * rpv
     f = torch.zeros(M.J, M.K); f[0, 20:40] = 0.03; f[1, 50:70] = 0.02
-    fit = FitB(M, torch.ones(P, M.K), g, torch.ones(P, 1), f, eps=torch.zeros(P, 1), chunk=P // LEAN_CHUNKS)
+    fit = FitB(M, torch.ones(P, M.K), g, torch.ones(P, 1), f, eps=torch.zeros(P, 1), chunk=P // LEAN_CHUNKS,
+               t_storage=t_storage)
     if texture:
         M.view_dirs = d.numpy()
         fit.ray_view = torch.arange(nv).repeat_interleave(rpv)
@@ -2561,13 +2563,17 @@ def _lean_tomo_fit(texture, normalize):
     return tf
 
 
-def _lean_run(texture, normalize, lean, keep=None):
+def _lean_run(texture, normalize, lean, keep=None, t_storage='device', options=None):
     """Runs LEAN_ITERS iterations of the driver's steps (fe_cube_multi.py: volume, texture, recentring, global and
     contamination steps) on a new _lean_tomo_fit, with lean_passes on or off. keep None leaves keep_gb at its default,
-    'none' keeps no model parts, and 'one' keeps one chunk's. Returns the objective after each iteration, the passes over
-    the rays in each iteration, the final state and, per iteration, whether the fit holds no kept model parts after it."""
-    tf = _lean_tomo_fit(texture, normalize)
+    'none' keeps no model parts, and 'one' keeps one chunk's. t_storage is passed to FitB. options maps names of other
+    FitB options to the values that the fit is given, or is None for none. Returns the objective after each iteration,
+    the passes over the rays in each iteration, the final state and, per iteration, whether the fit holds no kept model
+    parts after it."""
+    tf = _lean_tomo_fit(texture, normalize, t_storage)
     fit = tf.fit; M = fit.M
+    for name, value in (options or {}).items():
+        setattr(fit, name, value)
     fit.lean_passes = lean
     if keep == 'none':
         fit.keep_gb = 0.0
@@ -2689,7 +2695,83 @@ def test_lean_passes_mount_and_view_steps():
     assert all(abs(p_lean - (p_ref - 1.0)) < 1e-9 for p_ref, p_lean in zip(ref[0], lean[0])), (ref[0], lean[0])
 
 
-ONE_MODEL_RTOL = 1e-5            # one_model_views against a model per view: the largest difference relative to the largest
+# ---- the speedup options together (speedup round 2)
+COMBINED_ROUNDS = 2             # test_fisher_rays_with_host_storage takes this many rounds of the fit's steps.
+# On the CPU, a data loss that the fit remembers matches the data loss of a new pass to this relative tolerance. A
+# remembered value from an earlier state differs by the loss change of a step, which is far larger.
+MEMO_RTOL = 1e-12
+
+
+@pytest.mark.parametrize('texture,normalize', [(True, False), (False, True)])
+def test_lean_passes_with_other_options(texture, normalize):
+    """lean_passes gives the objectives and states of the same fit without it when the fit also has t_storage 'host',
+    lean_syncs, closed_form_strain and fisher_rays at one ray in FISHER_SUBSET_SHARE. The comparison is the one of
+    test_lean_passes_matches_default. The lean path makes fewer passes over the rays, and it frees its kept model parts
+    after each contamination step."""
+    rays = LEAN_VIEWS * LEAN_RAYS_PER_VIEW
+    options = dict(lean_syncs=True, closed_form_strain=True, fisher_rays=rays // FISHER_SUBSET_SHARE)
+    ref, again, lean = [_lean_run(texture, normalize, on, t_storage='host', options=options)
+                        for on in (False, False, True)]
+    noise, got = _lean_differences(again, ref), _lean_differences(lean, ref)
+    for k in got:
+        assert got[k] <= LEAN_NOISE_MARGIN * noise[k], (k, got[k], noise[k])
+    assert all(lean[3])
+    assert sum(lean[1]) < sum(ref[1]), (ref[1], lean[1])
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_fisher_rays_with_host_storage(device):
+    """With fisher_rays and lean_syncs, a fit with t_storage 'host', t_prefetch and lean_passes takes the same pixel,
+    global and contamination steps as a fit with the default storage. The two fits agree bitwise on the CPU, and to
+    GPU_RTOL on a GPU. After each global step, the data loss that each fit remembers is the data loss of a new pass.
+    After each contamination step, a remembered data loss is that of a new pass too. The fit with lean_passes makes
+    fewer passes over the rays, and it holds no kept model parts at the end."""
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('no GPU')
+    ref = _small_fit_cubic4()
+    a = _storage_fit(ref, ref.T.clone().to(device), device)
+    b = _storage_fit(ref, ref.T.clone(), device, t_storage='host', t_prefetch=True)
+    exact = device == 'cpu'
+
+    def same(x, y):
+        if not torch.is_tensor(x):
+            return x == y if exact else abs(x - y) <= GPU_RTOL * abs(y)
+        if exact:
+            return torch.equal(x, y)
+        return torch.allclose(x, y, rtol=GPU_RTOL, atol=GPU_RTOL * float(y.abs().max()))
+
+    def memo_is_current(fit, required):
+        # The remembered value is compared with a new pass over all rays. use_memo False makes data_loss compute it.
+        remembered = fit.recall_data_loss()
+        if remembered is None:
+            return not required
+        fit.use_memo = False
+        try:
+            fresh = fit.data_loss()
+        finally:
+            fit.use_memo = True
+        return abs(remembered - fresh) <= (MEMO_RTOL if exact else GPU_RTOL) * abs(fresh)
+
+    for x in (a, b):
+        x.fisher_rays = x.P // FISHER_SUBSET_SHARE
+        x.lean_syncs = True
+        x.build_atoms(); x.contamination_newton = True
+    b.lean_passes = True
+    for _ in range(COMBINED_ROUNDS):
+        for x in (a, b):
+            x.pixel_step()
+            x.global_step()
+            assert memo_is_current(x, True)
+            x.contamination_atoms_step()
+            assert memo_is_current(x, False)
+        for key in ('g', 'W', 'eps', 'c', 'f'):
+            assert same(getattr(b, key), getattr(a, key)), key
+    assert b.fisher_subset_info['rays'] == a.P // FISHER_SUBSET_SHARE
+    assert b.pass_count() < a.pass_count(), (a.pass_count(), b.pass_count())
+    assert b._kept is None
+
+
+ONE_MODEL_RTOL = 1e-5           # one_model_views against a model per view: the largest difference relative to the largest
                                  # value, and the adjoint identity's relative error
 ONE_MODEL_SEED = 20261123        # the random volumes, rays and per-view offsets of the one_model_views tests
 ONE_MODEL_OFFSET = 0.5           # each view's own channel offset is uniform between -ONE_MODEL_OFFSET and ONE_MODEL_OFFSET

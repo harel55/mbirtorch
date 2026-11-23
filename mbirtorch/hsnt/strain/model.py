@@ -1550,12 +1550,15 @@ class FitB:
         hits = self._floor_hits(g)
         plan = []
         # A tensor of ray indices (fisher_subset) has no span, so each of its chunks checks its own rays for the floor.
+        # When no ray at all can reach the floor, no ray of the tensor can either, and that check is left out.
         span = isinstance(sl, slice)
         start, stop, _ = sl.indices(self.P) if span else (None, None, None)
         for r in range(M.R):
             floor = None
             if hits[r] is not None and span:
                 h = hits[r]; floor = bool(np.searchsorted(h, start) < np.searchsorted(h, stop))
+            elif hits[r] is not None and hits[r].size == 0:
+                floor = False
             plan.append(WindowPlan(None if widths is None else widths[r], floor))
         return plan
 
