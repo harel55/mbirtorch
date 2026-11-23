@@ -752,12 +752,12 @@ class TomoFit:
         if nt == 0:
             return 0.0
         self.sync(); cache = fit._state(fit.g); _, Rb, _ = cache
-        P = fit.T.shape[0]; Y = M._harmonics_views().to(self.V.dtype)
+        P = fit.P; Y = M._harmonics_views().to(self.V.dtype)
         a = torch.zeros(P, nt, device=self.V.device, dtype=self.V.dtype)        # sum_k r d_r per ray
         B = torch.zeros(P, nt, nt, device=self.V.device, dtype=self.V.dtype)    # sum_k w d_r d_r' per ray
         for sl in fit.chunks():
             m, E, n_, beta, s_ = fit.mean(sl, cache=cache)
-            mm = m.clamp_min(1e-12); T = fit.T[sl]
+            mm = m.clamp_min(1e-12); T = fit.T_chunk(sl)
             r_ = fit.residual(sl, T, mm); w_ = fit.weight(sl, mm)
             W = fit.W[sl]
             d = torch.stack([-s_ * M.apply_band(E * (W[:, r:r + 1] * fit.texture_curve(sl, r)), Rb) for r in self.tex_r], 2)
@@ -1311,15 +1311,15 @@ class TomoFit:
         fit, R, C = self.fit, self.R, self.C
         self.sync()
         cache = fit._state(fit.g)
-        P = fit.T.shape[0]
+        P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R                                   # (W, U) and, anisotropic, U_tr
-        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
+        G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
         devs = []
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
-        fit.remember_data_loss(all_sum_float(sum(devs), fit.T.device))          # the deviance at this synced state
+        fit.remember_data_loss(all_sum_float(sum(devs), fit.device))          # the deviance at this synced state
         G, F = G.float(), F.float()
         Ffull, F = F, F[:, :2 * R, :2 * R].contiguous()            # the preconditioners use the (W, U) part
         gT = G[:, 2 * R:] if self.anisotropic else None
@@ -1687,10 +1687,10 @@ class TomoFit:
         refine_rigid = list(range(1, len(proj.parts))) if refine_rigid is None else list(refine_rigid)
         self.sync()
         cache = fit._state(fit.g)
-        P = fit.T.shape[0]
+        P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R
-        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
+        G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache)
@@ -1763,10 +1763,10 @@ class TomoFit:
         series = list(range(len(proj.parts))) if series is None else list(series)
         self.sync()
         cache = fit._state(fit.g)
-        P = fit.T.shape[0]
+        P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R
-        G = torch.zeros(P, nc, device=fit.T.device, dtype=torch.float64)
-        F = torch.zeros(P, nc, nc, device=fit.T.device, dtype=torch.float64)
+        G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
+        F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
         with torch.no_grad():
             for sl in fit.chunks():
                 G[sl], F[sl] = fit.ray_system(sl, cache)

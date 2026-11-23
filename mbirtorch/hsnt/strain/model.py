@@ -886,6 +886,36 @@ class FitB:
         self.contamination_newton = False
         self.last_step_se = float('inf')      # the last global step's RMS in standard errors (global_step)
 
+    # -- the measured transmission T (rays, bins). The passes read it one chunk at a time through T_chunk. They take the
+    # number of rays from P and the compute device from device. So the storage of T can change without changing them.
+    @property
+    def T(self):
+        """The transmission (rays, bins) as it is stored. Passes over the rays read it through T_chunk."""
+        return self._T
+
+    @T.setter
+    def T(self, value):
+        self._T = value
+
+    def T_chunk(self, sl):
+        """The transmission of the rays sl, on the device where the fit computes."""
+        return self._T[sl]
+
+    @property
+    def P(self):
+        """The number of rays."""
+        return self._T.shape[0]
+
+    @property
+    def device(self):
+        """The device on which the fit computes."""
+        return self._T.device
+
+    def _data_tensors(self):
+        """The tensors that hold the data. The state key of the remembered data loss includes them, so a new tensor or
+        an in-place change of one makes the remembered loss stale."""
+        return (self._T,)
+
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
         beam, each ray's expected counts at T = 1 from the current estimate of its pixel's open beam."""
@@ -908,14 +938,14 @@ class FitB:
         (divided by the counts' dispersion, like the dose); pixel (rays,) long: each ray's detector pixel; exposure
         (rays,): each ray's view exposure relative to the open beam. self.T must be the measured transmission, the
         sample counts over exposure x open beam."""
-        dev = self.T.device
+        dev = self.device
         O = torch.as_tensor(open_beam, device=dev, dtype=torch.float64)
         pix = torch.as_tensor(pixel, device=dev, dtype=torch.long)
         s_ = torch.as_tensor(exposure, device=dev, dtype=torch.float64)
         self.T_measured = self.T
         S_sum = torch.zeros_like(O)                                             # sum over the views of the sample counts
         for sl in self.chunks():
-            S = self.T[sl].double() * s_[sl, None] * O[pix[sl]]
+            S = self.T_chunk(sl).double() * s_[sl, None] * O[pix[sl]]
             if self.ray_weight is not None:
                 S = S * self.ray_weight[sl, None]
             S_sum.index_add_(0, pix[sl], S)
@@ -963,7 +993,7 @@ class FitB:
             for sl in self.chunks():
                 d = self.dose(sl)
                 mu = self.mean(sl, cache=cache)[0].double() * d
-                y = self.T[sl].double() * d
+                y = self.T_chunk(sl).double() * d
                 tot += float(xlogy(y, mu).sum())
         return 2 * tot
 
@@ -995,7 +1025,7 @@ class FitB:
         return None if self.eps_sd is None else self.eps_sd[sl]
 
     def chunks(self):
-        P = self.T.shape[0]
+        P = self.P
         return [slice(i, min(i + self.chunk, P)) for i in range(0, P, self.chunk)]
 
     def _texture(self, g):
@@ -1107,7 +1137,8 @@ class FitB:
     # tied to the state's tensors and their version counters, so any change to them makes it stale.
     def _state_key(self):
         tex = tuple(self.tex_Q) if self.tex_Q is not None else (None,)     # the texture's ray weights change the loss too
-        return tuple((t, t._version if torch.is_tensor(t) else None) for t in (self.g, self.W, self.eps, self.f, self.T, self.ray_weight) + tex)
+        return tuple((t, t._version if torch.is_tensor(t) else None)
+                     for t in (self.g, self.W, self.eps, self.f) + self._data_tensors() + (self.ray_weight,) + tex)
 
     def remember_data_loss(self, value):
         """Record value as the data loss (the deviance, no penalties) at the current state."""
@@ -1136,8 +1167,8 @@ class FitB:
             for sl in self.chunks():
                 Ws = None if W is None else W[sl]; es = None if eps is None else eps[sl]
                 m = self.mean(sl, g, Ws, f, es, cache)[0]
-                tot += float(self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64))
-        tot = all_sum_float(tot, self.T.device)
+                tot += float(self.deviance_terms(sl, m, self.T_chunk(sl)).sum(dtype=torch.float64))
+        tot = all_sum_float(tot, self.device)
         if current:
             self.remember_data_loss(tot)
         return tot
@@ -1157,7 +1188,7 @@ class FitB:
         self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         cache = self._state(self.g); mu, Rb, kap = cache
         for sl in self.chunks():
-            T = self.T[sl]; W = self.W[sl]
+            T = self.T_chunk(sl); W = self.W[sl]
             m, E, n, beta, s = self.mean(sl, cache=cache)
             mm = m.clamp_min(1e-12)
             cols = []
@@ -1192,7 +1223,7 @@ class FitB:
         list to which the rays' deviance at the current state is appended (it costs nothing extra here)."""
         M = self.M
         Jac, m = self.ray_jacobian(sl, cache)
-        mm = m.clamp_min(1e-12); T = self.T[sl]
+        mm = m.clamp_min(1e-12); T = self.T_chunk(sl)
         grad = torch.einsum('pk,pkn->pn', self.residual(sl, T, mm), Jac).double()
         F = torch.einsum('pk,pka,pkb->pab', self.weight(sl, mm), Jac, Jac).double()
         if deviance is not None:
@@ -1240,7 +1271,7 @@ class FitB:
         global gradient (n) and Fisher information (n, n), penalties included. Needs per-ray strain."""
         M = self.M; R = M.R
         cache, dmu, dRb = self.global_derivatives(idx)
-        P = self.T.shape[0]; n = len(idx); dev = self.T.device
+        P = self.P; n = len(idx); dev = self.device
         gch = chunk or max(64, self.chunk // 4)
         G = torch.zeros(P, 2 * R, device=dev, dtype=torch.float64); Fw = torch.zeros(P, 2 * R, 2 * R, device=dev, dtype=torch.float64)
         C = torch.zeros(P, 2 * R, n, device=dev, dtype=torch.float32)
@@ -1248,7 +1279,7 @@ class FitB:
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
             Jw, m = self.ray_jacobian(sl, cache)                                      # (Pc, K, 2R)
             Jg, _ = self.global_jacobian(sl, cache, idx, dmu, dRb)                     # (n, Pc, K)
-            mm = m.clamp_min(1e-12); T = self.T[sl]
+            mm = m.clamp_min(1e-12); T = self.T_chunk(sl)
             r_ = self.residual(sl, T, mm); w_ = self.weight(sl, mm)
             G[sl] = torch.einsum('pk,pkn->pn', r_, Jw).double()
             Fw[sl] = torch.einsum('pk,pka,pkb->pab', w_, Jw, Jw).double()
@@ -1264,7 +1295,7 @@ class FitB:
         """d m / d (W, U) of the rays sl, (Pc, K, 2R), and the mean m (Pc, K). With each ray's mean trace in eps's columns
         R..2R (elastic anisotropy, Hybrid2.set_dec): d m / d (W, U, U_tr), (Pc, K, 3R), U_tr the projected trace."""
         M = self.M; R = M.R
-        T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
+        W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
         mus = M.spectra(self.g, eps, self._views(sl), self._spectra_tex(self.g), self._sd(sl)).to(M.dt)  # (Pc, R, Kf)
@@ -1308,7 +1339,7 @@ class FitB:
 
     def ray_loss(self, sl, W, eps, cache):
         """Deviance of each ray in sl at maps W and strains eps (no penalties)."""
-        return self.deviance_terms(sl, self.mean(sl, W=W, eps=eps, cache=cache)[0], self.T[sl]).sum(1, dtype=torch.float64)
+        return self.deviance_terms(sl, self.mean(sl, W=W, eps=eps, cache=cache)[0], self.T_chunk(sl)).sum(1, dtype=torch.float64)
 
     # -- contamination on a multiscale dictionary: f_j = A c_j, c >= 0, each atom switched on by its own score test
     def build_atoms(self, widths=(1, 8, 32, 128)):
@@ -1352,7 +1383,7 @@ class FitB:
         pear = 0.0; dev = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                T = self.T[sl]
+                T = self.T_chunk(sl)
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
                 dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
@@ -1422,8 +1453,8 @@ class FitB:
         cache = self._state(self.g); dv = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                dv += float(self.deviance_terms(sl, self.mean(sl, f=f, cache=cache)[0], self.T[sl]).sum(dtype=torch.float64))
-        return all_sum_float(dv, self.T.device)
+                dv += float(self.deviance_terms(sl, self.mean(sl, f=f, cache=cache)[0], self.T_chunk(sl)).sum(dtype=torch.float64))
+        return all_sum_float(dv, self.device)
 
     def loss_c(self, c):
         return self.loss_c_data(c) + float((self.lam_c * c).sum())
@@ -1441,7 +1472,7 @@ class FitB:
         pear = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                T = self.T[sl]
+                T = self.T_chunk(sl)
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
                 Dm = beta[:, None, :] - n[:, :, None]                                  # (Pc, K, J)
@@ -1457,7 +1488,7 @@ class FitB:
         def per_bin_loss(fT):
             tot = torch.zeros(M.K, device=M.dev, dtype=torch.float64)
             for sl in self.chunks():
-                tot += self.deviance_terms(sl, self.mean(sl, f=fT.T, cache=cache)[0], self.T[sl]).sum(0, dtype=torch.float64)
+                tot += self.deviance_terms(sl, self.mean(sl, f=fT.T, cache=cache)[0], self.T_chunk(sl)).sum(0, dtype=torch.float64)
             all_sum(tot)
             return tot + (self.lam1 * fT.T).sum(0).double()
         self.f = _projected_newton_rows(self.f.T.contiguous(), grad, F, per_bin_loss, cap=(0, CONTAM_MAX_SHARE)).T.contiguous()
@@ -1641,10 +1672,10 @@ class FitB:
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
             m = self.mean(sl, g=gp, cache=cache)[0]
-            dv = self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64)
+            dv = self.deviance_terms(sl, m, self.T_chunk(sl)).sum(dtype=torch.float64)
             grad += torch.autograd.grad(dv, gp)[0]; dev += float(dv)
         all_sum(grad)
-        self.remember_data_loss(all_sum_float(dev, self.T.device))
+        self.remember_data_loss(all_sum_float(dev, self.device))
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):
             grad += torch.autograd.grad(pen, gp)[0]
@@ -1685,16 +1716,16 @@ class FitB:
                     return M.texture_factor(torch.cat([g0[:x0], xx, g0[x1:]]), r)
                 J = torch.func.jacfwd(fac)(g0[x0:x1])                                   # (views, edges, Kf, x params)
                 dtex.append([J[..., k].to(M.dt) for k in range(x1 - x0)])
-        P = self.T.shape[0]; gch = max(64, self.chunk // 4); dev = 0.0
+        P = self.P; gch = max(64, self.chunk // 4); dev = 0.0
         for sl in [slice(i, min(i + gch, P)) for i in range(0, P, gch)]:
             Jg, m = self.global_jacobian(sl, cache, idx, dmu, dRb, dtex)
-            mm = m.clamp_min(1e-12); T = self.T[sl]
+            mm = m.clamp_min(1e-12); T = self.T_chunk(sl)
             grad += torch.einsum('pk,npk->n', self.residual(sl, T, mm), Jg).double()
             F += torch.einsum('pk,apk,bpk->ab', self.weight(sl, mm), Jg, Jg).double()
             dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
             del Jg
         all_sum(grad); all_sum(F)
-        self.remember_data_loss(all_sum_float(dev, self.T.device))
+        self.remember_data_loss(all_sum_float(dev, self.device))
         gp = g0.clone().requires_grad_(True)
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):
