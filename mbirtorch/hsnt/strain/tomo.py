@@ -21,6 +21,7 @@ import math
 import os
 import sys
 import time
+import weakref
 
 import numpy as np
 import torch
@@ -438,6 +439,18 @@ class FineProjector:
         return self.inner.back(r.reshape(self.V * f * n * f * n, -1).contiguous())
 
 
+def _geometry_key(proj):
+    """Returns a value that describes the geometry of proj, a Projector, MultiProjector or FineProjector. The value
+    covers the view angles, the detector offsets and the mounts. Two projectors with equal values give equal
+    projections. TomoFit.refresh_spread uses it to tell whether the geometry has changed."""
+    if hasattr(proj, 'inner'):                                                    # a FineProjector
+        return ('fine', proj.factor, _geometry_key(proj.inner))
+    if hasattr(proj, 'parts'):                                                    # a MultiProjector
+        return tuple((tr, _geometry_key(p)) for tr, p in proj.parts)
+    vo = None if proj.view_offsets is None else proj.view_offsets.tobytes()
+    return (proj.n, proj.kind, proj.angles.tobytes(), proj.channel_offset, vo, proj.row_offset, bool(proj.ror_mask))
+
+
 def _otsu_threshold(x):
     """Otsu's threshold of the values x: the cut of their histogram (OTSU_BINS bins) that maximizes the variance
     between the two classes."""
@@ -611,6 +624,9 @@ class TomoFit:
         self._volume_steps = 0
         self.last_recenter = None            # recenter_strain's removed means: isotropic and per component (strain units)
         self._ray_sym, self._ray_sym_age = None, 0
+        # spread_grouped=True makes refresh_spread compute the same spread with much less memory (an option, off by
+        # default). Use it for large volumes and many rays.
+        self.spread_grouped = False
         self.sync()
 
     # ---- projections
@@ -827,6 +843,8 @@ class TomoFit:
         unless edge_spread is set."""
         if not getattr(self, 'edge_spread', False):
             return
+        if getattr(self, 'spread_grouped', False):             # The option gives the same spread with less memory.
+            return self._refresh_spread_grouped()
         n, R, C = self.V.shape[0], self.R, self.C
         iu = [(c, d) for c in range(C) for d in range(c, C)]
         with torch.no_grad():
@@ -838,6 +856,68 @@ class TomoFit:
             W, eps = self.fit.W, self.fit.eps[:, :R]
             m2 = torch.where(W > EPS_W_MIN, (M2 * ww[:, None, :]).sum(-1) / W.clamp_min(EPS_W_MIN), torch.zeros_like(W))
             self.fit.eps_sd = (m2 - eps ** 2).clamp_min(0).sqrt()
+
+    def _refresh_spread_grouped(self):
+        """refresh_spread when spread_grouped is set. It gives the default path's spread up to float rounding with much
+        less memory. It keeps its previous result when the volumes, the view weights, the ray maps and the
+        projector's geometry have not changed since that result was made. spread_skips counts the calls that keep it."""
+        if self._spread_kept():
+            self.spread_skips = getattr(self, 'spread_skips', 0) + 1
+            return
+        fit, proj, n, R, C = self.fit, self.proj, self.V.shape[0], self.R, self.C
+        iu = [(c, d) for c in range(C) for d in range(c, C)]
+        # The fit's own projector takes R * group channels. Each projection therefore carries group products per material.
+        group = proj.Q // R
+        # Each series is projected on its own. Only one series' rays are then held at a time.
+        if hasattr(proj, 'project_series'):
+            ends = np.cumsum([0] + list(proj.counts))
+            parts = [(slice(int(ends[s]), int(ends[s + 1])), lambda v, s=s: proj.project_series(s, v))
+                     for s in range(len(proj.counts))]
+        else:
+            parts = [(slice(None), proj.fwd)]
+        with torch.no_grad():
+            w = self.w_ray
+            W, eps = fit.W, fit.eps[:, :R]
+            # acc holds each ray's sum over the pairs (c, d) of w_c w_d proj(V E_c E_d), for each material.
+            acc = torch.zeros_like(W)
+            for g0 in range(0, len(iu), group):
+                pairs = iu[g0:g0 + group]
+                # The channels are ordered as in the default path's stack. The last group's unused channels stay zero.
+                vols = torch.zeros(n, n, n, R, group, device=self.V.device, dtype=self.V.dtype)
+                for j, (c, d) in enumerate(pairs):
+                    vols[..., j] = self.V * (self.E[..., c] * self.E[..., d])
+                vols = vols.reshape(n, n, n, R * group)
+                for sl, project in parts:
+                    rays = project(vols).reshape(-1, R, group)
+                    for j, (c, d) in enumerate(pairs):
+                        acc[sl] += rays[:, :, j] * ((1.0 if c == d else 2.0) * w[sl, c] * w[sl, d])[:, None]
+                    del rays
+                del vols
+            m2 = torch.where(W > EPS_W_MIN, acc / W.clamp_min(EPS_W_MIN), torch.zeros_like(W))
+            fit.eps_sd = (m2 - eps ** 2).clamp_min(0).sqrt()
+        # Weak references let the old volumes be freed.
+        tensors, key = self._spread_inputs()
+        self._spread_state = ([weakref.ref(t) for t in tensors], key, weakref.ref(fit.eps_sd), fit.eps_sd._version)
+
+    def _spread_inputs(self):
+        """Returns the inputs of refresh_spread's result: a list of the tensors it reads, and a key made of their
+        versions, the projector's geometry and whether the ray maps are synced. The tensors are the volumes, the view
+        weights and the ray maps fit.W and fit.eps. The ray maps are left out when sync made them from the current
+        volumes with the current geometry. Two such syncs give the same maps up to float rounding."""
+        geometry = _geometry_key(self.proj)
+        made = getattr(self, '_synced_geometry', None)
+        synced = self._is_synced() and made is not None and made[0] is self._synced and made[1] == geometry
+        tensors = [self.V, self.E, self.w_ray] + ([] if synced else [self.fit.W, self.fit.eps])
+        return tensors, (tuple(t._version for t in tensors), geometry, synced)
+
+    def _spread_kept(self):
+        """Returns True when fit.eps_sd is _refresh_spread_grouped's result for the current inputs."""
+        old = getattr(self, '_spread_state', None)
+        sd = self.fit.eps_sd
+        if old is None or sd is None or old[2]() is not sd or old[3] != sd._version:
+            return False
+        tensors, key = self._spread_inputs()
+        return key == old[1] and len(tensors) == len(old[0]) and all(r() is t for r, t in zip(old[0], tensors))
 
     def rays(self, V, E):
         """Each ray's projected density W (P, R) and mean strain along the beam eps (P, R); with elastic anisotropy eps
@@ -859,6 +939,9 @@ class TomoFit:
             self.fit.tex_Q = self.texture_rays(self.V, self.Tx, self.fit.W)
         self._synced = (self.V, self.V._version, self.E, self.E._version, self.fit.W, self.fit.W._version,
                         self.fit.eps, self.fit.eps._version)
+        if getattr(self, 'spread_grouped', False):
+            # refresh_spread reads the geometry these maps were made with, to tell when it may keep its last result.
+            self._synced_geometry = (self._synced, _geometry_key(self.proj))
 
     def _is_synced(self):
         """True when the fit's projected maps are this volume's: nothing changed since the last sync."""
