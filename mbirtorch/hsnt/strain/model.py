@@ -208,7 +208,7 @@ def _assemble_spectrum(C0, Bq, q, C1, BqA, A, off, w, hf, t, ee, h, valid, kp4, 
     if A is not None:
         out = out + A[:, None] * C1[None, :] + (A[:, None] * q) @ BqA
     win = _window_terms(off, w, hf, t, ee, h, valid, kp4, A)
-    out = out.index_add(1, idx, win.reshape(win.shape[0], -1))
+    out = out.index_add(1, idx, win.reshape(win.shape[0], -1).to(out.dtype))
     return x2[None, :] * out + smooth[None, :]
 
 
@@ -646,7 +646,7 @@ class Hybrid2:
                 kp4 = (k4[:, None] * p4.gather(1, idx)).to(dt)
             lw = lam[idx]
             off = (e[:, None] - lw + 0.5 * self.hf).to(dt)[None] + (e[None, :] * e_r.double()).to(dt)[:, :, None]
-            w3 = torch.zeros_like(off[..., :1]) if width is None else width[:, :, None]
+            w3 = torch.zeros_like(off[..., :1]) if width is None else width[:, :, None].to(dt)
             return _assemble_kernel(off.is_cuda)(
                 (((1 - t) * h) @ below).to(dt), Bq, q, C1, BqA, Ad, off, w3, float(self.hf), t.to(dt), ee, h.to(dt),
                 valid.to(dt), kp4, idx.reshape(-1), (x * x).to(dt), smooth.to(dt))
@@ -663,7 +663,7 @@ class Hybrid2:
         # the windows, bin by bin as in spectra
         lw = lam[idx]                                                                    # (n_e, wb)
         off = (e[:, None] - lw + 0.5 * self.hf).to(dt)[None] + (e[None, :] * e_r.double()).to(dt)[:, :, None]
-        w3 = None if width is None else width[:, :, None]
+        w3 = None if width is None else width[:, :, None].to(dt)
         step = edge_step(off, self.hf, w3)
         shape0 = 1 - t.to(dt)[None, :, None] * (off - 0.5 * self.hf) / ee[:, :, None]
         shape = shape0

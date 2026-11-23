@@ -647,6 +647,26 @@ def test_band_operator_choice():
     assert kinds == {'two_scale': True, 'ikeda_carpenter': False}
 
 
+def test_ray_spectrum_float32():
+    """In single precision, with elastic anisotropy and the strain's spread (whose widths come in double precision), the
+    no-gradient windowed spectrum runs and matches the dense sum."""
+    from mbirtorch.hsnt.strain.model import Hybrid2
+    lam = np.linspace(1.2, 4.4, 600)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float32)
+    gen = torch.Generator().manual_seed(6)
+    g = torch.zeros(M.n_global, dtype=torch.float64); sl = M.slices[0]; ne = sl['h'][1] - sl['h'][0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    M.set_dec(0, 0.8 + 0.4 * torch.rand(ne, generator=gen, dtype=torch.float64), 0.05 * torch.randn(ne, generator=gen, dtype=torch.float64))
+    eps = (2e-3 * torch.randn(30, 2, generator=gen, dtype=torch.float64))
+    sd = 3e-4 * torch.rand(30, 1, generator=gen, dtype=torch.float64)
+    with torch.no_grad():
+        a = M.spectra(g, eps, None, sd=sd)
+        M.dense_spectra = True; b = M.spectra(g, eps, None, sd=sd); M.dense_spectra = False
+    assert a.dtype == torch.float32
+    assert torch.allclose(a, b, rtol=0, atol=1e-5 * float(b.abs().max()))
+
+
 def test_fine_projector():
     """FineProjector: back is the adjoint of fwd, and a volume constant over each factor^3 block projects as the
     detector-resolution projector projects its block values (lengths in detector pixels)."""
