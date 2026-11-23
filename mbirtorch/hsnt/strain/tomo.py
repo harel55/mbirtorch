@@ -445,6 +445,9 @@ def _otsu_threshold(x):
     return lo + (k + 1) * (hi - lo) / OTSU_BINS
 
 
+D0_SMOOTH_SD = 5e-5             # d0 field: the standard deviation of its step between neighbouring voxels
+D0_RIDGE_SD = 1e-3              # d0 field: its standard deviation about 0 (fixes its level where equilibrium does not)
+D0_CG_ITERS = 50                # d0 field: conjugate-gradient iterations of each d0 step
 HEIGHT_PRIOR_SD = 0.05           # tabulated edge heights: their relative standard deviation about the table times a scale
 TEXTURE_SMOOTH_SD = 0.1          # per-voxel texture: the standard deviation of a coefficient's step between neighbouring voxels
 TEXTURE_RIDGE_SD = 1.0           # per-voxel texture: each coefficient's standard deviation about 0 (a random powder)
@@ -676,6 +679,66 @@ class TomoFit:
     def _texture_prior_apply(self, X):
         """The prior's Hessian applied to X (its gradient at X): laplacian / smooth_sd^2 + X / ridge_sd^2."""
         return self.laplacian(X) / self.tex_smooth_sd ** 2 + X / self.tex_ridge_sd ** 2
+
+    def set_d0_field(self, smooth_sd=D0_SMOOTH_SD, ridge_sd=D0_RIDGE_SD):
+        """A stress-free lattice that varies over the sample (user 2026-11-22, D0_FIELD.md): each material's dilatation
+        D (n, n, n, R) = its d0's relative change from the lattice parameter. The fitted strain E stays the lattice
+        strain the data see; the elastic strain is E - D I, and only it enters the equilibrium prior. Equilibrium fixes
+        D's gradient, and with traction its level at the free faces. D has a smoothness prior (smooth_sd per neighbour
+        step) and a weak ridge (ridge_sd) and is updated by d0_step. It needs the equilibrium prior and the strain
+        tensor, and not elastic anisotropy (whose lattice strains would scale D)."""
+        if self.elastic is None or self.C != 6:
+            raise ValueError('set_d0_field needs the equilibrium prior and the strain tensor')
+        if self.anisotropic:
+            raise ValueError('set_d0_field: not with elastic anisotropy')
+        self.D = torch.zeros_like(self.V)
+        self.d0_smooth_sd, self.d0_ridge_sd = float(smooth_sd), float(ridge_sd)
+
+    def _elastic(self, E):
+        """The elastic strain: E less the d0 field's dilatation on the normal components (E itself without one)."""
+        D = getattr(self, 'D', None)
+        if D is None:
+            return E
+        return E - torch.cat([D[..., None].expand(*D.shape, 3), torch.zeros(*D.shape, 3, device=D.device, dtype=E.dtype)], -1)
+
+    def _d0_prior(self, D):
+        """The d0 field's prior: (1/2) sum of (neighbour differences / d0_smooth_sd)^2 + (D / d0_ridge_sd)^2."""
+        tot = 0.5 * (D / self.d0_ridge_sd).pow(2).sum()
+        for ax in range(3):
+            tot = tot + 0.5 * (D.diff(dim=ax) / self.d0_smooth_sd).pow(2).sum()
+        return tot
+
+    def d0_step(self, cg_iters=D0_CG_ITERS):
+        """Solve for the d0 field D at the current strain E: minimize the equilibrium prior of E - D I plus D's own prior
+        (both quadratic in D) by conjugate gradients from the current D, on the materials' own voxels. Returns the
+        change's RMS. A no-op without a d0 field."""
+        if getattr(self, 'D', None) is None:
+            return 0.0
+        mask = self._eq_mask()
+        own = self.material_voxels().to(self.V.dtype)
+        E = self.E.detach()
+
+        def F(D):
+            Dm = D * own
+            r = self._eq_residual(E - torch.cat([Dm[..., None].expand(*Dm.shape, 3), torch.zeros(*Dm.shape, 3, device=Dm.device, dtype=E.dtype)], -1), mask)
+            return 0.5 * self.eq_w * (r.double() ** 2).sum() + self._d0_prior(Dm.double())
+
+        def grad(D):
+            D = D.detach().requires_grad_(True)
+            return torch.autograd.grad(F(D), D)[0] * own
+
+        b = -grad(torch.zeros_like(self.D))                    # F is quadratic: grad F(D) = H D - b
+        Hv = lambda v: grad(v) + b
+        x = self.D.clone(); r = b - Hv(x); p = r.clone(); rr = float((r * r).sum()); r0 = rr
+        for _ in range(cg_iters):
+            if rr <= 1e-20 * max(r0, 1e-300):
+                break
+            q = Hv(p); al = rr / max(float((p * q).sum()), 1e-300)
+            x = x + al * p; r = r - al * q; rn = float((r * r).sum())
+            p = r + (rn / rr) * p; rr = rn
+        change = float(((x - self.D) ** 2).mean().sqrt())
+        self.D = (x * own).detach()
+        return change
 
     def texture_step(self, cg_iters=TEXTURE_CG_ITERS):
         """One Gauss-Newton step on the per-voxel texture Tx with the volumes, strain and spectra fixed, by conjugate
@@ -1218,7 +1281,9 @@ class TomoFit:
                + self._dens_prior_value(V))
         if self.elastic is not None:
             mask = self._eq_mask() if mask is None else mask
-            tot += 0.5 * self.eq_w * float((self._eq_residual(E, mask).double() ** 2).sum())
+            tot += 0.5 * self.eq_w * float((self._eq_residual(self._elastic(E), mask).double() ** 2).sum())
+        if getattr(self, 'D', None) is not None:
+            tot += float(self._d0_prior(self.D.double()))
         return tot
 
     def data_loss(self, V=None, E=None):
@@ -1265,7 +1330,7 @@ class TomoFit:
         self._wts = wts = self._dens_wts(V)
         gV = bGW + (E * bGU).sum(-1) + self.dens_lap(V, wts)
         swts = self._strain_wts(E); cwts = self._strain_wts(E, curvature=True)          # gradient; curvature
-        gE = V[..., None] * bGU + 2 * self.lam_E * E * self._scale_E() + self.strain_lap(E, swts) + eq(E)
+        gE = V[..., None] * bGU + 2 * self.lam_E * E * self._scale_E() + self.strain_lap(E, swts) + eq(self._elastic(E))
         free = self._free_density(V, gV) & (not getattr(self, 'hold_volume', False))  # V's active bounds held
         fE = self.support_mask().expand_as(E) & (not self.hold_strain)              # strain free inside the support
         # Jacobi preconditioner from the ray Fisher diagonals (for the strain parts, each view's weight squared)
@@ -1277,7 +1342,7 @@ class TomoFit:
         bWU = self.proj.back(torch.cat([torch.zeros_like(dWW), (dWU[:, :, None] * self.w_ray[:, None, :]).reshape(P_, R * C)], 1))[..., R:].reshape(*V.shape[:3], R, C)
         if getattr(self, 'prior_scaling', 'fixed') == 'fisher' and self.prior_scale is None:
             self.set_prior_scale(V[..., None] ** 2 * bUU)                         # once, at the first volume step
-            gE = V[..., None] * bGU + 2 * self.lam_E * E * self._scale_E() + self.strain_lap(E, swts) + eq(E)
+            gE = V[..., None] * bGU + 2 * self.lam_E * E * self._scale_E() + self.strain_lap(E, swts) + eq(self._elastic(E))
         eq_diag = 12.0 * self.eq_w if self.elastic is not None else 0.0          # rough scale of the equilibrium curvature
         dV_ = bWW + (E * E * bUU).sum(-1) + 2 * (E * bWU).sum(-1) + self.dens_diag(wts)
         dE_ = V[..., None] ** 2 * bUU + 2 * self.lam_E * self._scale_E() + self.strain_diag(cwts) + eq_diag
@@ -1799,6 +1864,8 @@ class TomoFit:
                 self.last_recenter['mean'].append(((w[..., None] * self.E[..., r, :]).sum((0, 1, 2)) / w.sum()).tolist())
                 if C == 6:
                     self.E[..., r, :3] -= d
+                    if getattr(self, 'D', None) is not None:             # the elastic strain E - D I is unchanged
+                        self.D[..., r] -= d * own[..., r].to(self.D.dtype)
                     if full:                                                   # the deviatoric mean, per component
                         m = (w[..., None] * self.E[..., r, :]).sum((0, 1, 2)) / w.sum()
                         self.E[..., r, :] -= m
@@ -1834,6 +1901,8 @@ class TomoFit:
         parameter (memory ~ n_global x voxels x R (1 + C)), the first implementation, kept for comparison."""
         if self.anisotropic:
             raise NotImplementedError('joint_step: its cross terms use (W, U) only, not the trace of elastic anisotropy')
+        if getattr(self, 'D', None) is not None:
+            raise NotImplementedError('joint_step: not with a d0 field')
         fit, R, C = self.fit, self.R, self.C
         M = fit.M
         self.sync()

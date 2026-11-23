@@ -584,6 +584,29 @@ def test_equilibrium_corner_stencil():
     assert res['corner'][2] < 1e-12                                              # the hourglass mode remains
 
 
+def test_d0_step_recovers_a_dilatation_field():
+    """A lattice strain that is a pure dilatation D I with no elastic strain: d0_step finds D (up to the constant the
+    equilibrium prior cannot see without traction), and the elastic strain E - D I is then in equilibrium."""
+    from mbirtorch.hsnt.strain.tomo import TomoFit, D0_SMOOTH_SD, D0_RIDGE_SD
+    n = 14
+    c = (n - 1) / 2; g = torch.arange(n, dtype=torch.float64) - c
+    zz, yy, xx = torch.meshgrid(g, g, g, indexing='ij')
+    D_true = 2e-4 * torch.exp(-(xx ** 2 + yy ** 2 + zz ** 2) / (2 * 2.5 ** 2))[..., None]
+    tf = object.__new__(TomoFit); tf.elastic = [(1.0, 0.3)]; tf.eq_stencil = 'corner'; tf.traction = False
+    tf.eq_w = 1.0 / 1e-5 ** 2; tf.C = 6; tf.R = 1
+    tf.V = torch.ones(n, n, n, 1, dtype=torch.float64)
+    tf.E = torch.cat([D_true[..., None].expand(n, n, n, 1, 3), torch.zeros(n, n, n, 1, 3, dtype=torch.float64)], -1)
+    inner = torch.zeros(n, n, n, 1, dtype=torch.bool); inner[1:-2, 1:-2, 1:-2] = True
+    tf._eq_mask = lambda: inner
+    tf.material_voxels = lambda: torch.ones(n, n, n, 1, dtype=torch.bool)
+    tf.D = torch.zeros_like(tf.V); tf.d0_smooth_sd, tf.d0_ridge_sd = D0_SMOOTH_SD, D0_RIDGE_SD
+    tf.d0_step(cg_iters=400)
+    err = (tf.D - tf.D.mean()) - (D_true - D_true.mean())
+    assert float(err.abs().max()) < 0.1 * float(D_true.max())
+    res = tf._eq_residual(tf._elastic(tf.E), inner)
+    assert float(res.abs().max()) < 0.05 * float(tf._eq_residual(tf.E, inner).abs().max())
+
+
 def test_fine_projector():
     """FineProjector: back is the adjoint of fwd, and a volume constant over each factor^3 block projects as the
     detector-resolution projector projects its block values (lengths in detector pixels)."""
