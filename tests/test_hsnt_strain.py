@@ -1192,6 +1192,122 @@ def test_edge_spread():
     assert torch.allclose(fit.eps_sd[keep, 0] ** 2, var.clamp_min(0), rtol=1e-3, atol=1e-10)
 
 
+# SPREAD_MOUNTS is MOUNTS with whole shifts along each series' rotation axis. Its projectors therefore have no
+# fractional detector row offset. With a fractional row offset, each stacked volume's detector row position carries a
+# float32 rounding that grows with its place in the stack. The default refresh_spread stacks 21 products per material,
+# and the grouped path stacks 7. Their spreads then differ by up to a few 1e-4 of a ray's mean square strain.
+SPREAD_MOUNTS = [('x', ANGLES),
+                 (((1, 2, 0), (1, 1, 1), (0.4, -2.3, 2.0), (-0.35, 1.93, -0.63)), ANGLES),
+                 (((2, 0, 1), (-1, 1, -1), (3.0, -0.5, 0.0)), ANGLES)]
+SPREAD_TOL = 3e-5               # the two paths' largest difference in a ray's mean square strain, relative to the sum
+                                # of its terms' absolute values, without fractional row offsets
+SPREAD_TOL_ROWS = 2e-3          # the same with fractional row offsets
+
+
+def _spread_fit(kind, n, R, mounts, C=6):
+    """A TomoFit with edge_spread on, R materials and C strain components (6 for the tensor, 1 for one strain). kind
+    'plain' uses one Projector, 'multi' a MultiProjector with the given mounts and 'fine' a FineProjector (factor 2)
+    with them. The strain has a mean and a spread inside the material."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    from mbirtorch.hsnt.strain.tomo import TomoFit, Projector, FineProjector
+    from mbirtorch.hsnt.strain.geometry import series_weights
+    offs = [0.0, 0.3, -0.2]
+    if kind == 'plain':
+        pr, m, wts = Projector(n, ANGLES, 2, ror_mask=False), n, series_weights([('z', ANGLES)])
+    else:
+        pr = MultiProjector(n, mounts, 2, channel_offsets=offs, ror_mask=False) if kind == 'multi' else \
+            FineProjector(n, mounts, 2, channel_offsets=offs, ror_mask=False, factor=2)
+        m = n if kind == 'multi' else 2 * n
+        wts = series_weights(mounts)
+    if C == 1:
+        wts = None                                       # one strain, seen alike by every view
+    dev = pr.fwd(torch.zeros(m, m, m, 2)).device
+    mats = [('bcc', (2.8665 * 0.99, 2.8665 * 1.01)), ('fcc', (3.52 * 0.99, 3.52 * 1.01))][:R]
+    lam = np.linspace(2.0, 4.4, 40)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), mats, smooth_degree=3, n_contam=1, device=dev)
+    P = pr.V * n * n; kw = dict(device=dev)
+    fit = FitB(M, torch.ones(P, M.K, **kw), torch.zeros(M.n_global, dtype=torch.float64, **kw), torch.ones(P, R, **kw),
+               torch.zeros(1, M.K, **kw), eps=torch.zeros(P, R, **kw), chunk=512)
+    gen = torch.Generator().manual_seed(7)
+    V = torch.zeros(m, m, m, R)
+    a, b = m // 4, 3 * m // 4
+    V[a:b, a:b, a:b, 0] = 0.05
+    if R > 1:
+        V[a + 2:b + 2, a - 1:b - 1, a:b, 1] = 0.03
+    E = (1e-3 + 3e-4 * torch.randn(m, m, m, R, C, generator=gen)) * (V[..., None] > 0)
+    tf = TomoFit(fit, pr, V.to(dev), E.to(dev), weights=wts)
+    tf.edge_spread = True
+    return tf
+
+
+@pytest.mark.parametrize("kind,n,R,rows,C", [("plain", 16, 1, False, 6), ("multi", 16, 2, False, 6),
+                                             ("multi", 24, 1, False, 6), ("fine", 12, 2, False, 6),
+                                             ("multi", 16, 2, True, 6), ("fine", 12, 2, True, 6), ("multi", 16, 2, False, 1)])
+def test_spread_grouped(kind, n, R, rows, C):
+    """TomoFit.spread_grouped gives the default refresh_spread's strain spread up to float rounding, with a plain,
+    mounted or fine-grid projector, one or two materials and one or six strain components. It keeps its last result
+    while nothing it reads changes, also across syncs of the same volumes. It makes a new result after a change of the
+    strain or of the geometry. rows=True uses MOUNTS, whose fractional detector row offsets need the looser tolerance."""
+    from mbirtorch.hsnt.strain.tomo import EPS_W_MIN
+    tf = _spread_fit(kind, n, R, MOUNTS if rows else SPREAD_MOUNTS, C)
+    fit = tf.fit
+    tol = SPREAD_TOL_ROWS if rows else SPREAD_TOL
+    iu = [(c, d) for c in range(C) for d in range(c, C)]
+    npair = len(iu)
+
+    def grouped():
+        tf.spread_grouped = True
+        tf.refresh_spread()
+        return fit.eps_sd
+
+    def compare(out):
+        # The default path's spread at the current state is the reference. It replaces fit.eps_sd, and the next
+        # grouped call therefore computes a new result. The tolerance scales with each ray's sum of the absolute
+        # values of its terms.
+        tf.spread_grouped = False
+        tf.refresh_spread()
+        ref = fit.eps_sd
+        tf.spread_grouped = True
+        m = tf.V.shape[0]
+        prods = torch.stack([(tf.V * tf.E[..., c] * tf.E[..., d]).abs() for c, d in iu], -1).reshape(m, m, m, R * npair)
+        ww = torch.stack([(1.0 if c == d else 2.0) * (tf.w_ray[:, c] * tf.w_ray[:, d]).abs() for c, d in iu], -1)
+        terms = (tf.proj.with_q(R * npair).fwd(prods).reshape(-1, R, npair) * ww[:, None, :]).sum(-1)
+        scale = terms / fit.W.clamp_min(EPS_W_MIN)
+        diff = (out ** 2 - ref ** 2).abs()
+        keep = fit.W > EPS_W_MIN
+        assert float(ref[keep].max()) > 0
+        assert bool((diff <= tol * scale)[keep].all()), float((diff / scale.clamp_min(1e-30))[keep].max())
+
+    def move(k):
+        # The k-th of two changes of the geometry: a channel offset, a mount's shift or a mount's channel offset.
+        if kind == 'plain':
+            tf.proj.set_geometry((0.3, -0.2)[k])
+        elif k == 0:
+            tf.proj.set_mount(1, shift=(0.6, -2.0, 1.4 if rows else 1.0))
+        else:
+            tf.proj.set_mount(2, offset=0.4)
+
+    out = grouped()
+    skips = getattr(tf, 'spread_skips', 0)
+    assert grouped() is out and tf.spread_skips == skips + 1          # nothing changed: the result is kept
+    compare(out)
+    tf.sync(); out = grouped(); tf.sync()                              # a new sync of the same volumes ...
+    assert grouped() is out and tf.spread_skips == skips + 2          # ... keeps the result
+    compare(out)
+    out = grouped(); tf.E.mul_(1.5)                                    # the strain changes in place
+    new = grouped()
+    assert new is not out and tf.spread_skips == skips + 2
+    compare(new)
+    tf.sync(); out = grouped(); move(0)                                # the geometry changes without a sync
+    new = grouped()
+    assert new is not out and tf.spread_skips == skips + 2
+    compare(new)
+    tf.sync(); out = grouped(); move(1); tf.sync()                     # the geometry changes, then a sync
+    new = grouped()
+    assert new is not out and tf.spread_skips == skips + 2
+    compare(new)
+
+
 def test_tabulated_spectrum():
     """A tabulated material (Hybrid2.set_tabulated): its smooth part is c0 x the table's non-Bragg shape + c1 lambda /
     lambda_ref with the spline fixed at zero; the height prior (FitB.height_prior) is zero at heights proportional to
