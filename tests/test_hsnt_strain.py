@@ -2294,3 +2294,230 @@ def test_prolong_projections():
     pf = fp.fwd(prolong(xc, f, 'constant')).cpu()
     pb = pf.reshape(cp.V, n, f, n, f, 1).mean((2, 4)).reshape(-1, 1)
     assert torch.allclose(pb, f * pc, rtol=1e-5, atol=1e-5 * float(pc.abs().max()))
+
+
+# ---- FitB.lean_passes (speedup round 2): the passes over the rays and the projections whose results the fit has
+LEAN_N, LEAN_VIEWS, LEAN_RAYS_PER_VIEW = 8, 6, 64   # the lean_passes fit: volume side, views and rays per view
+LEAN_CHUNKS = 3                                     # ... the chunks of rays
+LEAN_BINS = 80                                      # ... the wavelength bins
+LEAN_DOSE = 200.0                                   # ... the counts per bin at transmission 1
+LEAN_CG_ITERS = 10                                  # ... the conjugate-gradient iterations of each volume step
+LEAN_ITERS = 3                                      # the iterations that the comparison runs
+# The comparison runs the default path twice. Where the two runs are bitwise equal (a deterministic CPU), the lean path
+# must be bitwise equal too. Elsewhere its difference from the default may be at most this many times the difference
+# between the two default runs, which is the default path's own rounding noise.
+LEAN_NOISE_MARGIN = 10.0
+# On a GPU, the mount and view-offset steps' loss may also differ by this fraction, and their mounts and offsets by this
+# many voxels, degrees or detector channels: the projector's atomic adds change float32 rounding from run to run.
+LEAN_GPU_TOL = 1e-4
+MOUNT_TEST_SHIFT = 0.3          # _mount_fit: the data's shift of series 1's mount (voxels) ...
+VIEW_TEST_OFFSET = 0.3          # ... and of one view's own channel offset in series 0 (detector channels)
+VIEW_TEST_INDEX = 2             # ... that view's index
+
+
+class _LeanProjector:
+    """A test projector on the CPU for the lean_passes checks. Its rays are view-major, views x rays_per_view of them,
+    and each ray is a weighted sum of RAY_VOXELS random voxels in any number of channels. back is the exact adjoint of
+    fwd. The projector has the attributes that tomo._geometry_key reads."""
+    RAY_VOXELS = 24
+
+    def __init__(self, n, views, rays_per_view, gen):
+        self.n, self.V, self.rays_per_view = n, views, rays_per_view
+        P = views * rays_per_view
+        self.idx = torch.randint(0, n ** 3, (P, self.RAY_VOXELS), generator=gen)
+        self.wt = torch.rand(P, self.RAY_VOXELS, generator=gen)
+        self.kind, self.angles, self.channel_offset = 'plain', np.zeros(views), 0.0
+        self.view_offsets, self.row_offset, self.ror_mask = None, 0.0, False
+
+    def with_q(self, Q):
+        return self
+
+    def fwd(self, vols):
+        return (vols.reshape(-1, vols.shape[-1])[self.idx] * self.wt.to(vols.dtype)[..., None]).sum(1)
+
+    def back(self, rays):
+        out = torch.zeros(self.n ** 3, rays.shape[-1], dtype=rays.dtype)
+        out.index_add_(0, self.idx.reshape(-1),
+                       (self.wt.to(rays.dtype)[..., None] * rays[:, None, :]).reshape(-1, rays.shape[-1]))
+        return out.reshape(self.n, self.n, self.n, -1)
+
+
+def _lean_tomo_fit(texture, normalize):
+    """A small tomographic fit on the CPU for the lean_passes checks: one bcc material in a cube, the strain tensor with
+    the equilibrium prior, the strain's spread along the rays, two contamination components and, with texture, the
+    per-voxel cubic4 texture. Its data are Poisson counts from a true state, and the fit starts from another state."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
+    from mbirtorch.hsnt.strain.tomo import TomoFit, STRAIN_SMOOTH2_SD
+    n, nv, rpv = LEAN_N, LEAN_VIEWS, LEAN_RAYS_PER_VIEW
+    gen = torch.Generator().manual_seed(23)
+    proj = _LeanProjector(n, nv, rpv, gen)
+    lam = np.linspace(2.0, 4.4, LEAN_BINS)
+    M = Hybrid2(lam, np.full_like(lam, LEAN_DOSE), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3,
+                n_contam=2, device='cpu', shape_model='cubic4' if texture else None, texture_basis=9 if texture else 1)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    g[M.kap_sl[0]:M.kap_sl[1]] = torch.tensor([0.05, 0.2], dtype=torch.float64)
+    d = torch.randn(nv, 3, generator=gen, dtype=torch.float64)
+    d = d / d.norm(dim=1, keepdim=True)
+    w = torch.stack([d[:, 0] ** 2, d[:, 1] ** 2, d[:, 2] ** 2, 2 * d[:, 0] * d[:, 1], 2 * d[:, 1] * d[:, 2],
+                     2 * d[:, 0] * d[:, 2]], 1).float()
+    P = nv * rpv
+    f = torch.zeros(M.J, M.K); f[0, 20:40] = 0.03; f[1, 50:70] = 0.02
+    fit = FitB(M, torch.ones(P, M.K), g, torch.ones(P, 1), f, eps=torch.zeros(P, 1), chunk=P // LEAN_CHUNKS)
+    if texture:
+        M.view_dirs = d.numpy()
+        fit.ray_view = torch.arange(nv).repeat_interleave(rpv)
+    V = torch.zeros(n, n, n, 1); V[2:6, 2:6, 2:6] = 1.0
+    x = torch.linspace(-1.0, 1.0, n)[:, None, None].expand(n, n, n)
+    E = 1e-3 * torch.stack([c * x for c in (1.0, -0.5, 0.3, 0.2, -0.1, 0.05)], -1)[..., None, :] * V[..., None]
+    tf = TomoFit(fit, proj, V, E, weights=w, elastic=[(211e9, 0.29)], density_smooth=True, normalize=normalize,
+                 smooth_order=2, smooth_sd=STRAIN_SMOOTH2_SD, cg_iters=LEAN_CG_ITERS)
+    if texture:
+        tf.set_texture_voxels(1.0, 1.0)
+        u = torch.tensor([0.3, 0.5, 0.81], dtype=torch.float64)
+        tf.Tx = (0.05 * harmonics4(u / u.norm())).float().reshape(1, 1, 1, 1, 9) * V[..., None]
+        tf.sync()
+    tf.edge_spread = True
+    tf.refresh_spread()
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = (torch.poisson(LEAN_DOSE * m.double(), generator=gen) / LEAN_DOSE).float()
+    # the starting state
+    tf.V = (0.7 * V + 0.05 * torch.rand(n, n, n, 1, generator=gen)).contiguous()
+    tf.E = torch.zeros_like(tf.E)
+    if texture:
+        tf.Tx = torch.zeros_like(tf.Tx)
+    g0 = fit.g.clone(); g0[sl['h'][0]:sl['h'][1]] *= 0.9
+    fit.g = g0; fit.f = 0.5 * f; fit.eps_sd = None
+    tf.sync()
+    return tf
+
+
+def _lean_run(texture, normalize, lean, keep=None):
+    """Runs LEAN_ITERS iterations of the driver's steps (fe_cube_multi.py: volume, texture, recentring, global and
+    contamination steps) on a new _lean_tomo_fit, with lean_passes on or off. keep None leaves keep_gb at its default,
+    'none' keeps no model parts, and 'one' keeps one chunk's. Returns the objective after each iteration, the passes over
+    the rays in each iteration, the final state and, per iteration, whether the fit holds no kept model parts after it."""
+    tf = _lean_tomo_fit(texture, normalize)
+    fit = tf.fit; M = fit.M
+    fit.lean_passes = lean
+    if keep == 'none':
+        fit.keep_gb = 0.0
+    elif keep == 'one':                                      # room for one chunk's n and beta, not for two
+        from mbirtorch.hsnt.strain.model import GB
+        fit.keep_gb = 1.5 * fit.chunk * (M.K + M.J) * torch.finfo(M.dt).bits / 8 / GB
+    fit.fisher_every = 2; fit.contamination_newton = True
+    damp = 1e-3
+    objectives, passes, freed = [], [], []
+    for _ in range(LEAN_ITERS):
+        p0 = fit.pass_count()
+        tf.volume_step()
+        if texture:
+            with torch.no_grad():
+                tf.texture_step()
+        tf.recenter_strain(full=True)
+        _, damp = fit.global_step(damp)
+        fit.contamination_atoms_step()
+        passes.append(fit.pass_count() - p0)
+        freed.append(fit._kept is None)
+        objectives.append(tf.loss() + float(fit.spline_penalty(fit.g)) + float((fit.lam_c * fit.c).sum()))
+    state = dict(V=tf.V, E=tf.E, g=fit.g, f=fit.f, c=fit.c, W=fit.W, eps=fit.eps)
+    if texture:
+        state['Tx'] = tf.Tx
+    return objectives, passes, {k: v.detach().clone() for k, v in state.items()}, freed
+
+
+def _largest_rel(a, b):
+    """The largest difference between a and b relative to b's largest magnitude."""
+    a, b = torch.as_tensor(a, dtype=torch.float64), torch.as_tensor(b, dtype=torch.float64)
+    return float((a - b).abs().max() / b.abs().max().clamp_min(torch.finfo(torch.float64).tiny))
+
+
+def _lean_differences(run, ref):
+    """The objectives' and each state's largest relative difference between two _lean_run results."""
+    out = {'objective': _largest_rel(run[0], ref[0])}
+    out.update({k: _largest_rel(run[2][k], ref[2][k]) for k in ref[2]})
+    return out
+
+
+@pytest.mark.parametrize('texture,normalize,keep,saved', [(True, True, None, 2.0), (True, False, 'none', 1.0),
+                                                          (False, True, 'one', 1.0 / LEAN_CHUNKS)])
+def test_lean_passes_matches_default(texture, normalize, keep, saved):
+    """FitB.lean_passes gives the default path's objectives and states (volumes, strain, texture, spectrum and
+    contamination parameters, ray maps) over LEAN_ITERS iterations of the driver's steps, bitwise when the default path
+    is deterministic (see LEAN_NOISE_MARGIN). It makes at least `saved` fewer passes over the rays per iteration: the
+    texture step's starting loss, and the contamination step's passes from the kept model parts. The cases cover the
+    per-voxel texture with and without normalize_fractions, no texture, and the memory budget at no chunk and one chunk.
+    The kept model parts are freed after each contamination step."""
+    ref = _lean_run(texture, normalize, False)
+    again = _lean_run(texture, normalize, False)
+    lean = _lean_run(texture, normalize, True, keep)
+    noise, got = _lean_differences(again, ref), _lean_differences(lean, ref)
+    for k in got:
+        assert got[k] <= LEAN_NOISE_MARGIN * noise[k], (k, got[k], noise[k])
+    assert all(lean[3]) and all(ref[3])
+    if all(v == 0 for v in noise.values()):              # the same steps were taken, so the passes compare per iteration
+        assert ref[1] == again[1]
+        for p_ref, p_lean in zip(ref[1], lean[1]):
+            assert p_lean <= p_ref - saved + 1e-9, (ref[1], lean[1])
+    else:
+        assert sum(lean[1]) < sum(ref[1]), (ref[1], lean[1])
+
+
+def _mount_fit(seed=0):
+    """_volume_step_fit with noiseless data made with series 1's mount shifted by MOUNT_TEST_SHIFT voxels and one view
+    of series 0 shifted by VIEW_TEST_OFFSET channels, so that a mount step and a view-offset step each have a clear way
+    down. The fit starts at the unshifted geometry."""
+    tf = _volume_step_fit(seed)
+    fit, pr = tf.fit, tf.proj
+    (_, _, shift0, _), _ = pr.parts[1]
+    views0 = len(pr.series[0][1])
+    offs = np.zeros(views0); offs[VIEW_TEST_INDEX] = VIEW_TEST_OFFSET
+    pr.set_mount(1, shift=[v + MOUNT_TEST_SHIFT for v in shift0])
+    pr.set_view_offsets(0, offs)
+    tf.sync()
+    with torch.no_grad():
+        fit.T = torch.cat([fit.mean(s)[0] for s in fit.chunks()]).clone()
+    pr.set_mount(1, shift=list(shift0))
+    pr.set_view_offsets(0, np.zeros(views0))
+    tf.sync()
+    return tf
+
+
+def _mount_run(lean):
+    """A mount step and a view-offset step on a new _mount_fit, with lean_passes on or off, from a synced state whose
+    data loss the fit holds (as after a contamination step). Returns each step's passes over the rays, each step's
+    length, the loss after them, the mounts and view offsets after them, and the fit's device."""
+    tf = _mount_fit()
+    fit = tf.fit
+    fit.lean_passes = lean
+    tf.sync(); fit.data_loss()
+    p0 = fit.pass_count()
+    out_m = tf.mount_step()
+    p1 = fit.pass_count()
+    out_v = tf.view_offset_step()
+    p2 = fit.pass_count()
+    geometry = [v for m in out_m['mounts'] for v in m['shift'] + m['rot'] + [m['offset']]] + \
+        [v for offs in out_v['offsets'] for v in offs]
+    return ((p1 - p0, p2 - p1), (out_m['alpha'], out_v['alpha']), tf.loss(), torch.tensor(geometry, dtype=torch.float64),
+            fit.device)
+
+
+def test_lean_passes_mount_and_view_steps():
+    """With lean_passes, TomoFit.mount_step and view_offset_step skip the projection of unchanged volumes and take
+    their starting loss from the fit's remembered data loss, so each makes one pass over the rays fewer than the
+    default path. They take the same steps: bitwise on a deterministic device, and on a GPU within the default path's
+    own run-to-run difference or LEAN_GPU_TOL (relative for the loss, in voxels, degrees and channels for the
+    geometry)."""
+    ref, again, lean = _mount_run(False), _mount_run(False), _mount_run(True)
+    assert lean[1] == ref[1] == again[1], (ref[1], again[1], lean[1])
+    assert ref[1][0] > 0, ref[1]                                       # the mount step was taken
+    floor = 0.0 if ref[4].type == 'cpu' else LEAN_GPU_TOL
+    noise = (abs(again[2] - ref[2]) / abs(ref[2]), float((again[3] - ref[3]).abs().max()))
+    got = (abs(lean[2] - ref[2]) / abs(ref[2]), float((lean[3] - ref[3]).abs().max()))
+    for g_, n_ in zip(got, noise):
+        assert g_ <= max(LEAN_NOISE_MARGIN * n_, floor), (got, noise)
+    assert ref[0] == again[0]
+    assert all(abs(p_lean - (p_ref - 1.0)) < 1e-9 for p_ref, p_lean in zip(ref[0], lean[0])), (ref[0], lean[0])

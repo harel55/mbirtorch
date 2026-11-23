@@ -158,6 +158,10 @@ HALF_TINY = float(torch.finfo(torch.float16).tiny)
 HALF_SAMPLE_RAYS = 4096      # half_rounding samples at most this many rays for its logged statistics.
 # pinned_empty passes this cudaHostRegister flag (cudaHostRegisterPortable), so every GPU treats the memory as pinned.
 HOST_REGISTER_PORTABLE = 1
+# With lean_passes, the fit keeps at most this many GB of the chunks' model parts (FitB.mean's n and beta) on the device,
+# for a later pass at the same state. The chunks beyond it are computed again. FitB.keep_gb starts at this value.
+LEAN_KEEP_GB = 8.0
+GB = 1e9                     # bytes per gigabyte (the unit of LEAN_KEEP_GB)
 
 
 def half_rounding(T, d):
@@ -1209,6 +1213,16 @@ class FitB:
         # The results are the same up to rounding. A chunk with a ray at CUBIC4_FLOOR is differentiated by forward mode,
         # as by default.
         self.closed_form_strain = False
+        # With lean_passes, the fit and its TomoFit skip the passes over the rays and the projections whose results they
+        # already have. A contamination step's trials reuse each chunk's model parts n and beta (mean) from the step's
+        # first pass, and that first pass reuses the parts that the global step's accepted trial computed. The parts are
+        # kept only within keep_gb, and the other chunks are computed again. The results are the same. It is off by
+        # default.
+        self.lean_passes = False
+        self.keep_gb = LEAN_KEEP_GB
+        self._kept = None                 # _keep_start records the kept model parts here.
+        # rays_evaluated counts the rays whose model mean has computed since the fit was made (pass_count).
+        self.rays_evaluated = 0
 
     # -- The measured transmission T (rays, bins). The passes read it one chunk at a time through T_chunk. They take the
     # number of rays from P and the compute device from device. So the storage of T can change without changing them.
@@ -1583,6 +1597,7 @@ class FitB:
         computed (closed_form_strain)."""
         M = self.M; g = self.g if g is None else g
         W = self.W[sl] if W is None else W; f = self.f if f is None else f
+        self.rays_evaluated = getattr(self, "rays_evaluated", 0) + W.shape[0]
         own = eps is None
         if eps is None and self.eps is not None:
             eps = self.eps[sl]
@@ -1598,6 +1613,62 @@ class FitB:
         beta = torch.exp(-W @ kap.T)
         s = 1 - f.sum(0)
         return s * n + beta @ f, E, n, beta, s
+
+    def pass_count(self):
+        """Returns the passes over the rays that mean has made since the fit was made: rays_evaluated over the number of
+        rays. A pass that reuses kept model parts (lean_passes) does not count."""
+        return getattr(self, "rays_evaluated", 0) / max(self.P, 1)
+
+    # -- lean_passes: the model parts n and beta (mean) of each chunk at one state, kept for a later pass at the same
+    # state. They do not depend on the contamination shares f, so the contamination step's passes can reuse them.
+    def _kept_items(self, g):
+        """Returns the tensors that the model parts n and beta depend on at g, besides the model's own settings."""
+        tex = list(self.tex_Q) if self.tex_Q is not None else [None]
+        return [g, self.W, self.eps, self.eps_sd, self.ray_view] + tex + self._model_parts(self.M)
+
+    def drop_kept(self):
+        """Frees the model parts that lean_passes kept."""
+        self._kept = None
+
+    def _keep_start(self, g, cache=None):
+        """Frees the kept model parts and starts a new record of them at g, for lean_passes. cache is the state at g
+        (_state), or None to compute it when it is needed. Returns the record, or None when g carries derivatives."""
+        self._kept = None
+        if self._traced(g):
+            return None
+        self._kept = dict(model=self.M, chunk=self.chunk, rays=self.P, keys=_Keys(self._kept_items(g)), parts={},
+                          bytes=0, cache=cache)
+        return self._kept
+
+    def _keep_part(self, kept, sl, n, beta):
+        """Adds the model parts n and beta of the rays sl to the record kept, if the record then stays within keep_gb."""
+        size = n.numel() * n.element_size() + beta.numel() * beta.element_size()
+        if kept["bytes"] + size <= getattr(self, "keep_gb", LEAN_KEEP_GB) * GB:
+            kept["parts"][sl.start] = (n, beta)
+            kept["bytes"] += size
+
+    def _kept_now(self):
+        """Returns the record of kept model parts when it was made at the current state, else None."""
+        k = getattr(self, "_kept", None)
+        if k is None or k["model"] is not self.M or k["chunk"] != self.chunk or k["rays"] != self.P:
+            return None
+        return k if k["keys"].match(self._kept_items(self.g)) else None
+
+    def _kept_mean(self, sl, kept, f=None):
+        """Returns the model (Pc, K) of the rays sl at the contamination shares f (the current ones by default) and its
+        parts n and beta, as mean does at the current state. The parts come from the record kept when it holds them.
+        Otherwise mean computes them, and they are added to the record within keep_gb."""
+        f = self.f if f is None else f
+        part = kept["parts"].get(sl.start)
+        if part is None:
+            if kept["cache"] is None:
+                kept["cache"] = self._state(self.g)
+            m, _, n, beta, _ = self.mean(sl, f=f, cache=kept["cache"])
+            self._keep_part(kept, sl, n, beta)
+            return m, n, beta
+        n, beta = part
+        s = 1 - f.sum(0)                                   # mean's own expression, so the model is the same
+        return s * n + beta @ f, n, beta
 
     def spline_penalty(self, g):
         """The spline's smoothness and magnitude penalty; with ``kappa_prior`` (a standard deviation) a weak prior on the
@@ -1676,8 +1747,10 @@ class FitB:
         same = all(a[0] is b[0] and a[1] == b[1] for a, b in zip(key, self._state_key()))
         return value if same else None
 
-    def data_loss(self, g=None, W=None, f=None, eps=None):
-        """The deviance of all rays (no penalties) at the given parameters, the current ones by default."""
+    def data_loss(self, g=None, W=None, f=None, eps=None, keep=False):
+        """The deviance of all rays (no penalties) at the given parameters, the current ones by default. keep=True, with
+        lean_passes and the current maps (W and eps None), keeps each chunk's model parts at g within keep_gb, for a
+        contamination step that follows at g (global_step's trials)."""
         current = g is None and W is None and f is None and eps is None
         if current:
             v = self.recall_data_loss()
@@ -1685,10 +1758,16 @@ class FitB:
                 return v
         g = self.g if g is None else g; f = self.f if f is None else f
         cache = self._state(g); tot = 0.0
+        lean_keep = keep and getattr(self, "lean_passes", False) and W is None and eps is None
+        kept = self._keep_start(g, cache) if lean_keep else None
         with torch.no_grad():
             for sl in self.chunks():
                 Ws = None if W is None else W[sl]; es = None if eps is None else eps[sl]
-                m = self.mean(sl, g, Ws, f, es, cache, eps_all=eps)[0]
+                if kept is None:
+                    m = self.mean(sl, g, Ws, f, es, cache, eps_all=eps)[0]
+                else:
+                    m, _, n, beta, _ = self.mean(sl, g, Ws, f, es, cache, eps_all=eps)
+                    self._keep_part(kept, sl, n, beta)
                 tot += self._chunk_total(self.deviance_terms(sl, m, self.T_chunk(sl)).sum(dtype=torch.float64))
         tot = all_sum_float(float(tot), self.device)
         if current:
@@ -1940,11 +2019,17 @@ class FitB:
         Fisher information, including the coupling between the components) by FISTA, then takes the same line search."""
         self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         M = self.M; J = M.J
+        lean = getattr(self, "lean_passes", False)
         if not J:
+            if lean:
+                self.drop_kept()
             return
         if not hasattr(self, "A"):
             self.build_atoms()
-        cache = self._state(self.g)
+        # With lean_passes, the model parts come from the global step's accepted trial when it was made at this state.
+        # Otherwise this pass computes them and keeps them for the trials below.
+        kept = (self._kept_now() or self._keep_start(self.g)) if lean else None
+        cache = None if kept is not None else self._state(self.g)
         grad = torch.zeros(M.K, J, device=M.dev, dtype=torch.float64)
         Fx = torch.zeros(M.K, J, J, device=M.dev, dtype=torch.float64)
         Fi0 = torch.zeros(M.K, J, device=M.dev, dtype=torch.float64)
@@ -1952,7 +2037,10 @@ class FitB:
         with torch.no_grad():
             for sl in self.chunks():
                 T = self.T_chunk(sl)
-                m, E, n, beta, s = self.mean(sl, cache=cache)
+                if kept is not None:
+                    m, n, beta = self._kept_mean(sl, kept)
+                else:
+                    m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
                 dev += self._chunk_total(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
                 Dm = beta[:, None, :] - n[:, :, None]
@@ -1988,6 +2076,8 @@ class FitB:
         self.f = self._contamination_f(self.c)
         if dev_new is not None:
             self.remember_data_loss(dev_new)
+        if lean:
+            self.drop_kept()
 
     def _contamination_newton(self, A, gc, Fx, c0):
         """The minimizer over c >= 0 of the contamination loss's quadratic model at c0 plus the L1 thresholds, by FISTA:
@@ -2018,6 +2108,14 @@ class FitB:
     def loss_c_data(self, c):
         """The deviance (no penalties) at the contamination coefficients c, the rest at the current state."""
         f = self._contamination_f(c)
+        kept = self._kept_now() if getattr(self, "lean_passes", False) else None
+        if kept is not None:                 # lean_passes: the kept model parts, with only the contamination term new
+            dv = 0.0
+            with torch.no_grad():
+                for sl in self.chunks():
+                    m = self._kept_mean(sl, kept, f)[0]
+                    dv += self._chunk_total(self.deviance_terms(sl, m, self.T_chunk(sl)).sum(dtype=torch.float64))
+            return all_sum_float(float(dv), self.device)
         cache = self._state(self.g); dv = 0.0
         with torch.no_grad():
             for sl in self.chunks():
@@ -2153,6 +2251,9 @@ class FitB:
         """system: (grad, F) already computed at the current state for these indices, to reuse."""
         self.refresh_open_beam()                           # a shared open beam: the bound at the current state
         M = self.M
+        lean = getattr(self, "lean_passes", False)
+        if lean:                       # The trials below keep new model parts, so older ones are freed before the passes.
+            self.drop_kept()
         idx = list(range(M.n_global)) if which is None else list(which)
         idx = [i for i in idx if float(M.ub[i]) > float(M.lb[i])]                     # fixed parameters stay out
         if not idx:
@@ -2181,7 +2282,7 @@ class FitB:
             step = torch.linalg.solve(A, grad[live])
             g_new = g0.clone(); g_new[idx_t[live]] = g0[idx_t[live]] - step
             g_new = torch.maximum(torch.minimum(g_new, M.ub), M.lb)
-            d1 = self.data_loss(g=g_new)
+            d1 = self.data_loss(g=g_new, keep=lean)           # lean_passes: the parts serve the contamination step
             l1 = d1 + self.penalties(g=g_new)
             if l1 < l0:
                 # the move's root mean square in standard errors, from its length in the Fisher metric (with all
@@ -2203,6 +2304,8 @@ class FitB:
                 return l1, max(lam_ / 3, 1e-9)
             lam_ *= 10
         self.last_step_se = 0.0
+        if lean:                                         # No trial was taken, so its kept parts are stale.
+            self.drop_kept()
         return l0, lam_
 
     def _lagged_system(self, idx):
