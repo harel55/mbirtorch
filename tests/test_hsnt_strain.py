@@ -1440,3 +1440,47 @@ def test_half_storage(storage, shared):
     assert info['median_counts_per_bin'] > 0 and info['tiny_share'] == 0.0
     with pytest.raises(ValueError, match='float16 storage'):
         _storage_fit(ref, torch.full_like(ref.T, 2 * HALF_MAX), device, t_dtype='float16')
+
+
+PREFETCH_TEST_RAYS = 20000   # rays of the larger transmission in test_host_prefetch
+PREFETCH_TEST_CHUNK = 1024   # its chunk
+
+
+def test_host_prefetch():
+    """With t_prefetch, host storage gives every chunk of T exactly as stored: a chunk prefetched by the call before
+    (chunks in order, the next pass's first chunk), a mispredicted one (smaller chunks, a repeated chunk, the reverse
+    order), and a chunk after T is replaced. A fit with prefetching takes the same steps as one without, to GPU_RTOL."""
+    if not torch.cuda.is_available():
+        pytest.skip('no GPU')
+    from mbirtorch.hsnt.strain.model import FitB
+    ref = _small_fit_cubic4()
+    a = _storage_fit(ref, ref.T.clone(), 'cuda', t_storage='host')
+    b = _storage_fit(ref, ref.T.clone(), 'cuda', t_storage='host', t_prefetch=True)
+    assert b.t_prefetch and not a.t_prefetch
+    P, half = b.P, max(1, b.chunk // 2)
+    order = (b.chunks() + b.chunks() + [slice(i, min(i + half, P)) for i in range(0, P, half)]
+             + [b.chunks()[1], b.chunks()[1]] + b.chunks()[::-1])
+    for sl in order:
+        x = b.T_chunk(sl)
+        assert x.device == b.device and torch.equal(x.cpu(), ref.T[sl]), sl
+    b.T = ref.T.clone() * 2                                     # a new T: an earlier prefetch must not be used
+    for sl in b.chunks():
+        assert torch.equal(b.T_chunk(sl).cpu(), 2 * ref.T[sl]), sl
+    b.T = ref.T.clone()
+    for x in (a, b):
+        x.build_atoms(); x.contamination_newton = True
+        x.contamination_atoms_step(); x.pixel_step(); x.global_step(1e-3)
+    for key in ('g', 'W', 'eps', 'c', 'f'):
+        y, z = getattr(b, key), getattr(a, key)
+        assert torch.allclose(y, z, rtol=GPU_RTOL, atol=GPU_RTOL * float(z.abs().max())), key
+    # a larger T, with chunks read in order twice while the main stream is kept busy between them
+    Tbig = torch.rand(PREFETCH_TEST_RAYS, b.M.K, dtype=torch.float64, generator=torch.Generator().manual_seed(4))
+    c = FitB(b.M, Tbig, b.g, torch.ones(PREFETCH_TEST_RAYS, 1, dtype=torch.float64, device='cuda'), b.f,
+             chunk=PREFETCH_TEST_CHUNK, t_storage='host', t_prefetch=True)
+    busy = torch.randn(PREFETCH_TEST_CHUNK, PREFETCH_TEST_CHUNK, device='cuda')
+    got = []
+    for sl in c.chunks() * 2:
+        got.append(c.T_chunk(sl) * 1.0)                         # a computation on the chunk, on the main stream
+        busy = torch.tanh(busy @ busy)
+    torch.cuda.synchronize()
+    assert torch.equal(torch.cat(got).cpu(), torch.cat([Tbig, Tbig]))

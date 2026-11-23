@@ -175,6 +175,16 @@ def _compute_device(dev):
     return d
 
 
+_COPY_STREAMS = {}           # the side stream of each GPU on which FitB prefetches chunks of the transmission
+
+
+def _copy_stream(device):
+    """The side stream on which FitB prefetches chunks of the transmission to device. There is one per GPU."""
+    if device not in _COPY_STREAMS:
+        _COPY_STREAMS[device] = torch.cuda.Stream(device)
+    return _COPY_STREAMS[device]
+
+
 def edge_step(off, hf, width=None):
     """Each fine bin's share below a Bragg edge: off is the edge's position less the bin's lower end, hf the bin width
     (the edge a sharp step, so the share is clamp(off / hf, 0, 1)). With width (the standard deviation of the edge's
@@ -887,7 +897,7 @@ class FitB:
     derivatives by the chain rule through the banded operator, contamination per bin."""
 
     def __init__(self, model, T, g, W, f, eps=None, chunk=1024, ridge=None, z=None, alpha=0.05, inflation=1.0,
-                 ray_mask=None, t_storage="device", t_dtype=None):
+                 ray_mask=None, t_storage="device", t_dtype=None, t_prefetch=False):
         """ray_mask (rays,) bool: only the rays where it is True enter the likelihood (use it to leave out detector
         regions the model does not describe, such as a sample holder); None uses every ray.
         t_storage says where the transmission T is kept. 'device' (the default) keeps T as it is given, and the fit
@@ -899,7 +909,10 @@ class FitB:
         t_storage says (the model's device for 'device'), which halves T's memory and its copies. Each chunk is then
         converted to the model's dtype before use. This is not exact: the rounding is about 2^-11 of T, so its share
         of the error grows with the counts per bin (half_rounding, logged in t_half_info). Keep the default for
-        noiseless data and very high counts."""
+        noiseless data and very high counts.
+        t_prefetch True, with t_storage 'host' on a GPU, starts the copy of the next chunk on a side stream while the
+        current one is in use, so that the copies overlap the computation. The numbers are the same. It is off by
+        default."""
         if t_storage not in T_STORAGES:
             raise ValueError(f"t_storage must be one of {T_STORAGES}, not {t_storage!r}")
         if t_dtype not in (None, T_HALF):
@@ -909,6 +922,8 @@ class FitB:
         self._device = T.device if self._t_default else _compute_device(model.dev)
         self._T_ratio = None             # the shared open beam's per-pixel factor, which T_chunk applies outside the default
         self.t_half_info = None          # half_rounding's statistics when T was converted to float16
+        self.t_prefetch = bool(t_prefetch) and t_storage == "host" and self._device.type == "cuda"
+        self._pending = None             # with t_prefetch: (start, stop) of the prefetched rows, their copy, its event
         self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
         self.ray_weight = None if ray_mask is None else ray_mask.to(self.device, self._t_cdt)
         self.n_points = int(all_sum_float((self.P if ray_mask is None else int(ray_mask.sum())) * T.shape[1], self.device))
@@ -948,6 +963,7 @@ class FitB:
     def T(self, value):
         # the dtype in which T_chunk returns the transmission: T's own, or the model's with float16 storage
         self._t_cdt = value.dtype if self.t_dtype is None else self.M.dt
+        self._pending = None                 # a prefetched chunk of an earlier T is not used
         self._T = self._store(value)
 
     def _store(self, value):
@@ -977,11 +993,35 @@ class FitB:
         """The transmission of the rays sl, on the device where the fit computes."""
         if self._t_default:
             return self._T[sl]
-        x = self._T[sl].to(self._device, non_blocking=True)
+        x = self._fetch(sl) if self.t_prefetch else self._T[sl].to(self._device, non_blocking=True)
         if x.dtype != self._t_cdt:           # float16 storage: converted on the device, after the (half-size) copy
             x = x.to(self._t_cdt)
         if self._T_ratio is not None:        # a shared open beam: the bound's transmission, computed as refresh_open_beam does
             x = (x.double() * self._T_ratio[self.shared_open_beam["pix"][sl]]).to(self._t_cdt)
+        return x
+
+    def _fetch(self, sl):
+        """The stored rows sl, copied to the compute device (t_prefetch). If the last call prefetched these rows, this
+        call waits for that copy instead of copying. Before it returns, it starts copying the rows that follow sl
+        (the same number of rows; at the end of T, the first chunk of the next pass) on a side stream."""
+        main = torch.cuda.current_stream(self._device)
+        start, stop, step = sl.indices(self.P)
+        pending, self._pending = self._pending, None
+        if pending is not None and step == 1 and pending[0] == (start, stop):
+            x, done = pending[1], pending[2]
+            main.wait_event(done)                 # the computation on x starts after its copy has finished
+            x.record_stream(main)                 # x's memory is not reused before the main stream is done with it
+        else:
+            x = self._T[sl].to(self._device, non_blocking=True)
+        if step != 1:
+            return x
+        nxt = (stop, min(2 * stop - start, self.P)) if stop < self.P else (0, min(self.chunk, self.P))
+        side = _copy_stream(self._device)
+        with torch.cuda.stream(side):
+            y = self._T[nxt[0]:nxt[1]].to(self._device, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+        self._pending = (nxt, y, done)
         return x
 
     @property

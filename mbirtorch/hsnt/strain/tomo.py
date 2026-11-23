@@ -2031,7 +2031,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
            init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
-           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage='device', t_dtype=None):
+           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage='device', t_dtype=None, t_prefetch=False):
     """The pipeline's start: returns a TomoFit. Each material (an entry of lattices and a0) is one of three kinds. With a
     starting spectrum (a row of init_spectra, e.g. a known material's table), it starts from that spectrum at its a0.
     With a lattice type and a0 only, warm_start searches its lattice parameter within a0 * (1 +- a_range). With
@@ -2084,13 +2084,13 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     stores it in float16 during the fit (not exact; FitB). With either option, T may be given in host memory (pinned
     for fast copies). The noise measurement then copies T to the model's device in chunks, and the warm start's
     factorization copies T to that device as its memory plan allows. Both use T as given, before any float16
-    rounding."""
+    rounding. t_prefetch is FitB's: with 'host', each pass's copies overlap its computation (the same numbers)."""
     from mbirtorch import hsnt
     from .model import _compute_device
     # the device for the steps that read the whole T: None (T's own) by default, the model's device with the options
     t_default = t_storage == 'device' and t_dtype is None
     t_dev = None if t_default else _compute_device(device)
-    t_kw = {} if t_default else dict(t_storage=t_storage, t_dtype=t_dtype)
+    t_kw = {} if t_default else dict(t_storage=t_storage, t_dtype=t_dtype, t_prefetch=t_prefetch)
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
