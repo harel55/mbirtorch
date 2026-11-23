@@ -2353,6 +2353,8 @@ class AndersonMixing:
 
 
 PROLONG_MODES = ('constant', 'trilinear')    # prolong: block copies, or trilinear interpolation between voxel centres
+PROLONG_WEIGHT_MIN = 1e-8                    # prolong: a fine voxel whose interpolated weight is at or below this holds
+                                             # no material, and it takes the unweighted interpolation
 
 
 def prolong(x, factor, mode='trilinear', weight=None):
@@ -2362,29 +2364,42 @@ def prolong(x, factor, mode='trilinear', weight=None):
     'constant' copies each coarse voxel into its fine voxels. Mode 'trilinear' interpolates between the coarse voxel
     centres, and it holds the outermost values out to the faces. weight, when given, has as many axes as x and the
     same first three, and it broadcasts against x. The result is then interp(weight x) / interp(weight) where
-    interp(weight) exceeds EPS_W_MIN, and interp(x) elsewhere. Use the volume fraction as the weight for a strain, a
-    texture or a d0 field, so that the empty voxels next to a face do not dilute it."""
+    interp(weight) exceeds PROLONG_WEIGHT_MIN, and interp(x) elsewhere. Use the volume fraction as the weight for a
+    strain, a texture or a d0 field, so that the empty voxels next to a face do not dilute it. The function works on
+    one channel (one index of the trailing axes) at a time, so its working memory beyond the result is a few fine
+    volumes of one channel."""
     if mode not in PROLONG_MODES:
         raise ValueError(f'prolong: mode must be one of {PROLONG_MODES}, not {mode!r}')
     f = int(factor)
     if f != factor or f < 1:
         raise ValueError(f'prolong: factor must be a positive integer, not {factor!r}')
-    if weight is not None and (weight.dim() != x.dim() or weight.shape[:3] != x.shape[:3]):
+    if weight is not None and (weight.dim() != x.dim() or weight.shape[:3] != x.shape[:3]
+                               or any(w not in (1, s) for w, s in zip(weight.shape, x.shape))):
         raise ValueError(f'prolong: weight {tuple(weight.shape)} must have the axes of x {tuple(x.shape)}')
-
-    def up(y):
-        n0, n1, n2 = y.shape[:3]; tail = y.shape[3:]
-        if y.numel() == 0:
-            return y.new_zeros((f * n0, f * n1, f * n2, *tail))
-        if mode == 'constant':
-            return y.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
-        c = y.reshape(n0, n1, n2, -1).permute(3, 0, 1, 2)[None]                  # (1, channels, n0, n1, n2)
-        out = torch.nn.functional.interpolate(c, scale_factor=f, mode='trilinear', align_corners=False)[0]
-        return out.permute(1, 2, 3, 0).reshape(f * n0, f * n1, f * n2, *tail)
-
     if f == 1:
         return x.clone()
-    if weight is None:
-        return up(x)
-    den = up(weight)
-    return torch.where(den > EPS_W_MIN, up(weight * x) / den.clamp_min(EPS_W_MIN), up(x))
+    n0, n1, n2 = x.shape[:3]
+    out = x.new_empty((f * n0, f * n1, f * n2, *x.shape[3:]))
+    if out.numel() == 0:
+        return out
+
+    def up(y):                                   # It maps one channel (n0, n1, n2) to the fine grid (f n0, f n1, f n2).
+        if mode == 'constant':
+            return y.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
+        return torch.nn.functional.interpolate(y.contiguous()[None, None], scale_factor=f, mode='trilinear',
+                                               align_corners=False)[0, 0]
+
+    xs = x.reshape(n0, n1, n2, -1)
+    ws = None if weight is None else torch.broadcast_to(weight, x.shape).reshape(n0, n1, n2, -1)
+    outs = out.view(f * n0, f * n1, f * n2, -1)
+    for c in range(xs.shape[3]):
+        if ws is None:
+            outs[..., c] = up(xs[..., c])
+            continue
+        den = up(ws[..., c])
+        val = up(ws[..., c] * xs[..., c]) / den.clamp_min(PROLONG_WEIGHT_MIN)
+        empty = den <= PROLONG_WEIGHT_MIN
+        if bool(empty.any()):
+            val[empty] = up(xs[..., c])[empty].to(val.dtype)
+        outs[..., c] = val
+    return out

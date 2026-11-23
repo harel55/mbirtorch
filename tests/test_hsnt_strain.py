@@ -1265,8 +1265,9 @@ def test_prolong():
     """prolong (coarse-to-fine): factor 1 returns its input unchanged, which is the default path. Mode 'constant'
     copies each coarse voxel into its block of fine voxels. Mode 'trilinear' reproduces a linear field at the fine
     voxel centres between the outermost coarse centres. The weighted form keeps a strain that is constant over a
-    material's voxels constant up to the faces, where the plain form dilutes it."""
-    from mbirtorch.hsnt.strain.tomo import prolong
+    material's voxels constant up to the faces, where the plain form dilutes it. The weighted form also equals its
+    definition, computed from whole-tensor interpolations, where some fine voxels hold no material."""
+    from mbirtorch.hsnt.strain.tomo import prolong, PROLONG_WEIGHT_MIN
     n, f = 6, 2
     x = torch.rand(n, n, n, 2, 3, generator=torch.Generator().manual_seed(0))
     for mode in ('constant', 'trilinear'):
@@ -1289,7 +1290,19 @@ def test_prolong():
     Ew = prolong(E, f, 'trilinear', weight=V[..., None])
     assert torch.allclose(Ew[own], torch.full_like(Ew[own], 1e-3), rtol=1e-5, atol=0)
     assert float(prolong(E, f, 'trilinear')[own].min()) < 0.9e-3
-    for bad in (dict(factor=1.5), dict(factor=f, mode='cubic'), dict(factor=f, weight=V)):
+    # the weighted form against its definition, with an empty slab of coarse voxels where the plain form is used
+    gen = torch.Generator().manual_seed(1)
+    xd = torch.rand(n, n, n, 2, 3, generator=gen, dtype=torch.float64)
+    wd = torch.rand(n, n, n, 2, 1, generator=gen, dtype=torch.float64); wd[:2] = 0
+    for mode in ('constant', 'trilinear'):
+        den = prolong(wd, f, mode)
+        ref = torch.where(den > PROLONG_WEIGHT_MIN, prolong(wd * xd, f, mode) / den.clamp_min(PROLONG_WEIGHT_MIN),
+                          prolong(xd, f, mode))
+        assert bool((den <= PROLONG_WEIGHT_MIN).any())
+        assert torch.allclose(prolong(xd, f, mode, weight=wd), ref, rtol=1e-12, atol=0)
+    assert prolong(torch.zeros(0, n, n, 2), f).shape == (0, f * n, f * n, 2)
+    for bad in (dict(factor=1.5), dict(factor=f, mode='cubic'), dict(factor=f, weight=V),
+                dict(factor=f, weight=torch.ones(n, n, n, 2, 1))):
         with pytest.raises(ValueError):
             prolong(E, **bad)
 
