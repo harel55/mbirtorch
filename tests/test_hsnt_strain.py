@@ -607,6 +607,46 @@ def test_d0_step_recovers_a_dilatation_field():
     assert float(res.abs().max()) < 0.05 * float(tf._eq_residual(tf.E, inner).abs().max())
 
 
+@pytest.mark.parametrize('block', [7, 64, 1000])
+def test_block_band_matches_dense(block):
+    """The block-banded resolution band (Hybrid2.block_band) gives the dense band's product and gradient (to the
+    BAND_DROP share it leaves out), on uneven wavelength bins whose count is not a multiple of the block, for blocks
+    smaller and larger than the band."""
+    from mbirtorch.hsnt.strain.model import Hybrid2
+    gen = torch.Generator().manual_seed(4)
+    lam = 1.5 + np.cumsum(0.008 + 0.006 * torch.rand(301, generator=gen, dtype=torch.float64).numpy())
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device='cpu', two_scale=True, dtype=torch.float64)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.003, 0.004, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    Rb = M.band(g)
+    E = torch.rand(23, M.Kf, generator=gen, dtype=torch.float64, requires_grad=True)
+    dense = M.apply_band(E, M.band_matrix(Rb, torch.float64))
+    blk = M.apply_band(E, M.block_band(Rb, torch.float64, block=block))
+    assert blk.shape == dense.shape
+    assert torch.allclose(blk, dense, rtol=0, atol=1e-8 * float(dense.abs().max()))
+    w = torch.rand(dense.shape, generator=gen, dtype=torch.float64)
+    g1, = torch.autograd.grad((dense * w).sum(), E)
+    g2, = torch.autograd.grad((blk * w).sum(), E)
+    assert torch.allclose(g1, g2, rtol=0, atol=1e-8 * float(g1.abs().max()))
+
+
+def test_band_operator_choice():
+    """band_operator uses the block-banded product for a narrow kernel (two-scale: a few tens of columns carry the
+    weight) and the dense matrix for the Ikeda-Carpenter kernel's long tails."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, BlockBand
+    lam = np.linspace(1.035, 6.027, 1420)
+    kinds = {}
+    for kern, vals in (('two_scale', [0.0, 0.0015, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0]),
+                       ('ikeda_carpenter', [0, 0.00118, 0.00039, 0.00059, 0, 0.0002, 0, 0])):
+        M = Hybrid2(lam, np.full_like(lam, 3838.0), [('bcc', (2.8665 * 0.98, 2.8665 * 1.02))], device='cpu',
+                    dtype=torch.float64, two_scale=True, kernel=kern)
+        g = torch.zeros(M.n_global, dtype=torch.float64)
+        g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(vals, dtype=torch.float64)
+        kinds[kern] = isinstance(M.band_operator(M.band(g)), BlockBand)
+    assert kinds == {'two_scale': True, 'ikeda_carpenter': False}
+
+
 def test_fine_projector():
     """FineProjector: back is the adjoint of fwd, and a volume constant over each factor^3 block projects as the
     detector-resolution projector projects its block values (lengths in detector pixels)."""

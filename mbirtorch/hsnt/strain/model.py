@@ -132,6 +132,11 @@ CUBIC4_FLOOR = 0.05              # cubic4: the smallest texture factor (a trunca
 CUBIC4_QUADRATURE = (12, 24)     # cubic4: Gauss-Legendre nodes in cos(polar) x uniform azimuths, exact for degree 8
 VIEW_TEXTURES = ("cubic4",)      # shape models whose spectra depend on the view
 EDGE_SPREAD_MIN = 1e-3           # edge_step: an edge spread below this share of a fine bin is a sharp step
+BAND_BLOCK = 64                  # rows of the resolution band per block of its block-banded product (Hybrid2.block_band)
+BAND_DROP = 1e-9                 # block_band leaves out band values below this share of their row's sum (below float32's
+                                 # precision); the two-scale kernel then needs ~66 of the band's 461 slots
+BAND_BLOCK_FILL = 0.25           # band_operator uses the block-banded product when its blocks cover at most this share of
+                                 # the fine grid (2026-11-22: two-scale 9%, 2.7x faster; Ikeda-Carpenter 35%, no gain)
 WINDOW_COMPILE = True             # compile the windowed spectrum's assembly on a GPU (fused passes; no-gradient evaluations)
 EDGE_SPREAD_REACH = 8.0          # edge spread: bins farther than this many widths from an edge take the sharp step's share
 SHAPE_MODELS = (None, "extinction", "texture", "cubic4")   # the shape models Hybrid2 accepts
@@ -924,13 +929,45 @@ class Hybrid2:
         Rb = (hi_c - lo_c).clamp_min(0) * self.phi[self.band_idx] * self.band_valid
         return Rb / Rb.sum(1, keepdim=True).clamp_min(1e-30)
 
+    def block_band(self, Rb, dtype=None, block=BAND_BLOCK):
+        """The band values Rb (K, bw) as a BlockBand: for each block of `block` rows, the fine-grid columns its rows reach
+        (from band_idx, so uneven bins work; values below BAND_DROP of their row's sum are left out) and the dense
+        (columns x rows) slice of the band over them. Duplicate indices at the grid's ends add up, as in sparse."""
+        dtype = self.dt if dtype is None else dtype
+        K, bw = Rb.shape; idx = self.band_idx
+        keep = Rb.abs() > BAND_DROP * Rb.abs().sum(1, keepdim=True)
+        Rb = Rb * keep
+        idx_lo = torch.where(keep, idx, torch.full_like(idx, self.Kf)); idx_hi = torch.where(keep, idx, torch.full_like(idx, -1))
+        nb = (K + block - 1) // block; Kp = nb * block
+        row_blk = torch.arange(K, device=Rb.device) // block
+        c0 = torch.full((nb,), self.Kf, device=Rb.device, dtype=torch.long).scatter_reduce(0, row_blk, idx_lo.min(1).values, 'amin')
+        c1 = torch.zeros(nb, device=Rb.device, dtype=torch.long).scatter_reduce(0, row_blk, idx_hi.max(1).values + 1, 'amax')
+        c0 = torch.minimum(c0, c1 - 1).clamp(0, self.Kf - 1)          # a block with no values keeps one column
+        W = max(int((c1 - c0).max()), 1)
+        cols = (c0[:, None] + torch.arange(W, device=Rb.device)[None, :]).clamp(max=self.Kf - 1)   # (nb, W)
+        blocks = torch.zeros(nb, W, block, device=Rb.device, dtype=dtype)
+        k = torch.arange(K, device=Rb.device)[:, None].expand(K, bw)
+        kk, mm = keep.nonzero(as_tuple=True)
+        blocks.index_put_((row_blk[kk], idx[kk, mm] - c0[row_blk[kk]], kk % block), Rb[kk, mm].to(dtype), accumulate=True)
+        return BlockBand(blocks, cols, K)
+
+    def band_operator(self, Rb, dtype=None):
+        """The fit's band product for the band values Rb: the block-banded one (block_band) when its blocks cover at most
+        BAND_BLOCK_FILL of the fine grid, else the dense matrix (band_matrix)."""
+        B = self.block_band(Rb, dtype)
+        return B if B.cols.shape[1] <= BAND_BLOCK_FILL * self.Kf else self.band_matrix(Rb, dtype)
+
     def band_matrix(self, Rb, dtype=None):
         """The band as a dense (K, Kf) matrix. A dense product is several times faster on a GPU than the sparse one
         (the band covers about a sixth of the fine grid), and the matrix is small (K x Kf)."""
         return self.sparse(Rb, dtype).to_dense()
 
     def apply_band(self, E, Rb):
-        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw), its sparse matrix, or its dense matrix."""
+        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw), its sparse matrix, its dense matrix, or its
+        BlockBand (block_band, the fastest)."""
+        if isinstance(Rb, BlockBand):
+            out = torch.bmm(E[:, Rb.cols].permute(1, 0, 2), Rb.blocks.to(E.dtype))          # (blocks, Pc, block)
+            return out.permute(1, 0, 2).reshape(E.shape[0], -1)[:, :Rb.K]
         if Rb.layout == torch.sparse_csr:
             return (Rb @ E.T).T
         S = Rb if Rb.shape == (self.K, self.Kf) else self.band_matrix(Rb, E.dtype)
@@ -938,6 +975,16 @@ class Hybrid2:
 
     def kappa(self, g):
         return g[self.kap_sl[0]:self.kap_sl[1]].reshape(self.J, self.R)
+
+
+class BlockBand:
+    """The resolution band as blocks of BAND_BLOCK consecutive rows, each a small dense (W x block) slice of the band with
+    the fine-grid columns it covers (Hybrid2.block_band). Hybrid2.apply_band multiplies a spectrum by it in one batched
+    product: about a quarter of the dense product's work, with the same result (2026-11-22: 4x faster on a GPU)."""
+    __slots__ = ("blocks", "cols", "K")
+
+    def __init__(self, blocks, cols, K):
+        self.blocks, self.cols, self.K = blocks, cols, K
 
 
 class _BandLater:
@@ -1130,7 +1177,7 @@ class FitB:
 
     def _state(self, g):
         M = self.M
-        return M.spectra(g).to(M.dt), M.band_matrix(M.band(g)), M.kappa(g).to(M.dt)
+        return M.spectra(g).to(M.dt), M.band_operator(M.band(g)), M.kappa(g).to(M.dt)
 
     def mean(self, sl, g=None, W=None, f=None, eps=None, cache=None):
         M = self.M; g = self.g if g is None else g
@@ -1734,7 +1781,7 @@ class FitB:
         assert not any(M.res_sl[0] <= i < M.res_sl[1] for i in idx), 'global_grad holds the resolution kernel fixed'
         gp = self.g.clone().requires_grad_(True)
         with torch.no_grad():
-            band = M.band_matrix(M.band(self.g))
+            band = M.band_operator(M.band(self.g))
         grad = torch.zeros_like(self.g); dev = 0.0
         for sl in self.chunks():
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
