@@ -26,7 +26,7 @@ import weakref
 import numpy as np
 import torch
 
-from .model import LEGENDRE_DEGREE, Hybrid2, FitB, ls_init_material
+from .model import LEGENDRE_DEGREE, Hybrid2, FitB, ls_init_material, _Keys
 from .bragg import warm_start, BraggSpectrum
 from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
@@ -781,18 +781,24 @@ class TomoFit:
         fit = self.fit; M = fit.M; nt = len(self.tex_r)
         if nt == 0:
             return 0.0
-        self.sync(); cache = fit._state(fit.g); _, Rb, _ = cache
+        self._sync_if_needed(); cache = fit._state(fit.g); _, Rb, _ = cache
         P = fit.P; Y = M._harmonics_views().to(self.V.dtype)
         a = torch.zeros(P, nt, device=self.V.device, dtype=self.V.dtype)        # sum_k r d_r per ray
         B = torch.zeros(P, nt, nt, device=self.V.device, dtype=self.V.dtype)    # sum_k w d_r d_r' per ray
+        # With lean_passes, this pass also sums the data loss, as data_loss would, so obj0 below costs no pass.
+        devs = [] if self.lean_passes else None
         for sl in fit.chunks():
             m, E, n_, beta, s_ = fit.mean(sl, cache=cache)
             mm = m.clamp_min(1e-12); T = fit.T_chunk(sl)
+            if devs is not None:
+                devs.append(fit._chunk_total(fit.deviance_terms(sl, m, T).sum(dtype=torch.float64)))
             r_ = fit.residual(sl, T, mm); w_ = fit.weight(sl, mm)
             W = fit.W[sl]
             d = torch.stack([-s_ * M.apply_band(E * (W[:, r:r + 1] * fit.texture_curve(sl, r)), Rb) for r in self.tex_r], 2)
             a[sl] = torch.einsum('pk,pkr->pr', r_, d).to(a.dtype)
             B[sl] = torch.einsum('pk,pkr,pks->prs', w_, d, d).to(B.dtype)
+        if devs is not None:
+            fit.remember_data_loss(all_sum_float(float(sum(devs)), fit.device))
         views = fit.ray_view; Yv = Y[views]                                         # (P, 9)
         Wt = torch.stack([fit.W[:, r] for r in self.tex_r], 1)                      # (P, nt)
         inv_w = torch.where(Wt > EPS_W_MIN, 1.0 / Wt.clamp_min(EPS_W_MIN), torch.zeros_like(Wt))
@@ -824,6 +830,8 @@ class TomoFit:
             obj = float(fit.data_loss()) + self.texture_prior(cand)
             if obj < obj0:
                 self.Tx = cand
+                if self.lean_passes:            # fit.tex_Q is already the ray weights of cand, so the maps are current.
+                    self._lean_record()
                 return obj - obj0
         fit.tex_Q = old_Q
         return 0.0
@@ -934,17 +942,90 @@ class TomoFit:
         eps = torch.where(W > EPS_W_MIN, U / W.clamp_min(EPS_W_MIN), torch.zeros_like(U))
         return W.clamp_min(0), eps
 
-    def sync(self):
-        self.fit.W, self.fit.eps = self.rays(self.V, self.E)
+    def sync(self, rays=None):
+        """Projects the current volumes to the fit's ray maps: fit.W, fit.eps and the texture's ray weights fit.tex_Q.
+        rays holds the maps (W, eps) of the current volumes when they are already projected (lean_passes)."""
+        self.fit.W, self.fit.eps = self.rays(self.V, self.E) if rays is None else rays
         if getattr(self, 'tex_basis', None) is not None:              # the texture field's ray weights follow the volume
             self.fit.tex_Q = self.texture_q(self.V, self.fit.W)
         elif getattr(self, 'Tx', None) is not None:                   # per-voxel texture: the rays' mean coefficients
             self.fit.tex_Q = self.texture_rays(self.V, self.Tx, self.fit.W)
+        self._mark_synced()
+
+    def _mark_synced(self):
+        """Records that the fit's ray maps are the current volumes' (_is_synced). With lean_passes, it also records what
+        the maps were made from (_lean_synced), and it frees the fit's kept model parts, which new maps make stale."""
         self._synced = (self.V, self.V._version, self.E, self.E._version, self.fit.W, self.fit.W._version,
                         self.fit.eps, self.fit.eps._version)
         if getattr(self, 'spread_grouped', False):
             # refresh_spread reads the geometry these maps were made with, to tell when it may keep its last result.
             self._synced_geometry = (self._synced, _geometry_key(self.proj))
+        if self.lean_passes:
+            self._lean_record()
+            self.fit.drop_kept()
+
+    @property
+    def lean_passes(self):
+        """True when the fit's lean_passes option is on (FitB.lean_passes). This fit then skips the projections and the
+        passes over the rays whose results it already has. The results are the same. It is off by default."""
+        return bool(getattr(getattr(self, 'fit', None), 'lean_passes', False))
+
+    @lean_passes.setter
+    def lean_passes(self, on):
+        self.fit.lean_passes = bool(on)
+
+    def _lean_inputs(self):
+        """Returns two lists for lean_passes. The first holds the volume fractions, the view weights, the texture and
+        the maps made from them (the projected densities and the texture's ray weights). The second holds the strain
+        and the rays' mean strain."""
+        fit = self.fit
+        tq = list(fit.tex_Q) if fit.tex_Q is not None else [None]
+        return ([self.V, fit.W, self.w_ray, getattr(self, 'Tx', None), getattr(self, 'tex_basis', None)] + tq,
+                [self.E, fit.eps])
+
+    def _lean_record(self):
+        """Records the tensors of _lean_inputs and the projector's geometry, as the inputs of the current maps."""
+        volume, strain = self._lean_inputs()
+        self._lean_state = (_Keys(volume), _Keys(strain), _geometry_key(self.proj))
+
+    def _lean_synced(self, strain=True):
+        """Returns True when the fit's ray maps are still those that the last record (_lean_record) describes: no tensor
+        of _lean_inputs is new or changed, and the geometry is the same. strain=False leaves out the strain and the rays'
+        mean strain."""
+        rec = getattr(self, '_lean_state', None)
+        if rec is None:
+            return False
+        volume, strain_ = self._lean_inputs()
+        return rec[0].match(volume) and (not strain or rec[1].match(strain_)) and rec[2] == _geometry_key(self.proj)
+
+    def _sync_if_needed(self):
+        """Makes the fit's ray maps those of the current volumes, at the start of a step. Without lean_passes it always
+        projects them (sync). With lean_passes it projects them only when they are not current, and it frees the fit's
+        kept model parts."""
+        if not self.lean_passes:
+            self.sync()
+            return
+        self.fit.drop_kept()
+        if not self._lean_synced():
+            self.sync()
+
+    def _sync_strain(self):
+        """sync after a change of the strain alone. With lean_passes, when the volume fractions, the texture, their maps
+        and the geometry are the same as at the last sync, only the rays' mean strain is projected again. The projected
+        densities and the texture's ray weights are kept. A new projection of the same volume fractions gives them
+        again, exactly on the CPU and up to the rounding of the projector's atomic adds on a GPU. Otherwise it is sync."""
+        if not (self.lean_passes and self._lean_synced(strain=False)):
+            self.sync()
+            return
+        self.fit.eps = self.rays(self.V, self.E)[1]
+        self._mark_synced()
+
+    def _lean_deviances(self):
+        """Returns a list for FitB.ray_system's deviance argument when a step's derivative pass should also sum the data
+        loss: with lean_passes, and when the fit does not already hold the data loss of the current state. Else None."""
+        if self.lean_passes and self.fit.recall_data_loss() is None:
+            return []
+        return None
 
     def _is_synced(self):
         """True when the fit's projected maps are this volume's: nothing changed since the last sync."""
@@ -1398,12 +1479,16 @@ class TomoFit:
         if V is None and E is None and self._is_synced():
             return self.fit.data_loss()
         V = self.V if V is None else V; E = self.E if E is None else E
+        return self._loss_and_rays(V, E)[0]
+
+    def _loss_and_rays(self, V, E):
+        """Returns data_loss(V, E) and the ray maps (W, eps) that it projected from V and E."""
         W, eps = self.rays(V, E)
         cache = self.fit._state(self.fit.g); tot = 0.0
         with torch.no_grad():
             for sl in self.fit.chunks():
                 tot += self.fit._chunk_total(self.fit.ray_loss(sl, W[sl], eps[sl], cache, eps_all=eps).sum())
-        return all_sum_float(float(tot), V.device)
+        return all_sum_float(float(tot), V.device), W, eps
 
     def loss(self, V=None, E=None, mask=None):
         return self.data_loss(V, E) + self.prior(self.V if V is None else V, self.E if E is None else E, mask)
@@ -1414,7 +1499,7 @@ class TomoFit:
         self.refresh_spread()                                  # the rays' strain spread at the current volumes
         self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         fit, R, C = self.fit, self.R, self.C
-        self.sync()
+        self._sync_if_needed()
         cache = fit._state(fit.g)
         P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R                                   # (W, U) and, anisotropic, U_tr
@@ -1524,19 +1609,32 @@ class TomoFit:
                 dV, dE = zV + (rz_new / rz) * dV, zE + (rz_new / rz) * dE; rz = rz_new
             dec = float(-(gV * free * xV).sum() - (gE * fE * xE).sum())            # Newton decrement^2 (deviance)
             l0 = self.loss(mask=mask)
+            lean = self.lean_passes
 
             def at(alpha, beta=0.0):
                 Vn, En = V + alpha * xV, E + alpha * xE
                 if beta:
                     Vn, En = Vn + beta * pV, En + beta * pE
                 Vn = Vn.clamp(0, self.v_max)
+                if lean:                          # lean_passes: the trial's ray maps also, for the sync after the step
+                    d1, Wn, en = self._loss_and_rays(Vn, En)
+                    return d1 + self.prior(Vn, En, mask), d1, Vn, En, (Wn, en)
                 d1 = self.data_loss(Vn, En)
                 return d1 + self.prior(Vn, En, mask), d1, Vn, En
+
+            def keep_best(tried):
+                # With lean_passes, only the best trial so far (the one that min below picks) keeps its volumes and maps.
+                if lean:
+                    best = min(tried, key=lambda k: tried[k][0])
+                    for k in list(tried):
+                        if k != best and tried[k][2] is not None:
+                            tried[k] = tried[k][:2] + (None,) * (len(tried[k]) - 2)
+                return tried
             # line search: the objective at step lengths 1 and 1/2, the parabola through them and l0, and its minimizer.
             # The Gauss-Newton model predicts the parabola l0 - alpha dec + alpha^2 dec / 2; where the true curvature
             # along the step is larger (strain enters through the edges, not log-linearly), the full step overshoots
             # and the iterates zig-zag (2026-10-23: successive strain steps had cosine -0.94)
-            tried = {1.0: at(1.0), 0.5: at(0.5)}
+            tried = keep_best({1.0: at(1.0), 0.5: at(0.5)})
             l1, lh = tried[1.0][0], tried[0.5][0]
             c = 2.0 * (l1 - 2.0 * lh + l0); b = (l1 - l0) - c
             self.last_line = dict(curvature_ratio=(2.0 * c / dec) if dec > 0 else None,
@@ -1546,14 +1644,16 @@ class TomoFit:
             if c > 0:
                 a_star = min(max(-b / (2.0 * c), LINE_ALPHA_RANGE[0]), LINE_ALPHA_RANGE[1])
                 if all(abs(a_star - k) > 1e-3 for k in tried):
-                    tried[a_star] = at(a_star)
+                    tried[a_star] = at(a_star); keep_best(tried)
             tried = {(k, 0.0): v for k, v in tried.items()}
             prev = self._prev_step if (self.momentum and self._prev_step is not None and self._prev_step[0].shape == V.shape) else None
             if prev is not None and c > 0:
                 # the plane of the Gauss-Newton step x and the previous step p: the loss at p, p/2 and x + p gives the
                 # quadratic's slope and curvature along p and its cross term; its minimizer is tried as well
                 pV, pE = prev[0] * free, proj_E(prev[1] * fE)
-                tried[(0.0, 1.0)] = at(0.0, 1.0); tried[(0.0, 0.5)] = at(0.0, 0.5); tried[(1.0, 1.0)] = at(1.0, 1.0)
+                tried[(0.0, 1.0)] = at(0.0, 1.0); keep_best(tried)
+                tried[(0.0, 0.5)] = at(0.0, 0.5); keep_best(tried)
+                tried[(1.0, 1.0)] = at(1.0, 1.0); keep_best(tried)
                 lp, lph, lxp = tried[(0.0, 1.0)][0], tried[(0.0, 0.5)][0], tried[(1.0, 1.0)][0]
                 cp = 2.0 * (lp - 2.0 * lph + l0); bp = (lp - l0) - cp                # along p: l0 + bp t + cp t^2
                 cxp = lxp - l0 - (b + c) - (bp + cp)                                  # the cross term's coefficient
@@ -1566,17 +1666,27 @@ class TomoFit:
                     ab = (min(max(float(ab[0]), LINE_ALPHA_RANGE[0]), LINE_ALPHA_RANGE[1]),
                           min(max(float(ab[1]), MOMENTUM_RANGE[0]), MOMENTUM_RANGE[1]))
                     if all(abs(ab[0] - k[0]) + abs(ab[1] - k[1]) > 1e-3 for k in tried):
-                        tried[ab] = at(*ab)
+                        tried[ab] = at(*ab); keep_best(tried)
             for alpha in (0.25,):                                                    # the old fallback
                 if min(v[0] for v in tried.values()) >= l0:
-                    tried[(alpha, 0.0)] = at(alpha)
-            (alpha, beta), (l_best, d1, Vn, En) = min(tried.items(), key=lambda kv: kv[1][0])
+                    tried[(alpha, 0.0)] = at(alpha); keep_best(tried)
+            (alpha, beta), chosen = min(tried.items(), key=lambda kv: kv[1][0])
+            if chosen[2] is None:
+                # keep_best dropped the chosen trial's volumes. That happens only if a trial replaced a better one under
+                # the same key, so the trial is made again.
+                chosen = at(alpha, beta)
+            l_best, d1, Vn, En = chosen[:4]
             if l_best < l0:
                 self.last_line['alpha'] = alpha; self.last_line['beta'] = beta
                 self.last_step_se = self._step_se(alpha * alpha * dec)
                 self._prev_step = (Vn - V, En - E)
                 self._last_rel_step = float((En - E).norm() / E.norm().clamp_min(1e-30))   # the strain's relative move
-                self.V, self.E = Vn, En; self.sync(); fit.remember_data_loss(d1)
+                if not lean:
+                    self.V, self.E = Vn, En; self.sync(); fit.remember_data_loss(d1)
+                elif getattr(self, 'normalize', False):
+                    self.V, self.E = Vn, En           # normalize_fractions below projects the maps, so none is made here
+                else:
+                    self.V, self.E = Vn, En; self.sync(rays=chosen[4]); fit.remember_data_loss(d1)
                 self.damp = max(self.damp / 3, 1e-6)
                 if getattr(self, 'normalize', False):
                     self.normalize_fractions()
@@ -1883,15 +1993,18 @@ class TomoFit:
         self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         proj, fit, R, C = self.proj, self.fit, self.R, self.C
         refine_rigid = list(range(1, len(proj.parts))) if refine_rigid is None else list(refine_rigid)
-        self.sync()
+        self._sync_if_needed()
         cache = fit._state(fit.g)
         P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R
         G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
         F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
+        devs = self._lean_deviances()
         with torch.no_grad():
             for sl in fit.chunks():
-                G[sl], F[sl] = fit.ray_system(sl, cache)
+                G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
+        if devs is not None:                     # the data loss at this state, so the loss below costs no pass
+            fit.remember_data_loss(all_sum_float(float(sum(devs)), fit.device))
         # the mounts move the (W, U) projections; the trace's share (anisotropy, small) is left to the line search
         G, F = G[:, :2 * R].contiguous(), F[:, :2 * R, :2 * R].contiguous()
         n = self.V.shape[0]
@@ -1959,15 +2072,18 @@ class TomoFit:
         self.fit.refresh_open_beam()                           # a shared open beam: the bound at the current state
         proj, fit, R, C = self.proj, self.fit, self.R, self.C
         series = list(range(len(proj.parts))) if series is None else list(series)
-        self.sync()
+        self._sync_if_needed()
         cache = fit._state(fit.g)
         P = fit.P
         nc = 3 * R if self.anisotropic else 2 * R
         G = torch.zeros(P, nc, device=fit.device, dtype=torch.float64)
         F = torch.zeros(P, nc, nc, device=fit.device, dtype=torch.float64)
+        devs = self._lean_deviances()
         with torch.no_grad():
             for sl in fit.chunks():
-                G[sl], F[sl] = fit.ray_system(sl, cache)
+                G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
+        if devs is not None:                     # the data loss at this state, so the loss below costs no pass
+            fit.remember_data_loss(all_sum_float(float(sum(devs)), fit.device))
         # the mounts move the (W, U) projections; the trace's share (anisotropy, small) is left to the line search
         G, F = G[:, :2 * R].contiguous(), F[:, :2 * R, :2 * R].contiguous()
         n = self.V.shape[0]
@@ -2078,7 +2194,7 @@ class TomoFit:
                     a_new = min(max(a_new, float(M.lb[ia])), float(M.ub[ia]))
                 self.fit.g[ia] = a_new
                 moved.append(d)
-        self.sync()
+        self._sync_strain()                                  # only the strain changed (all of sync without lean_passes)
         return moved
 
     def support_mask(self):
