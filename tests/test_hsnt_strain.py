@@ -980,7 +980,7 @@ def test_warmup_searches_unknown_materials(known):
         lat[known] = mats[known][0]; a0[known] = mats[known][1]
         init = [None, None]; init[known] = mu[known]
     _, info = warmup(T.float(), lam, np.full(lam.size, 1e5), lat, a0, proj, device='cpu', init_spectra=init,
-                     d0_from_data=True, noise=None, normalize=False)
+                     d0_from_data=True, noise=None, normalize=False, a_range=0.01)      # not the search's +-2%
     for (lt, a), (lt_f, a_f) in zip(mats, info['found']):
         assert lt_f == lt and abs(a_f / a - 1) < 1e-3
 

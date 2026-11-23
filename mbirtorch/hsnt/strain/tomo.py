@@ -2145,9 +2145,9 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         assert all(np.isfinite(cost[i, j]) for i, j in zip(rows_i, order)), (fd_s, typed)
         for i, j in zip(rows_i, order):
             r = search[i]; thetas[r] = th_s[j]; a_f = float(th_s[j][0])
-            found[r] = fd_s[j] if typed[i] is not None else (fd_s[j][0], (a_f * (1 - a_range), a_f * (1 + a_range)))
-            if lats[r] is None:
-                lats[r] = found[r]
+            found[r] = fd_s[j]                         # the search's range: theta's edge slots are counted over it
+            if lats[r] is None:                        # the fit's bounds: a_range about the found parameter
+                lats[r] = (fd_s[j][0], (a_f * (1 - a_range), a_f * (1 + a_range)))
     lattices = [f[0] for f in found]
     a0 = [float(th[0]) if a is None else a for a, th in zip(a0, thetas)]
     targets = []
