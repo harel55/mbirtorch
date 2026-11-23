@@ -2351,3 +2351,40 @@ class AndersonMixing:
         self.dF, self.dG, self.prev, self.w = [], [], None, None
         return dict(used=0, rejected=True, loss=l_x - l_G)
 
+
+PROLONG_MODES = ('constant', 'trilinear')    # prolong: block copies, or trilinear interpolation between voxel centres
+
+
+def prolong(x, factor, mode='trilinear', weight=None):
+    """Return x on a grid that is factor times finer along its first three axes. Use it to continue a fit from a
+    coarser grid (coarse-to-fine). x has shape (n0, n1, n2, ...), and the result has shape (factor n0, factor n1,
+    factor n2, ...). Each coarse voxel covers factor^3 fine voxels, and the two grids share their outer faces. Mode
+    'constant' copies each coarse voxel into its fine voxels. Mode 'trilinear' interpolates between the coarse voxel
+    centres, and it holds the outermost values out to the faces. weight, when given, has as many axes as x and the
+    same first three, and it broadcasts against x. The result is then interp(weight x) / interp(weight) where
+    interp(weight) exceeds EPS_W_MIN, and interp(x) elsewhere. Use the volume fraction as the weight for a strain, a
+    texture or a d0 field, so that the empty voxels next to a face do not dilute it."""
+    if mode not in PROLONG_MODES:
+        raise ValueError(f'prolong: mode must be one of {PROLONG_MODES}, not {mode!r}')
+    f = int(factor)
+    if f != factor or f < 1:
+        raise ValueError(f'prolong: factor must be a positive integer, not {factor!r}')
+    if weight is not None and (weight.dim() != x.dim() or weight.shape[:3] != x.shape[:3]):
+        raise ValueError(f'prolong: weight {tuple(weight.shape)} must have the axes of x {tuple(x.shape)}')
+
+    def up(y):
+        n0, n1, n2 = y.shape[:3]; tail = y.shape[3:]
+        if y.numel() == 0:
+            return y.new_zeros((f * n0, f * n1, f * n2, *tail))
+        if mode == 'constant':
+            return y.repeat_interleave(f, 0).repeat_interleave(f, 1).repeat_interleave(f, 2)
+        c = y.reshape(n0, n1, n2, -1).permute(3, 0, 1, 2)[None]                  # (1, channels, n0, n1, n2)
+        out = torch.nn.functional.interpolate(c, scale_factor=f, mode='trilinear', align_corners=False)[0]
+        return out.permute(1, 2, 3, 0).reshape(f * n0, f * n1, f * n2, *tail)
+
+    if f == 1:
+        return x.clone()
+    if weight is None:
+        return up(x)
+    den = up(weight)
+    return torch.where(den > EPS_W_MIN, up(weight * x) / den.clamp_min(EPS_W_MIN), up(x))
