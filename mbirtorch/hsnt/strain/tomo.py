@@ -50,8 +50,9 @@ CG_ITERS = 30                   # conjugate-gradient iterations per volume step
 LINE_ALPHA_RANGE = (0.05, 2.0)  # the volume step's line search: the step lengths its parabola's minimizer is clamped to
 MOMENTUM_RANGE = (-1.0, 3.0)    # with momentum=True: the multiples of the previous step the volume step may add
 RAY_SYMBOL_REFRESH = 5          # precond='fft_ray': the data's strain symbol is recomputed every this many volume steps
-SYMBOL_IMAG_TOL = 1e-10         # fft_compact: the priors' Fourier symbol is stored as real numbers when its largest
-                                # imaginary part is at most this fraction of its largest real part (else as complex)
+SYMBOL_IMAG_TOL = 1e-13         # fft_compact: the priors' Fourier symbol is stored as real numbers when, for every
+                                # material, its largest imaginary part is at most this fraction of its largest real
+                                # part (else as complex).  Double-precision FFT rounding gives about 1e-16.
 FFT_INVERT_BATCH = 2 ** 17      # fft_compact: the spatial frequencies whose blocks are inverted at once (this bounds
                                 # the inversion's temporary memory)
 RAY_SUM_CHUNK = 2 ** 20         # fft_compact: the rays summed at once for the data's strain block (this bounds its
@@ -1644,9 +1645,10 @@ class TomoFit:
     def _prior_symbol_half(self):
         """(n, n, n // 2 + 1, R, C, C): the strain priors' Fourier symbol (_prior_symbol) on the half of the spectrum
         that torch.fft.rfftn returns.  The symbol is real when the priors do not change under reflection through a
-        voxel, and it is then stored as float64.  symbol_imag_rel records its largest imaginary part relative to its
-        largest real part.  When that ratio exceeds SYMBOL_IMAG_TOL, the symbol is built again and stored as
-        complex128, which takes twice the memory.  fft_compact_storage records which of the two was used."""
+        voxel, and it is then stored as float64.  symbol_imag_rel records, for the material where it is largest, the
+        largest imaginary part relative to that material's largest real part.  When that ratio exceeds SYMBOL_IMAG_TOL,
+        the symbol is built again and stored as complex128, which takes twice the memory.  fft_compact_storage records
+        which of the two was used."""
         R, C, V = self.R, self.C, self.V
         n = V.shape[0]; c = (n // 2,) * 3
         full = torch.ones(n, n, n, R, dtype=torch.bool, device=V.device)
@@ -1654,7 +1656,7 @@ class TomoFit:
 
         def build(dtype):
             out = torch.zeros(n, n, n // 2 + 1, R, C, C, dtype=dtype, device=V.device)
-            imag = torch.zeros((), dtype=torch.float64, device=V.device); real = torch.zeros_like(imag)
+            imag = torch.zeros(R, dtype=torch.float64, device=V.device); real = torch.zeros_like(imag)   # per material
             for r in range(R):
                 for k in range(C):
                     X = torch.zeros(n, n, n, R, C, device=V.device, dtype=V.dtype); X[c + (r, k)] = 1.0
@@ -1664,9 +1666,10 @@ class TomoFit:
                         resp = resp + self.eq_w * torch.func.vjp(div, X)[1](div(X))[0]
                     resp = torch.roll(resp[..., r, :], shifts=tuple(-v for v in c), dims=(0, 1, 2)).double()
                     f = torch.fft.rfftn(resp, dim=(0, 1, 2))
-                    imag = torch.maximum(imag, f.imag.abs().amax()); real = torch.maximum(real, f.real.abs().amax())
+                    imag[r] = torch.maximum(imag[r], f.imag.abs().amax())
+                    real[r] = torch.maximum(real[r], f.real.abs().amax())
                     out[..., r, :, k] = f if dtype.is_complex else f.real
-            return out, float(imag / real.clamp_min(torch.finfo(torch.float64).tiny))
+            return out, float((imag / real.clamp_min(torch.finfo(torch.float64).tiny)).max())
 
         out, self.symbol_imag_rel = build(torch.float64)
         if self.symbol_imag_rel > SYMBOL_IMAG_TOL:

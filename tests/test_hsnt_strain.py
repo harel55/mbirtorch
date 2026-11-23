@@ -417,6 +417,14 @@ def test_fft_preconditioner_symbol(order):
     assert torch.allclose(via, direct, atol=1e-10 * float(direct.abs().max()))
 
 
+# The largest relative difference allowed between the fft_compact output and the default 'fft' output in double
+# precision.  The two paths round differently.  The equilibrium prior's symbol entries are about eq_w = 1e10, so their
+# rounding is about 1e-6.  The softest blocks are about 3e4 (at zero frequency, where the ridge, the data and the
+# damping are all that is left).  The outputs therefore differ by about eq_w * eps / 3e4, which is about 1e-10.  This
+# bound leaves a margin of about 100, and a real error is far larger.
+FFT_COMPACT_REL_TOL = 1e-8
+
+
 class _RayProjector:
     """A test projector whose back is the exact adjoint of fwd: each of P rays sums RAY_VOXELS random voxels with random
     positive weights, in each of Q channels."""
@@ -489,7 +497,7 @@ def test_fft_compact_matches_full(n, R, stencil, order, elastic):
     (zV0, zE0), (zV1, zE1) = old(rV, rE), new(rV, rE)
     assert torch.equal(zV0, zV1)
     rel = float((zE1 - zE0).norm() / zE0.norm())
-    assert rel < 1e-10, rel
+    assert rel < FFT_COMPACT_REL_TOL, rel
     assert tf.fft_compact_storage == 'real', tf.symbol_imag_rel
 
 
@@ -553,7 +561,45 @@ def test_fft_compact_symbol_storage(monkeypatch):
     rE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
     z0, z1 = old(rV, rE)[1], new(rV, rE)[1]
     rel = float((z1 - z0).norm() / z0.norm())
-    assert rel < 1e-10, rel
+    assert rel < FFT_COMPACT_REL_TOL, rel
+
+
+def test_fft_compact_empty_material():
+    """A material without voxels gets no data block and no damping from fft_compact, as from the default 'fft'
+    preconditioner.  Here the second of two materials is empty, and the two outputs agree to rounding.  The test leaves
+    out the equilibrium prior.  With it, the empty material's softest block would be only its ridge, and the rounding
+    would come close to FFT_COMPACT_REL_TOL."""
+    n, R = 16, 2
+    tf, args = _fft_fit(n, R, elastic=False)
+    tf.V[..., 1] = 0
+    assert not bool(tf.material_voxels()[..., 1].any())
+    old, new = _both_preconditioners(tf, args)
+    g = torch.Generator().manual_seed(6)
+    rV = torch.randn(n, n, n, R, generator=g, dtype=torch.float64)
+    rE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
+    z0, z1 = old(rV, rE)[1], new(rV, rE)[1]
+    assert bool(torch.isfinite(z1).all())
+    rel = float((z1 - z0).norm() / z0.norm())
+    assert rel < FFT_COMPACT_REL_TOL, rel
+
+
+def test_fft_compact_leaves_fft_ray():
+    """fft_compact applies to precond='fft' only.  With precond='fft_ray' the default path runs, and its output is the
+    same with the option on and off."""
+    n, R = 12, 1
+    tf, args = _fft_fit(n, R)
+    tf.precond = 'fft_ray'
+    g = torch.Generator().manual_seed(7)
+    ray = torch.randn(n, n, n, R, 6, 6, generator=g, dtype=torch.complex128)
+    tf._ray_symbol = lambda F: ray                       # a stand-in for the data's strain symbol
+
+    def compact(*a, **k):
+        raise AssertionError("the compact preconditioner ran with precond='fft_ray'")
+    tf._fft_preconditioner_compact = compact
+    old, new = _both_preconditioners(tf, args)
+    rV = torch.randn(n, n, n, R, generator=g, dtype=torch.float64)
+    rE = torch.randn(n, n, n, R, 6, generator=g, dtype=torch.float64)
+    assert torch.equal(old(rV, rE)[1], new(rV, rE)[1])
 
 
 def _old_data_block(tf, F, own):
