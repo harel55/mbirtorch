@@ -1943,6 +1943,8 @@ class TomoFit:
         return float('nan'), 0.0
 
 
+UNTYPED_LATTICES = ('fcc', 'bcc')  # warmup: the lattice types searched for a material with no given type (user 2026-11-22:
+                                 # not diamond, whose edges are a subset of fcc's, so fcc data could be reported as diamond)
 UNTYPED_PAIR_COST = 1.0          # warmup: the pairing cost of a material with no given type (above any typed one's lattice mismatch)
 INIT_SPECTRA_RESOLUTION = (0.005, 0.0)   # warmup with init_spectra: the kernel's starting relative width (the Ti rods' 0.02 A at 4 A)
 
@@ -1960,7 +1962,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     """The pipeline's start: returns a TomoFit. Each material (an entry of lattices and a0) is one of three kinds. With a
     starting spectrum (a row of init_spectra, e.g. a known material's table), it starts from that spectrum at its a0.
     With a lattice type and a0 only, warm_start searches its lattice parameter within a0 * (1 +- a_range). With
-    lattice type None (and a0 None), nothing is assumed: warm_start searches its type among the cubic types and its
+    lattice type None (and a0 None), nothing is assumed: warm_start searches its type among UNTYPED_LATTICES and its
     parameter over its full range, among all R materials, and found components that match a given material are left
     out. init_spectra may be None or hold None for the materials to search. The lattice parameters are then fixed: at a0 (a known stress-free reference), or with
     d0_from_data at warm_start's values (strain relative to the sample's mean lattice). With anchor_scale, each
@@ -2053,7 +2055,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
             if all(t is not None for t in typed):     # only lattice parameters to find, each within its given range
                 th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=len(search), lattices=typed, device=device)
             else:                                     # some types unknown: search every cubic type for all R materials
-                th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=R, device=device)
+                th_, fd_, _, _, res_ = warm_start(H0.astype(np.float64), lam, n_bragg=R, lattice_types=UNTYPED_LATTICES,
+                                                  device=device)
             out = [([t.cpu() for t in th_], fd_, res_)]
         th_s, fd_s, resolution = broadcast_objects(out)[0]
         # a component that is a given material (its type, its parameter within a_range) is that material, not a new one
