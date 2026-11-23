@@ -1388,8 +1388,9 @@ def test_lean_syncs_matches_default(case, dtype):
 
 
 def test_lean_syncs_volume_step():
-    """A tomographic fit with FitB.lean_syncs, several chunks of rays and a strain spread along the beam gives the
-    default path's data loss at a trial state (to rounding), and a volume step that lowers the objective as much."""
+    """A tomographic fit with several chunks of rays and a strain spread along the beam, with FitB.lean_syncs, with
+    FitB.closed_form_strain and with both: each gives the default path's data loss at a trial state (to rounding), and
+    a volume step that lowers the objective as much."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     from mbirtorch.hsnt.strain.tomo import TomoFit
     pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
@@ -1405,19 +1406,104 @@ def test_lean_syncs_volume_step():
     V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
     E_true = 1.5e-3 * torch.randn(N, N, N, 1, 1, generator=torch.Generator().manual_seed(6)).to(dev) * (V[..., None] > 0)
 
-    def run(lean):
+    def run(lean, closed=False):
         fit = FitB(M, torch.ones(P, M.K, **kw), g, torch.ones(P, 1, **kw), torch.zeros(1, M.K, **kw),
                    eps=torch.zeros(P, 1, **kw), chunk=512)
         tf = TomoFit(fit, pr, V.clone(), E_true.clone()); tf.sync(); tf.edge_spread = True; tf.refresh_spread()
         with torch.no_grad():
             fit.T = torch.cat([fit.mean(c)[0] for c in fit.chunks()])              # noiseless data at the truth
-        fit.lean_syncs = lean
+        fit.lean_syncs = lean; fit.closed_form_strain = closed
         tf.E = 0.5 * E_true; tf.sync(); tf.refresh_spread()                         # the spread at the start
         trial = tf.data_loss(V, 0.8 * E_true)
         l0 = tf.loss(); tf.volume_step(); l1 = tf.loss()                           # data + prior
         assert isinstance(trial, float)
         return trial, l0, l1
-    ref, got = run(False), run(True)
     assert len(range(0, P, 512)) > 1                                                 # several chunks
-    assert abs(got[0] - ref[0]) <= 1e-5 * abs(ref[0]) and abs(got[1] - ref[1]) <= 1e-5 * abs(ref[1])
-    assert got[2] < got[1] and abs(got[2] - ref[2]) <= 1e-3 * abs(ref[1])
+    ref = run(False)
+    for got in (run(True), run(False, True), run(True, True)):                       # lean, closed form, both
+        assert abs(got[0] - ref[0]) <= 1e-5 * abs(ref[0]) and abs(got[1] - ref[1]) <= 1e-5 * abs(ref[1])
+        assert got[2] < got[1] and abs(got[2] - ref[2]) <= 1e-3 * abs(ref[1])
+
+
+def _close(got, ref, tol):
+    """True when got equals ref to relative tolerance tol, with an absolute floor of tol times ref's largest value.
+    It is a check for the closed-form strain derivatives."""
+    a, b = got.double(), ref.double()
+    return torch.allclose(a, b, rtol=tol, atol=tol * float(b.abs().max()))
+
+
+@pytest.mark.parametrize('dtype', [torch.float64, torch.float32])
+def test_closed_form_strain_matches_jvp(dtype):
+    """Hybrid2.spectra_de gives the spectra and their forward-mode derivatives with respect to each ray's strain along
+    the beam and its mean trace: two materials (one with elastic anisotropy), a global cubic4 texture and a strain
+    spread, with and without a window plan. ray_jacobian with FitB.closed_form_strain equals the default path, and a
+    chunk with a ray at CUBIC4_FLOOR falls back to forward mode."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, WindowPlan, harmonics4
+    lam = np.linspace(1.6, 4.4, 400)
+    M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01)),
+                                               ('fcc', (3.6149 * 0.99, 3.6149 * 1.01))],
+                smooth_degree=5, n_contam=1, device='cpu', dtype=dtype, shape_model='cubic4')
+    gen = torch.Generator().manual_seed(11)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    for r, a0 in enumerate((2.8665, 3.6149)):
+        sl = M.slices[r]; ne = sl['h'][1] - sl['h'][0]
+        g[sl['a']] = a0; g[sl['h'][0]:sl['h'][1]] = 0.2 + 0.1 * torch.rand(ne, generator=gen, dtype=torch.float64)
+        g[sl['c'][0]] = 0.1
+        g[sl['x'][0]:sl['x'][1]] = 0.05 * torch.randn(9, generator=gen, dtype=torch.float64)
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64)
+    d = torch.randn(8, 3, generator=gen, dtype=torch.float64); M.view_dirs = (d / d.norm(dim=1, keepdim=True)).numpy()
+    ne0 = M.slices[0]['h'][1] - M.slices[0]['h'][0]
+    M.set_dec(0, 0.8 + 0.4 * torch.rand(ne0, generator=gen, dtype=torch.float64),
+              0.05 * torch.randn(ne0, generator=gen, dtype=torch.float64))
+    P = 40
+    eps = (1e-3 * torch.randn(P, 4, generator=gen, dtype=torch.float64)).to(dtype)    # strains (R), mean traces (R)
+    sd = (3e-4 * torch.rand(P, 2, generator=gen, dtype=torch.float64)).to(dtype)
+    views = torch.arange(P) // 5
+    tol = 1e-9 if dtype == torch.float64 else 1e-4
+    for plan in (None, [WindowPlan(64, False), WindowPlan(64, False)]):
+        for r in range(2):
+            mu, d_eps, d_tau = M.spectra_de(g, eps, r, views, sd, plan=plan)
+            ok = {'mu': _close(mu, M.spectra(g, eps, views, sd=sd)[:, r], tol)}
+            for col, got in ((r, d_eps), (2 + r, d_tau)):
+                tg = torch.zeros(eps.shape, dtype=torch.float64); tg[:, col] = 1
+                _, dm = torch.func.jvp(lambda e_: M.spectra(g, e_, views, sd=sd)[:, r], (eps.double(),), (tg,))
+                ok[f'column {col}'] = _close(got, dm, tol)
+            assert all(ok.values()), (r, ok)
+        assert M.spectra_de(g, eps[:, :2], 0, views, sd, plan=plan)[2] is None              # no trace columns
+    # ray_jacobian: view 0's texture brings material 0 to the floor, so the first chunk falls back to forward mode
+    Y = harmonics4(torch.as_tensor(M.view_dirs))
+    x0, x1 = M.slices[0]['x']
+    g[x0:x1] = torch.linalg.pinv(Y) @ torch.tensor([-3.0, 0.1, 0.2, -0.1, 0.0, 0.1, -0.2, 0.3], dtype=torch.float64)
+    W = (0.5 + torch.rand(P, 2, generator=gen, dtype=torch.float64)).to(dtype)
+    fit = FitB(M, torch.ones(P, M.K, dtype=dtype), g, W, torch.zeros(1, M.K, dtype=dtype), eps=eps, chunk=16)
+    fit.ray_view = views; fit.eps_sd = sd
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(50.0 * m.double(), generator=gen).to(dtype) / 50.0
+    for lean in (False, True):
+        fit.lean_syncs = lean; fit.closed_form_strain = False
+        cache = fit._state(fit.g)
+        with torch.no_grad():
+            ref = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+            fit.closed_form_strain = True
+            got = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+            assert [fit._ray_jacobian_closed(s, cache) is None for s in fit.chunks()] == [True, False, False]
+        for (J0, m0), (J1, m1) in zip(ref, got):
+            assert J1.shape == J0.shape == (J0.shape[0], M.K, 6)
+            assert _close(J1, J0, tol) and _close(m1, m0, tol)
+
+
+@pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic'])
+def test_closed_form_strain_ray_jacobian(case):
+    """ray_jacobian with FitB.closed_form_strain equals the default path for a powder, a global texture, a texture
+    field and elastic anisotropy, with and without lean_syncs."""
+    fit = _lean_fit(case, torch.float64)
+    for lean in (False, True):
+        fit.lean_syncs = lean; fit.closed_form_strain = False
+        cache = fit._state(fit.g)
+        with torch.no_grad():
+            ref = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+            fit.closed_form_strain = True
+            got = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+        for (J0, m0), (J1, m1) in zip(ref, got):
+            assert _close(J1, J0, 1e-9) and _close(m1, m0, 1e-9)

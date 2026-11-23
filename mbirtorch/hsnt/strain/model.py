@@ -651,7 +651,7 @@ class Hybrid2:
         k0, k1 = self._window_bins(lo_e, hi_e, wd, self.f0)
         return (k1 - k0).max()
 
-    def _ray_spectrum(self, g, r, eps, views, sd, x, smooth, with_da=False, plan=None):
+    def _ray_spectrum(self, g, r, eps, views, sd, x, smooth, with_da=False, plan=None, with_de=False):
         """Material r's spectra (Pc, Kf) under per-ray dilations eps, equal to spectra's per-edge sum but without
         per-edge arrays over all fine bins. Each edge has a window: the bins its rays' edges reach (their spread over the
         rays, plus EDGE_SPREAD_REACH widths of the strain's spread). Below the window every ray's edge is fully present,
@@ -660,7 +660,9 @@ class Hybrid2:
         every bin, for a shape model linked to the heights (extinction, texture) or when a ray's cubic4 factor could
         reach CUBIC4_FLOOR. with_da=True also returns the spectra's derivative with respect to the lattice parameter a
         (Pc, Kf), in closed form: every edge moves in proportion to a. plan: a WindowPlan for these rays (lean_syncs);
-        a wider window than the rays' own gives the same sums, since its extra bins are masked."""
+        a wider window than the rays' own gives the same sums, since its extra bins are masked. with_de=True also
+        returns the spectra's derivatives with respect to each ray's strain along the beam and its mean trace, in
+        closed form (_strain_slopes)."""
         if self.shape_model in ("extinction", "texture"):
             return None
         m, sl = self.mats[r], self.slices[r]; dt = self.dt
@@ -689,7 +691,7 @@ class Hybrid2:
             idx = idx.clamp(max=Kf - 1)
             below = (torch.arange(Kf, device=k0.device)[None, :] < k0[:, None]).double()   # (n_e, Kf)
         lam = self.lamf
-        if not torch.is_grad_enabled() and not with_da:
+        if not torch.is_grad_enabled() and not with_da and not with_de:
             # no derivatives wanted: one fused (compiled) assembly of every part
             q = 1 / ee
             Bq = ((t * h)[:, None] * lam[None, :] * below).to(dt)
@@ -729,6 +731,9 @@ class Hybrid2:
         win = (h.to(dt)[None, :, None] * step * shape) * valid.to(dt)[None]
         out = out.index_add(1, idx.reshape(-1), win.reshape(win.shape[0], -1))
         mu = (x * x).to(dt)[None, :] * out + smooth.to(dt)[None, :]
+        if with_de:
+            return (mu,) + self._strain_slopes(r, eps, e, q, Bq, None if A is None else BqA, A, off, w3, step, shape0,
+                                               None if A is None else fac, lw, h, t, valid, idx, x, plan is not None)
         if not with_da:
             return mu
         with torch.no_grad():
@@ -770,6 +775,60 @@ class Hybrid2:
         nbs = self.nb_shape[r] if getattr(self, "nb_shape", None) is not None and self.nb_shape[r] is not None else 1.0
         smooth = c[0] * nbs + c[1] * x + self.B.double() @ s_
         return self._ray_spectrum(g, r, eps, views, sd, x, smooth, with_da=True, plan=None if plan is None else plan[r])
+
+    def spectra_de(self, g, eps, r, views=None, sd=None, plan=None):
+        """Material r's per-ray spectra (Pc, Kf) and their derivatives (Pc, Kf) with respect to each ray's strain along
+        the beam, eps[:, r], and with respect to its mean trace, eps[:, R + r], in closed form. The third value is None
+        when eps has no trace columns. Returns None when the windowed sum does not apply (see _ray_spectrum). Use it in
+        place of forward-mode differentiation of spectra (FitB.closed_form_strain). plan: as for spectra."""
+        if self.dense_spectra:
+            return None
+        sl = self.slices[r]
+        x = self.lamf / self.lam_ref
+        c = g[sl["c"][0]:sl["c"][1]]; s_ = g[sl["s"][0]:sl["s"][1]]
+        nbs = self.nb_shape[r] if getattr(self, "nb_shape", None) is not None and self.nb_shape[r] is not None else 1.0
+        smooth = c[0] * nbs + c[1] * x + self.B.double() @ s_
+        return self._ray_spectrum(g, r, eps, views, sd, x, smooth, plan=None if plan is None else plan[r], with_de=True)
+
+    def _strain_slopes(self, r, eps, e, q, Bq, BqA, A, off, w3, step, shape0, fac, lw, h, t, valid, idx, x, where):
+        """The derivatives (Pc, Kf) of material r's windowed spectrum (_ray_spectrum) with respect to each ray's strain
+        along the beam, and with respect to its mean trace when eps carries the traces in columns R..2R (else None).
+        Each edge's lattice strain is alpha eps + beta tau (Hybrid2.set_dec), and without set_dec it is eps. A unit of
+        lattice strain moves the edge by e, its unstrained position. That changes 1 / edge below the window. Within the
+        window it moves the edge step, the step's spread and the slope term. The texture factor does not depend on the
+        strain. The other arguments are _ray_spectrum's parts with its names. where is as for edge_step."""
+        m = self.mats[r]; dt = self.dt
+        with torch.no_grad():
+            ed = e.detach().to(dt)
+            qd = q.detach()
+            dq = -ed[None, :] * qd * qd                                                  # d(1 / edge) per unit strain
+            s_off, s_w = edge_step_slopes(off.detach(), self.hf, None if w3 is None else w3.detach(), where=where)
+            dstep = s_off * ed[None, :, None]                                            # the edge moves by e
+            if w3 is not None:
+                dstep = dstep + s_w * (w3.detach() * (ed[None, :] * qd)[:, :, None])     # and its spread with it
+            dshape = t.detach().to(dt)[None, :, None] * lw.to(dt)[None] * dq[:, :, None]  # t lambda d(1 / edge)
+            dwin = dstep * shape0.detach() + step.detach() * dshape
+            if fac is not None:
+                dwin = dwin * fac.detach()
+            dwin = (h.detach().to(dt)[None, :, None] * dwin) * valid.to(dt)[None]
+            Bqd = Bq.detach().to(dt)
+            BqAd = None if BqA is None else BqA.detach().to(dt)
+            Ad = None if A is None else A.detach().to(dt)
+            anis = "alpha" in m
+            coefs = [m["alpha"] if anis else torch.ones_like(e)]                        # per edge, per unit of eps
+            if eps.shape[1] == 2 * self.R:
+                coefs.append(m["beta"] if anis else torch.zeros_like(e))                # per edge, per unit of trace
+            out = []
+            for c in coefs:
+                cd = c.detach().to(dt)
+                dqc = dq * cd[None, :]
+                d = dqc @ Bqd
+                if Ad is not None:
+                    d = d + (Ad[:, None] * dqc) @ BqAd
+                win = dwin * cd[None, :, None]
+                d = d.index_add(1, idx.reshape(-1), win.reshape(win.shape[0], -1))
+                out.append((x * x).to(dt)[None, :] * d)
+            return out[0], (out[1] if len(out) > 1 else None)
 
     def edge_terms(self, g, eps, r, sd=None):
         """Material r's edge terms under per-pixel dilations eps (Pc, R): (Pc, n_edges, Kf) in the model's dtype, each the
@@ -974,6 +1033,10 @@ class FitB:
         # strain are kept from one pass to the next while g does not change, and each pass works out the window widths
         # and the cubic4 floor of all its chunks at once (window_plan). The results are the same up to rounding.
         self.lean_syncs = False
+        # closed_form_strain: ray_jacobian takes the spectra's strain derivatives in closed form (Hybrid2.spectra_de)
+        # in place of forward-mode differentiation, and reuses the same spectra for the mean. The results are the same
+        # up to rounding. A chunk with a ray at CUBIC4_FLOOR is differentiated by forward mode, as by default.
+        self.closed_form_strain = False
 
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
@@ -1257,18 +1320,22 @@ class FitB:
         self._floor_memo = (M, key, [None if t is None else t._version for t in key], hits, y4)
         return hits
 
-    def mean(self, sl, g=None, W=None, f=None, eps=None, cache=None, eps_all=None):
+    def mean(self, sl, g=None, W=None, f=None, eps=None, cache=None, eps_all=None, spectra=None):
         """The model (Pc, K) of the rays sl and its parts (E, n, beta, s) at the given parameters, the current ones by
-        default. eps_all: with lean_syncs, all rays' strains when eps is their slice sl (window_plan)."""
+        default. eps_all: with lean_syncs, all rays' strains when eps is their slice sl (window_plan). spectra: the
+        rays' spectra (Pc, R, Kf) at these parameters, when they are already computed (closed_form_strain)."""
         M = self.M; g = self.g if g is None else g
         W = self.W[sl] if W is None else W; f = self.f if f is None else f
         own = eps is None
         if eps is None and self.eps is not None:
             eps = self.eps[sl]
         mu, Rb, kap = self._state(g) if cache is None else cache
-        X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(
-            g, eps, self._views(sl), self._spectra_tex(g), self._sd(sl),
-            plan=self.window_plan(sl, g, self.eps if own else eps_all)).to(M.dt))
+        if spectra is not None:
+            X = torch.einsum('pr,prk->pk', W, spectra.to(M.dt))
+        else:
+            X = W @ mu if eps is None else torch.einsum('pr,prk->pk', W, M.spectra(
+                g, eps, self._views(sl), self._spectra_tex(g), self._sd(sl),
+                plan=self.window_plan(sl, g, self.eps if own else eps_all)).to(M.dt))
         E = torch.exp(-X)
         n = M.apply_band(E, Rb)
         beta = torch.exp(-W @ kap.T)
@@ -1492,8 +1559,13 @@ class FitB:
 
     def ray_jacobian(self, sl, cache):
         """d m / d (W, U) of the rays sl, (Pc, K, 2R), and the mean m (Pc, K). With each ray's mean trace in eps's columns
-        R..2R (elastic anisotropy, Hybrid2.set_dec): d m / d (W, U, U_tr), (Pc, K, 3R), U_tr the projected trace."""
+        R..2R (elastic anisotropy, Hybrid2.set_dec): d m / d (W, U, U_tr), (Pc, K, 3R), U_tr the projected trace.
+        With closed_form_strain, the strain derivatives come in closed form (_ray_jacobian_closed)."""
         M = self.M; R = M.R
+        if getattr(self, "closed_form_strain", False):
+            closed = self._ray_jacobian_closed(sl, cache)
+            if closed is not None:
+                return closed
         T = self.T[sl]; W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
@@ -1513,6 +1585,35 @@ class FitB:
                 tt = torch.zeros_like(eps); tt[:, R + r] = 1
                 _, dmt = torch.func.jvp(spec, (eps.double(),), (tt.double(),))
                 dmt = dmt[:, r].to(M.dt)
+                colw = colw - eps[:, R + r:R + r + 1] * dmt
+                cols_t.append(-s * M.apply_band(E * dmt, Rb))
+            cols_w.append(-s * M.apply_band(E * colw, Rb) - torch.einsum('jk,pj,j->pk', self.f, beta, kap[:, r]))
+            cols_u.append(-s * M.apply_band(E * dmu, Rb))
+        return torch.stack(cols_w + cols_u + cols_t, 2), m
+
+    def _ray_jacobian_closed(self, sl, cache):
+        """ray_jacobian with the strain derivatives in closed form (Hybrid2.spectra_de). One evaluation of each
+        material's spectra gives the derivatives and the mean. Returns None when a material of the chunk needs the
+        dense sum (a ray at CUBIC4_FLOOR), and ray_jacobian then uses forward-mode differentiation, as by default."""
+        M = self.M; R = M.R
+        W = self.W[sl]; eps = self.eps[sl]
+        plan = self.window_plan(sl, self.g, self.eps)
+        views, sd = self._views(sl), self._sd(sl)
+        parts = []
+        with torch.no_grad():
+            for r in range(R):
+                p = M.spectra_de(self.g, eps, r, views, sd, plan=plan)
+                if p is None:
+                    return None
+                parts.append(p)
+        m, E, n, beta, s = self.mean(sl, cache=cache, spectra=torch.stack([p[0] for p in parts], 1))
+        _, Rb, kap = cache
+        packed = eps.shape[1] == 2 * R                                                # each ray's mean trace in R..2R
+        cols_w, cols_u, cols_t = [], [], []
+        for r, (mu_r, dmu, dmt) in enumerate(parts):
+            # the same columns as ray_jacobian: dX/dW_r (U, Ut fixed) = mu_r - eps_r mu_r' - tau_r mu_r^t'
+            colw = mu_r - eps[:, r:r + 1] * dmu
+            if packed:
                 colw = colw - eps[:, R + r:R + r + 1] * dmt
                 cols_t.append(-s * M.apply_band(E * dmt, Rb))
             cols_w.append(-s * M.apply_band(E * colw, Rb) - torch.einsum('jk,pj,j->pk', self.f, beta, kap[:, r]))
