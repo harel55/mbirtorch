@@ -1,9 +1,13 @@
 """Tests of the experimental strain-tomography projectors in ``mbirtorch.hsnt.strain``."""
 import math
+import types
+import warnings
+
 import numpy as np
 import pytest
 import torch
 
+from mbirtorch.hsnt.strain.model import FallbackWarning
 from mbirtorch.hsnt.strain.tomo import MultiProjector
 
 N = 12
@@ -445,13 +449,13 @@ class _RayProjector:
         return out.reshape(self.n, self.n, self.n, -1)
 
 
-def _fft_fit(n, R, stencil='corner', order=2, elastic=True, dtype=torch.float64, seed=0, proj=None):
+def _fft_fit(n, R, stencil='corner', order=2, elastic=True, dtype=torch.float64, seed=0, proj=None, C=6):
     """A TomoFit with only what the 'fft' preconditioner reads: a cube of material inside an empty volume, the package's
     prior strengths, and random ray information and view weights.  proj None gives a _RayProjector.  Returns the fit and
-    the preconditioner's arguments (F, lam_, pV, dE_, fV, fE), on the projector's device."""
+    the preconditioner's arguments (F, lam_, pV, dE_, fV, fE), on the projector's device.  C is the number of strain
+    components, 6 for the tensor and 1 for one strain."""
     from mbirtorch.hsnt.strain.tomo import TomoFit, EQUILIBRIUM_SD, STRAIN_SMOOTH2_SD, STRAIN_PRIOR_SD
     gen = torch.Generator().manual_seed(seed)
-    C = 6
     tf = object.__new__(TomoFit)
     tf.R, tf.C, tf.precond = R, C, 'fft'
     tf.proj = proj if proj is not None else _RayProjector(n, 4 * n * n, R * (1 + C), gen, dtype)
@@ -500,6 +504,27 @@ def test_fft_compact_matches_full(n, R, stencil, order, elastic):
     rel = float((zE1 - zE0).norm() / zE0.norm())
     assert rel < FFT_COMPACT_REL_TOL, rel
     assert tf.fft_compact_storage == 'real', tf.symbol_imag_rel
+
+
+SCALAR_TEST_N = 16               # test_fft_compact_scalar_strain's volume has this side.
+SCALAR_TEST_SEED = 3             # test_fft_compact_scalar_strain draws its random inputs from this seed.
+SCALAR_STRAIN_COMPONENTS = 1     # A scalar strain has one component per voxel.
+
+
+@pytest.mark.parametrize("R", [1, 2])
+def test_fft_compact_scalar_strain(R):
+    """With one strain per voxel (C = 1) and no equilibrium prior, fft_compact gives the 'fft' preconditioner's output
+    to the double-precision tolerance.  fft_compact is on by default, so it must also hold for a scalar strain fit."""
+    n, C = SCALAR_TEST_N, SCALAR_STRAIN_COMPONENTS
+    tf, args = _fft_fit(n, R, elastic=False, C=C)
+    old, new = _both_preconditioners(tf, args)
+    g = torch.Generator().manual_seed(SCALAR_TEST_SEED)
+    rV = torch.randn(n, n, n, R, generator=g, dtype=torch.float64)
+    rE = torch.randn(n, n, n, R, C, generator=g, dtype=torch.float64)
+    (zV0, zE0), (zV1, zE1) = old(rV, rE), new(rV, rE)
+    assert torch.equal(zV0, zV1)
+    rel = float((zE1 - zE0).norm() / zE0.norm())
+    assert rel < FFT_COMPACT_REL_TOL, rel
 
 
 def test_fft_compact_cg_iterates():
@@ -662,6 +687,7 @@ def test_volume_step_fft_compact():
     """A volume step with fft_compact runs on the package projector, and it agrees with the default step: the Newton
     decrement and the objective's decrease match to the precision of single-precision conjugate gradients."""
     a, b = _volume_step_fit(), _volume_step_fit()
+    a.fft_compact = False
     b.fft_compact = True
     ua, da = a.volume_step()
     ub, db = b.volume_step()
@@ -669,12 +695,29 @@ def test_volume_step_fft_compact():
     assert abs(ub - ua) <= 5e-2 * abs(ua) and abs(db - da) <= 5e-2 * abs(da), (ua, ub, da, db)
 
 
-def _small_fit(seed=0):
-    """A small FitB on the CPU: one bcc material, per-ray dilations, one contamination component, counts from the model."""
+def _speedups_off(obj):
+    """Sets every speedup option that is on by default to off on a FitB, or on a TomoFit and its fit, and returns obj.
+    A reference arm that must take the old default path uses it."""
+    from mbirtorch.hsnt.strain.model import FitB
+    fit = obj if isinstance(obj, FitB) else obj.fit
+    if fit is not obj:
+        obj.fft_compact = False
+        obj.spread_grouped = False
+    fit.lean_syncs = False
+    fit.closed_form_strain = False
+    fit.lean_passes = False
+    fit.fisher_rays = 0
+    fit.drop_kept()
+    return obj
+
+
+def _small_fit(seed=0, shape_model=None):
+    """A small FitB on the CPU: one bcc material, per-ray dilations, one contamination component, counts from the model.
+    shape_model is passed to Hybrid2. The speedup options are off (_speedups_off)."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     lam = np.linspace(2.0, 4.4, 300)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
-                device='cpu', dtype=torch.float64)
+                device='cpu', dtype=torch.float64, shape_model=shape_model)
     g = torch.zeros(M.n_global, dtype=torch.float64)
     sl = M.slices[0]
     g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3; g[sl['c'][0]] = 0.2
@@ -684,7 +727,7 @@ def _small_fit(seed=0):
     W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
     eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
     f = torch.zeros(1, M.K, dtype=torch.float64); f[0, 100:140] = 0.05
-    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, f, eps=eps, chunk=16)
+    fit = _speedups_off(FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, f, eps=eps, chunk=16))
     with torch.no_grad():
         m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
     fit.T = torch.poisson(50.0 * m, generator=gen) / 50.0
@@ -708,6 +751,7 @@ def test_kernel_moves_on_fisher_steps():
     from mbirtorch.hsnt.strain import model as mdl
     fit = _small_fit()
     M = fit.M
+    fit.fisher_rays = 0                   # the kernel's lag applies to the Fisher information from all rays
     fit.fisher_every = 3
     res = list(range(M.res_sl[0], M.res_sl[1]))
     loss = [fit.loss()]
@@ -778,8 +822,9 @@ def _fisher_fit(groups, repeat=1, masked_groups=0, seed=5):
     eps = (1e-3 * torch.cos(2 * u))[:, None]
     f = torch.zeros(1, M.K, dtype=torch.float64); f[0, 100:140] = 0.05
     mask = torch.ones(groups * repeat, dtype=torch.bool); mask[:masked_groups * repeat] = False
-    fit = FitB(M, torch.ones(groups * repeat, M.K, dtype=torch.float64), g, W.repeat_interleave(repeat, 0), f,
-               eps=eps.repeat_interleave(repeat, 0), chunk=16, ray_mask=mask if masked_groups else None)
+    fit = _speedups_off(FitB(M, torch.ones(groups * repeat, M.K, dtype=torch.float64), g,
+                             W.repeat_interleave(repeat, 0), f, eps=eps.repeat_interleave(repeat, 0), chunk=16,
+                             ray_mask=mask if masked_groups else None))
     fit.ray_view = view.repeat_interleave(repeat)
     with torch.no_grad():
         m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
@@ -870,6 +915,7 @@ def test_fisher_rays_global_steps():
     assert all(b <= a + STEP_LOSS_RTOL * abs(a) for a, b in zip(loss, loss[1:]))
     assert recomputed == [k % GLOBAL_TEST_EVERY == 0 for k in range(GLOBAL_TEST_STEPS)]
     assert any(mv for mv, rc in zip(moved, recomputed) if not rc)
+    assert fit._fisher_fallback is None                    # the uniform sample judges every parameter well enough
 
 
 def test_fisher_rays_auto(monkeypatch):
@@ -882,6 +928,116 @@ def test_fisher_rays_auto(monkeypatch):
     fit.subset_fisher(idx)
     n = AUTO_TEST_RAYS_PER_PARAMETER * len(idx)
     assert n < fit.P and fit.fisher_subset_info == dict(rays=n, asked=n, kept=fit.P)
+
+
+# ---- the automatic fallback of fisher_rays
+FISHER_EXACT_RTOL = 1e-12        # The fallback's Fisher information equals global_system's to this relative tolerance.
+RARE_TOTAL_RAYS = 4096           # test_fisher_rays_rare_material_falls_back's fit has this many rays.
+RARE_RAYS = 10                   # Its second material crosses only this many consecutive rays.
+RARE_START = 1000                # The second material's rays start at this ray.
+RARE_STRATUM = 64                # Its ray subset samples one ray in this many.
+RARE_BINS = 100                  # Its data have this many wavelength bins.
+RARE_DOSE = 50.0                 # The data have this many counts per bin at a transmission of 1.
+RARE_SEED = 31                   # The fit's random maps and counts come from this seed.
+RARE_WAVELENGTHS = (2.0, 4.4)    # The data's wavelength bins span this range (angstrom).
+RARE_BCC_A0 = 2.8665             # The bcc material has this lattice parameter (angstrom).
+RARE_FCC_A0 = 3.524              # The fcc material has this lattice parameter (angstrom).
+RARE_A_RANGE = 0.01              # Each lattice parameter may move by this fraction.
+RARE_HEIGHT = 0.3                # Each material's edge heights start at this value.
+RARE_SMOOTH = 0.2                # Each material's first smooth coefficient starts at this value.
+RARE_SMOOTH_DEGREE = 3           # The smooth part of each spectrum has this Legendre degree.
+RARE_BCC_MIN_FRACTION = 0.5      # The bcc material's map on each ray is this value plus a uniform draw from [0, 1).
+# The new tests' resolution kernel has these eight parameters, in the order of Hybrid2.res_sl.
+TEST_KERNEL = (0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0)
+UNIFORM_TEST_STEPS = 3           # test_fisher_rays_uniform_sample_no_fallback takes this many global steps.
+SMALL_TEST_STEPS = 2             # test_fisher_rays_small_problem_default_path takes this many global steps.
+
+
+def _rare_material_fit():
+    """Returns a FitB on the CPU in float64 with a bcc and an fcc material. The bcc material crosses all
+    RARE_TOTAL_RAYS rays, and the fcc material crosses only RARE_RAYS consecutive rays from RARE_START. The counts come
+    from the model. The speedup options are off (_speedups_off)."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    lam = np.linspace(*RARE_WAVELENGTHS, RARE_BINS)
+    a0s = (RARE_BCC_A0, RARE_FCC_A0)
+    M = Hybrid2(lam, np.full_like(lam, RARE_DOSE),
+                [(lt, (a * (1 - RARE_A_RANGE), a * (1 + RARE_A_RANGE))) for lt, a in zip(('bcc', 'fcc'), a0s)],
+                smooth_degree=RARE_SMOOTH_DEGREE, n_contam=1, device='cpu', dtype=torch.float64)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    for r, a0 in enumerate(a0s):
+        sl = M.slices[r]
+        g[sl['a']] = a0; g[sl['h'][0]:sl['h'][1]] = RARE_HEIGHT; g[sl['c'][0]] = RARE_SMOOTH
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(TEST_KERNEL, dtype=torch.float64)
+    gen = torch.Generator().manual_seed(RARE_SEED)
+    W = torch.zeros(RARE_TOTAL_RAYS, M.R, dtype=torch.float64)
+    W[:, 0] = RARE_BCC_MIN_FRACTION + torch.rand(RARE_TOTAL_RAYS, generator=gen, dtype=torch.float64)
+    W[RARE_START:RARE_START + RARE_RAYS, 1] = 1.0
+    fit = _speedups_off(FitB(M, torch.ones(RARE_TOTAL_RAYS, M.K, dtype=torch.float64), g, W,
+                             torch.zeros(1, M.K, dtype=torch.float64)))
+    with torch.no_grad():
+        m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
+    fit.T = torch.poisson(RARE_DOSE * m, generator=gen) / RARE_DOSE
+    return fit
+
+
+def test_fisher_rays_rare_material_falls_back():
+    """A material that crosses fewer rays than one stratum of the fisher_rays subset gets no sampled ray, or one that
+    stands for far more rays than cross it. The first global step finds that the subset misjudges it, warns once, and
+    takes its step with global_system's Fisher information. Every later global step uses all rays, without the
+    subset."""
+    fit = _rare_material_fit()
+    fit.fisher_rays = RARE_TOTAL_RAYS // RARE_STRATUM
+    idx = _free_globals(fit)
+    _, F_ref = fit.global_system(idx)
+    with pytest.warns(FallbackWarning, match='all .* rays'):
+        fit.global_step()
+    assert fit._fisher_fallback is not None
+    F = fit._fisher[1]
+    assert torch.allclose(F, F_ref, rtol=FISHER_EXACT_RTOL,
+                          atol=FISHER_EXACT_RTOL * float(torch.diagonal(F_ref).abs().max()))
+    calls = []
+    subset = fit.subset_fisher
+    fit.subset_fisher = lambda idx_: calls.append(1) or subset(idx_)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)          # The fit warns only once.
+        fit.global_step()
+    assert calls == []
+
+
+def test_fisher_rays_uniform_sample_no_fallback():
+    """When every parameter's information is spread over many rays, the fisher_rays subset passes the check: the first
+    global step computes the full Fisher information once, and the later steps use the subset alone. Nothing is
+    warned."""
+    fit = _fisher_fit(ACCURACY_TEST_RAYS)
+    fit.fisher_rays = fit.P // FISHER_SUBSET_SHARE
+    full, sub = [], []
+    global_system, subset_fisher = fit.global_system, fit.subset_fisher
+    fit.global_system = lambda idx_: full.append(1) or global_system(idx_)
+    fit.subset_fisher = lambda idx_: sub.append(1) or subset_fisher(idx_)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        for _ in range(UNIFORM_TEST_STEPS):
+            fit.global_step()
+    assert fit._fisher_fallback is None
+    assert len(full) == 1 and len(sub) == UNIFORM_TEST_STEPS, (full, sub)
+
+
+def test_fisher_rays_small_problem_default_path():
+    """When the fisher_rays subset would hold at least FISHER_RAYS_MAX_SHARE of the rays, the global step takes the
+    default path with all rays: it never calls subset_fisher, it warns nothing, and its steps equal those with
+    fisher_rays 0."""
+    from mbirtorch.hsnt.strain.model import FISHER_RAYS_AUTO
+    a, b = _small_fit(), _small_fit()
+    a.fisher_rays, b.fisher_rays = FISHER_RAYS_AUTO, 0
+    calls = []
+    subset_fisher = a.subset_fisher
+    a.subset_fisher = lambda idx_: calls.append(1) or subset_fisher(idx_)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        for _ in range(SMALL_TEST_STEPS):
+            a.global_step(); b.global_step()
+    assert calls == [] and a._fisher_fallback is None
+    assert torch.equal(a.g, b.g)
 
 
 def test_contamination_newton_kkt():
@@ -1224,7 +1380,8 @@ def _small_fit_cubic4(seed=0, coeffs=None):
     P = 40
     W = 0.5 + torch.rand(P, 1, generator=gen, dtype=torch.float64)
     eps = 1e-3 * torch.randn(P, 1, generator=gen, dtype=torch.float64)
-    fit = FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64), eps=eps, chunk=16)
+    fit = _speedups_off(FitB(M, torch.ones(P, M.K, dtype=torch.float64), g, W, torch.zeros(1, M.K, dtype=torch.float64),
+                             eps=eps, chunk=16))
     fit.ray_view = torch.arange(P) % 8
     with torch.no_grad():
         m = torch.cat([fit.mean(s)[0] for s in fit.chunks()])
@@ -1596,7 +1753,9 @@ def test_edge_spread():
                torch.zeros(1, M2.K, **kw), eps=torch.zeros(P, 1, **kw), chunk=512)
     V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
     E = 1e-3 * torch.randn(N, N, N, 1, 1, generator=torch.Generator().manual_seed(2)).to(dev)
-    tf = TomoFit(fit, pr, V, E); tf.sync(); tf.edge_spread = True; tf.refresh_spread()
+    tf = TomoFit(fit, pr, V, E); tf.sync(); tf.edge_spread = True
+    tf.spread_grouped = False                    # This test checks the reference path. test_spread_grouped compares.
+    tf.refresh_spread()
     W = pr.with_q(1).fwd(V); m1 = pr.with_q(1).fwd(V * E[..., 0]); m2 = pr.with_q(1).fwd(V * E[..., 0] ** 2)
     keep = W[:, 0] > 1e-3
     var = (m2 / W.clamp_min(1e-12) - (m1 / W.clamp_min(1e-12)) ** 2)[keep, 0]
@@ -1639,6 +1798,7 @@ def _spread_fit(kind, n, R, mounts, C=6):
     P = pr.V * n * n; kw = dict(device=dev)
     fit = FitB(M, torch.ones(P, M.K, **kw), torch.zeros(M.n_global, dtype=torch.float64, **kw), torch.ones(P, R, **kw),
                torch.zeros(1, M.K, **kw), eps=torch.zeros(P, R, **kw), chunk=512)
+    fit.lean_passes = False                              # The test counts refresh_spread's own reuse of its result.
     gen = torch.Generator().manual_seed(7)
     V = torch.zeros(m, m, m, R)
     a, b = m // 4, 3 * m // 4
@@ -1829,8 +1989,8 @@ def _storage_twins(device, shared):
     view (_shared_open_beam_data)."""
     ref = _small_fit_cubic4()
     T, ob = _shared_open_beam_data(ref) if shared else (ref.T, None)
-    return (_storage_fit(ref, T.clone().to(device), device, ob),
-            _storage_fit(ref, T.clone(), device, ob, t_storage='host'))
+    return (_speedups_off(_storage_fit(ref, T.clone().to(device), device, ob, t_storage='device')),
+            _speedups_off(_storage_fit(ref, T.clone(), device, ob, t_storage='host', t_prefetch=False)))
 
 
 @pytest.mark.parametrize('shared', [False, True])
@@ -1953,7 +2113,7 @@ def test_warmup_host_storage(device, noise):
         torch.manual_seed(0)
         out.append(warmup(Tin, lam, np.full(lam.size, 1e5), [lt for lt, _ in mats], [a for _, a in mats], proj,
                           device=device, init_spectra=list(mu), d0_from_data=True, noise=noise, normalize=False,
-                          ray_mask=ray_mask, t_storage=storage))
+                          ray_mask=ray_mask, t_storage=storage, t_prefetch=False))
     (a, ia), (b, ib) = out
     assert a.fit.T is Ta and b.fit.T is Tb                          # neither storage made a copy of T
     assert b.fit.t_storage == 'host' and b.fit.T.device.type == 'cpu' and b.fit.P == a.fit.P
@@ -2016,8 +2176,8 @@ def test_half_storage(storage, shared):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ref = _small_fit_cubic4()
     T, ob = _shared_open_beam_data(ref) if shared else (ref.T, None)
-    a = _storage_fit(ref, T.clone().to(device), device, ob)
-    b = _storage_fit(ref, T.clone(), device, ob, t_storage=storage, t_dtype='float16')
+    a = _storage_fit(ref, T.clone().to(device), device, ob, t_storage='device')
+    b = _storage_fit(ref, T.clone(), device, ob, t_storage=storage, t_dtype='float16', t_prefetch=False)
     assert b.T.dtype == torch.float16 and b.T.device.type == ('cpu' if storage == 'host' else a.device.type)
     for sl in a.chunks():
         x = b.T_chunk(sl)
@@ -2049,7 +2209,7 @@ def test_host_prefetch():
         pytest.skip('no GPU')
     from mbirtorch.hsnt.strain.model import FitB
     ref = _small_fit_cubic4()
-    a = _storage_fit(ref, ref.T.clone(), 'cuda', t_storage='host')
+    a = _storage_fit(ref, ref.T.clone(), 'cuda', t_storage='host', t_prefetch=False)
     b = _storage_fit(ref, ref.T.clone(), 'cuda', t_storage='host', t_prefetch=True)
     assert b.t_prefetch and not a.t_prefetch
     P, half = b.P, max(1, b.chunk // 2)
@@ -2126,8 +2286,8 @@ def _lean_fit(case, dtype, seed=7, device='cpu'):
     if case == 'anisotropic':
         M.set_dec(0, 0.8 + 0.4 * torch.rand(ne, generator=gen, dtype=torch.float64), 0.05 * torch.randn(ne, generator=gen, dtype=torch.float64))
     kw = dict(dtype=dtype, device=device)
-    fit = FitB(M, torch.ones(P, M.K, **kw), g.to(device), W.to(**kw), torch.zeros(1, M.K, **kw), eps=eps.to(**kw),
-               chunk=16)
+    fit = _speedups_off(FitB(M, torch.ones(P, M.K, **kw), g.to(device), W.to(**kw), torch.zeros(1, M.K, **kw),
+                             eps=eps.to(**kw), chunk=16))
     fit.ray_view = (torch.arange(P) // 5).to(device)
     fit.eps_sd = (3e-4 * torch.rand(P, 1, generator=gen, dtype=torch.float64)).to(**kw)
     if case == 'field':
@@ -2198,13 +2358,16 @@ def _lean_outputs(fit):
 
 @pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic', 'floor'])
 @pytest.mark.parametrize('dtype', [torch.float64, torch.float32])
-def test_lean_syncs_matches_default(case, dtype):
+def test_lean_syncs_matches_default(case, dtype, monkeypatch):
     """FitB.lean_syncs (the band kept between passes, one window width and one cubic4 floor decision per pass) gives the
     default path's spectra, losses, ray systems, global systems, global gradient and lattice search, to rounding. A
     pass's window width holds every chunk's own window, in single and in double precision. With 'floor', some chunks
     take the dense sum and others the windowed sum, as on the default path. A pixel_step works out one window width for
     the whole step, and in double precision it gives the default path's maps and strains."""
+    from mbirtorch.hsnt.strain import model
     from mbirtorch.hsnt.strain.model import WINDOW_BUCKET
+    # The test checks the shared window plan, not the rule that limits its size.
+    monkeypatch.setattr(model, 'WINDOW_PLAN_MAX_RATIO', math.inf)
     fit = _lean_fit(case, dtype)
     M = fit.M
     ref = _lean_outputs(fit)
@@ -2280,7 +2443,8 @@ def test_lean_syncs_volume_step():
         None, the data are noiseless data at the truth. A given T is used as the data."""
         fit = FitB(M, torch.ones(P, M.K, **kw), g, torch.ones(P, 1, **kw), torch.zeros(1, M.K, **kw),
                    eps=torch.zeros(P, 1, **kw), chunk=512)
-        tf = TomoFit(fit, pr, V.clone(), E_true.clone()); tf.sync(); tf.edge_spread = True; tf.refresh_spread()
+        tf = _speedups_off(TomoFit(fit, pr, V.clone(), E_true.clone()))      # Each variant sets its options below.
+        tf.sync(); tf.edge_spread = True; tf.refresh_spread()
         if T is None:
             with torch.no_grad():
                 T = torch.cat([fit.mean(c)[0] for c in fit.chunks()])              # noiseless data at the truth
@@ -2394,11 +2558,13 @@ def test_closed_form_strain_matches_jvp(dtype):
     fit.T = torch.poisson(50.0 * m.double(), generator=gen).to(dtype) / 50.0
     for lean in (False, True):
         fit.lean_syncs = lean; fit.closed_form_strain = False
+        fit._warned = set()                       # The fallback warns once per fit, so each round starts afresh.
         cache = fit._state(fit.g)
         with torch.no_grad():
             ref = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
             fit.closed_form_strain = True
-            got = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+            with pytest.warns(FallbackWarning, match='texture'):
+                got = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
             assert [fit._ray_jacobian_closed(s, cache) is None for s in fit.chunks()] == [True, False, False]
         for (J0, m0), (J1, m1) in zip(ref, got):
             assert J1.shape == J0.shape == (J0.shape[0], M.K, 6)
@@ -2424,10 +2590,13 @@ def test_closed_form_strain_ray_jacobian(case):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='the check needs a GPU')
 @pytest.mark.parametrize('case', ['powder', 'views', 'field', 'anisotropic'])
-def test_lean_syncs_no_gpu_waits(case):
+def test_lean_syncs_no_gpu_waits(case, monkeypatch):
     """With FitB.lean_syncs, a pass of the data loss over the chunks of rays does not wait for the GPU once the pass's
     window widths and cubic4 floor decisions are known. torch.cuda.set_sync_debug_mode makes any wait raise an error.
     The pass gives the same loss as data_loss."""
+    from mbirtorch.hsnt.strain import model
+    # The test checks the shared window plan, not the rule that limits its size.
+    monkeypatch.setattr(model, 'WINDOW_PLAN_MAX_RATIO', math.inf)
     fit = _lean_fit(case, torch.float32, device='cuda')
     fit.lean_syncs = True; fit.use_memo = False
     cache = fit._state(fit.g)
@@ -2542,6 +2711,7 @@ class _LeanProjector:
         self.wt = torch.rand(P, self.RAY_VOXELS, generator=gen)
         self.kind, self.angles, self.channel_offset = 'plain', np.zeros(views), 0.0
         self.view_offsets, self.row_offset, self.ror_mask = None, 0.0, False
+        self.Q = None              # This is the channel count of TomoFit's projector. _lean_tomo_fit sets it.
 
     def with_q(self, Q):
         return self
@@ -2556,11 +2726,12 @@ class _LeanProjector:
         return out.reshape(self.n, self.n, self.n, -1)
 
 
-def _lean_tomo_fit(texture, normalize, t_storage='device'):
+def _lean_tomo_fit(texture, normalize, t_storage='device', speedups=False):
     """A small tomographic fit on the CPU for the lean_passes checks: one bcc material in a cube, the strain tensor with
     the equilibrium prior, the strain's spread along the rays, two contamination components and, with texture, the
     per-voxel cubic4 texture. Its data are Poisson counts from a true state, and the fit starts from another state.
-    t_storage is passed to FitB."""
+    t_storage is passed to FitB. With speedups False, the speedup options are off from the start (_speedups_off), and
+    with True they keep their defaults."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB, harmonics4
     from mbirtorch.hsnt.strain.tomo import TomoFit, STRAIN_SMOOTH2_SD
     n, nv, rpv = LEAN_N, LEAN_VIEWS, LEAN_RAYS_PER_VIEW
@@ -2579,9 +2750,12 @@ def _lean_tomo_fit(texture, normalize, t_storage='device'):
     w = torch.stack([d[:, 0] ** 2, d[:, 1] ** 2, d[:, 2] ** 2, 2 * d[:, 0] * d[:, 1], 2 * d[:, 1] * d[:, 2],
                      2 * d[:, 0] * d[:, 2]], 1).float()
     P = nv * rpv
+    proj.Q = M.R * (1 + w.shape[1])              # TomoFit's projector carries the volume fractions and the strain.
     f = torch.zeros(M.J, M.K); f[0, 20:40] = 0.03; f[1, 50:70] = 0.02
     fit = FitB(M, torch.ones(P, M.K), g, torch.ones(P, 1), f, eps=torch.zeros(P, 1), chunk=P // LEAN_CHUNKS,
                t_storage=t_storage)
+    if not speedups:
+        _speedups_off(fit)
     if texture:
         M.view_dirs = d.numpy()
         fit.ray_view = torch.arange(nv).repeat_interleave(rpv)
@@ -2590,6 +2764,8 @@ def _lean_tomo_fit(texture, normalize, t_storage='device'):
     E = 1e-3 * torch.stack([c * x for c in (1.0, -0.5, 0.3, 0.2, -0.1, 0.05)], -1)[..., None, :] * V[..., None]
     tf = TomoFit(fit, proj, V, E, weights=w, elastic=[(211e9, 0.29)], density_smooth=True, normalize=normalize,
                  smooth_order=2, smooth_sd=STRAIN_SMOOTH2_SD, cg_iters=LEAN_CG_ITERS)
+    if not speedups:
+        _speedups_off(tf)
     if texture:
         tf.set_texture_voxels(1.0, 1.0)
         u = torch.tensor([0.3, 0.5, 0.81], dtype=torch.float64)
@@ -2614,14 +2790,14 @@ def _lean_tomo_fit(texture, normalize, t_storage='device'):
 def _lean_run(texture, normalize, lean, keep=None, t_storage='device', options=None):
     """Runs LEAN_ITERS iterations of the driver's steps (fe_cube_multi.py: volume, texture, recentring, global and
     contamination steps) on a new _lean_tomo_fit, with lean_passes on or off. keep None leaves keep_gb at its default,
-    'none' keeps no model parts, and 'one' keeps one chunk's. t_storage is passed to FitB. options maps names of other
-    FitB options to the values that the fit is given, or is None for none. Returns the objective after each iteration,
-    the passes over the rays in each iteration, the final state and, per iteration, whether the fit holds no kept model
-    parts after it."""
-    tf = _lean_tomo_fit(texture, normalize, t_storage)
+    'none' keeps no model parts, and 'one' keeps one chunk's. t_storage is passed to FitB. The speedup options start off
+    (_speedups_off). options maps names of FitB or TomoFit options to the values that the fit is given, or is None for
+    none. Returns the objective after each iteration, the passes over the rays in each iteration, the final state and,
+    per iteration, whether the fit holds no kept model parts after it."""
+    tf = _speedups_off(_lean_tomo_fit(texture, normalize, t_storage))
     fit = tf.fit; M = fit.M
     for name, value in (options or {}).items():
-        setattr(fit, name, value)
+        setattr(fit if hasattr(fit, name) else tf, name, value)
     fit.lean_passes = lean
     if keep == 'none':
         fit.keep_gb = 0.0
@@ -2689,8 +2865,8 @@ def test_lean_passes_matches_default(texture, normalize, keep, saved):
 def _mount_fit(seed=0):
     """_volume_step_fit with noiseless data made with series 1's mount shifted by MOUNT_TEST_SHIFT voxels and one view
     of series 0 shifted by VIEW_TEST_OFFSET channels, so that a mount step and a view-offset step each have a clear way
-    down. The fit starts at the unshifted geometry."""
-    tf = _volume_step_fit(seed)
+    down. The fit starts at the unshifted geometry. The speedup options are off (_speedups_off)."""
+    tf = _speedups_off(_volume_step_fit(seed))
     fit, pr = tf.fit, tf.proj
     (_, _, shift0, _), _ = pr.parts[1]
     views0 = len(pr.series[0][1])
@@ -2751,13 +2927,17 @@ MEMO_RTOL = 1e-12
 
 
 @pytest.mark.parametrize('texture,normalize', [(True, False), (False, True)])
-def test_lean_passes_with_other_options(texture, normalize):
+def test_lean_passes_with_other_options(texture, normalize, monkeypatch):
     """lean_passes gives the objectives and states of the same fit without it when the fit also has t_storage 'host',
     lean_syncs, closed_form_strain and fisher_rays at one ray in FISHER_SUBSET_SHARE. The comparison is the one of
     test_lean_passes_matches_default. The lean path makes fewer passes over the rays, and it frees its kept model parts
-    after each contamination step."""
+    after each contamination step. The TomoFit options fft_compact and spread_grouped are set on both arms too."""
+    from mbirtorch.hsnt.strain import model
+    # This test checks the subset path, not the subset's check. So the check never switches the fit to all rays.
+    monkeypatch.setattr(model, 'FISHER_CHECK_TOL', math.inf)
     rays = LEAN_VIEWS * LEAN_RAYS_PER_VIEW
-    options = dict(lean_syncs=True, closed_form_strain=True, fisher_rays=rays // FISHER_SUBSET_SHARE)
+    options = dict(lean_syncs=True, closed_form_strain=True, fisher_rays=rays // FISHER_SUBSET_SHARE,
+                   fft_compact=True, spread_grouped=True)
     ref, again, lean = [_lean_run(texture, normalize, on, t_storage='host', options=options)
                         for on in (False, False, True)]
     noise, got = _lean_differences(again, ref), _lean_differences(lean, ref)
@@ -2768,7 +2948,7 @@ def test_lean_passes_with_other_options(texture, normalize):
 
 
 @pytest.mark.parametrize('device', ['cpu', 'cuda'])
-def test_fisher_rays_with_host_storage(device):
+def test_fisher_rays_with_host_storage(device, monkeypatch):
     """With fisher_rays and lean_syncs, a fit with t_storage 'host', t_prefetch and lean_passes takes the same pixel,
     global and contamination steps as a fit with the default storage. The two fits agree bitwise on the CPU, and to
     GPU_RTOL on a GPU. After each global step, the data loss that each fit remembers is the data loss of a new pass.
@@ -2776,9 +2956,13 @@ def test_fisher_rays_with_host_storage(device):
     fewer passes over the rays, and it holds no kept model parts at the end."""
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('no GPU')
+    from mbirtorch.hsnt.strain import model
+    # This test checks the subset path, not the subset's check. So the check never switches the fit to all rays.
+    monkeypatch.setattr(model, 'FISHER_CHECK_TOL', math.inf)
     ref = _small_fit_cubic4()
-    a = _storage_fit(ref, ref.T.clone().to(device), device)
+    a = _storage_fit(ref, ref.T.clone().to(device), device, t_storage='device')
     b = _storage_fit(ref, ref.T.clone(), device, t_storage='host', t_prefetch=True)
+    a.lean_passes = False
     exact = device == 'cpu'
 
     def same(x, y):
@@ -2803,6 +2987,7 @@ def test_fisher_rays_with_host_storage(device):
     for x in (a, b):
         x.fisher_rays = x.P // FISHER_SUBSET_SHARE
         x.lean_syncs = True
+        x.closed_form_strain = False
         x.build_atoms(); x.contamination_newton = True
     b.lean_passes = True
     for _ in range(COMBINED_ROUNDS):
@@ -2815,6 +3000,7 @@ def test_fisher_rays_with_host_storage(device):
         for key in ('g', 'W', 'eps', 'c', 'f'):
             assert same(getattr(b, key), getattr(a, key)), key
     assert b.fisher_subset_info['rays'] == a.P // FISHER_SUBSET_SHARE
+    assert a._fisher_fallback is None and b._fisher_fallback is None
     assert b.pass_count() < a.pass_count(), (a.pass_count(), b.pass_count())
     assert b._kept is None
 
@@ -2890,7 +3076,7 @@ def test_one_model_views():
     x = torch.rand(n, n, n, Q, generator=gen)
     y = torch.rand(th.size * n * n, Q, generator=gen)
     for row_offset in (0.0, ONE_MODEL_ROW_OFFSET):
-        old = Projector(n, th, Q, ONE_MODEL_CHANNEL_OFFSET, False, vo, row_offset)
+        old = Projector(n, th, Q, ONE_MODEL_CHANNEL_OFFSET, False, vo, row_offset, one_model_views=False)
         new = Projector(n, th, Q, ONE_MODEL_CHANNEL_OFFSET, False, vo, row_offset, one_model_views=True)
         assert len(old.models) == th.size and len(new.models) == 1
         fwd, back = new.fwd(x).cpu(), new.back(y).cpu()
@@ -2903,7 +3089,7 @@ def test_one_model_views():
     offsets = [0.0, 0.3, -0.2]
     for make, side in ((lambda **k: MultiProjector(N, MOUNTS, 2, channel_offsets=offsets, ror_mask=False, **k), N),
                        (lambda **k: FineProjector(N // 2, MOUNTS, 2, channel_offsets=offsets, ror_mask=False, **k), N)):
-        old, new = make(view_extra=extra), make(view_extra=extra, one_model_views=True)
+        old, new = make(view_extra=extra, one_model_views=False), make(view_extra=extra, one_model_views=True)
         assert all(len(p.models) == len(ANGLES) for _, p in old.parts) and all(len(p.models) == 1 for _, p in new.parts)
         vol = torch.rand(side, side, side, 2, generator=gen)
         rays = torch.rand(sum(old.counts), 2, generator=gen)
@@ -2915,3 +3101,466 @@ def test_one_model_views():
                 p.set_view_offsets(1, changed)
                 p.set_mount(2, shift=ONE_MODEL_MOUNT_SHIFT)
         assert new.with_q(3).one_model_views
+
+
+DEFAULTS_TEST_RAYS = 8           # test_speedup_defaults' fit has this many rays.
+DEFAULTS_TEST_Q = 2              # test_speedup_defaults' projectors carry this many channels.
+DEFAULTS_TEST_OFFSETS = [0.0, 0.3, -0.2]   # test_speedup_defaults' series have these channel offsets.
+DEFAULTS_FINE_FACTOR = 2         # test_speedup_defaults' FineProjector has a grid this many times finer.
+# The window tests set one chunk's strains to this value. With _lean_fit's grid, the shared window is then more than
+# WINDOW_PLAN_MAX_RATIO times any chunk's own width.
+OUTLIER_STRAIN = 8e-2
+WINDOW_FALLBACK_RTOL = 1e-12     # The window fallback's losses and ray systems equal lean_syncs off to this tolerance.
+WARN_ONCE_PASSES = 3             # test_fallback_warns_once makes this many passes.
+CLOSED_FALLBACK_RTOL = 1e-12     # A chunk that falls back to forward mode equals closed_form_strain off to this.
+CLOSED_FORM_RTOL = 1e-9          # A chunk in closed form equals forward mode to this, as in test_closed_form_strain_*.
+CGROUP_TEST_AVAILABLE = 10 ** 10                 # test_host_free_bytes_cgroup's system has this much available memory.
+CGROUP_TEST_TOTAL = 2 * 10 ** 10                 # Its system has this much memory in total.
+# These are the memory.max, memory.current and inactive_file of test_host_free_bytes_cgroup's group.
+CGROUP_TEST_CHILD = (10_000_000, 4_000_000, 1_000_000)
+CGROUP_TEST_PARENT = (6_000_000, 3_000_000)      # These are the parent group's memory.max and memory.current.
+CGROUP_TEST_V1 = (5_000_000, 1_000_000)          # These are a version 1 group's limit and usage.
+CGROUP_TEST_V1_HIGH = 2 * CGROUP_TEST_TOTAL      # A version 1 limit above the total memory counts as no limit.
+BUFFER_TEST_SHAPE = (64, 12)                     # test_transmission_buffer_cpu's transmission has this shape.
+MESSAGE_TEST_BYTES = 3.2e9                       # test_storage_messages' transmission has this many bytes.
+MESSAGE_TEST_HOST_FREE = 4.0e9                   # test_storage_messages' host has this many bytes free.
+MESSAGE_TEST_GPU_FREE = 2.0e9                    # test_storage_messages' GPU has this many bytes free.
+# In test_storage_choice, a memory with room has this many times the transmission's bytes free, and a tight memory
+# has CHOICE_TEST_TIGHT times them free.
+CHOICE_TEST_ROOM = 4.0
+CHOICE_TEST_TIGHT = 1.0
+FRACTION_TEST_TOTAL = 4 * 10 ** 9                # test_device_free_bytes_fraction's GPU has this many bytes.
+FRACTION_TEST_FREE = 3 * 10 ** 9                 # The driver reports this many bytes of it free.
+FRACTION_TEST_RESERVED = 2 * 10 ** 8             # PyTorch holds this many bytes of it.
+FRACTION_TEST_ALLOCATED = 10 ** 8                # PyTorch's tensors use this many of the bytes that it holds.
+FRACTION_TEST_SHARE = 0.25                       # PyTorch may use this share of the GPU's memory.
+KEEP_TEST_SHARE_OF_NEED = 0.5    # test_lean_keep_remedy sets keep_gb to this share of the memory that all parts need.
+
+
+def test_speedup_defaults():
+    """Every speedup option is on by default: lean_syncs, closed_form_strain, lean_passes and fisher_rays
+    FISHER_RAYS_AUTO on a FitB, fft_compact and spread_grouped on a TomoFit, and one_model_views on each projector. A
+    fit on the CPU keeps T as given, without prefetch. Nothing is warned."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB, FISHER_RAYS_AUTO
+    from mbirtorch.hsnt.strain.tomo import Projector, FineProjector
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        lam = np.linspace(*RARE_WAVELENGTHS, RARE_BINS)
+        M = Hybrid2(lam, np.full_like(lam, RARE_DOSE),
+                    [('bcc', (RARE_BCC_A0 * (1 - RARE_A_RANGE), RARE_BCC_A0 * (1 + RARE_A_RANGE)))],
+                    smooth_degree=RARE_SMOOTH_DEGREE, n_contam=1, device='cpu', dtype=torch.float64)
+        T = torch.ones(DEFAULTS_TEST_RAYS, M.K, dtype=torch.float64)
+        fit = FitB(M, T, torch.zeros(M.n_global, dtype=torch.float64),
+                   torch.ones(DEFAULTS_TEST_RAYS, 1, dtype=torch.float64), torch.zeros(1, M.K, dtype=torch.float64))
+        assert fit.lean_syncs and fit.closed_form_strain and fit.lean_passes
+        assert fit.fisher_rays == FISHER_RAYS_AUTO
+        assert fit.t_storage == 'device' and fit.T is T and not fit.t_prefetch
+        tf = _volume_step_fit()
+        assert tf.fft_compact and tf.spread_grouped
+        assert Projector(N, ANGLES, DEFAULTS_TEST_Q).one_model_views
+        assert MultiProjector(N, MOUNTS, DEFAULTS_TEST_Q, channel_offsets=DEFAULTS_TEST_OFFSETS,
+                              ror_mask=False).one_model_views
+        assert FineProjector(N // DEFAULTS_FINE_FACTOR, MOUNTS[:2], DEFAULTS_TEST_Q,
+                             channel_offsets=DEFAULTS_TEST_OFFSETS[:2],
+                             ror_mask=False, factor=DEFAULTS_FINE_FACTOR).one_model_views
+
+
+def test_warmup_fit_options():
+    """warmup's fit_options sets each named FitB attribute on a fit, and a name that FitB does not have raises
+    ValueError."""
+    from mbirtorch.hsnt.strain.tomo import _apply_fit_options
+    fit = _small_fit()
+    _apply_fit_options(fit, dict(lean_syncs=True, fisher_rays=0))
+    assert fit.lean_syncs and fit.fisher_rays == 0
+    _apply_fit_options(fit, None)
+    with pytest.raises(ValueError):
+        _apply_fit_options(fit, dict(lean_sync=False))
+
+
+def test_no_fallback_on_normal_path():
+    """A small tomographic fit with every default on takes the volume, texture, global, contamination and pixel steps
+    without any FallbackWarning."""
+    from mbirtorch.hsnt.strain.model import T_STORAGE_AUTO
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        tf = _lean_tomo_fit(True, True, t_storage=T_STORAGE_AUTO, speedups=True)
+        fit = tf.fit
+        fit.contamination_newton = True
+        tf.volume_step()
+        with torch.no_grad():
+            tf.texture_step()
+        tf.recenter_strain(full=True)
+        fit.global_step()
+        fit.contamination_atoms_step()
+        fit.pixel_step()
+
+
+def test_host_free_bytes_cgroup(tmp_path, monkeypatch):
+    """host_free_bytes is the system's available memory, or less when a control group leaves less: a version 2 group
+    and its parents (inactive file pages count as free), or a version 1 memory group. A limit of 'max', a version 1
+    limit above the total memory and a missing group file set no limit."""
+    from mbirtorch.hsnt.strain import model
+    monkeypatch.setattr(model.psutil, 'virtual_memory',
+                        lambda: types.SimpleNamespace(available=CGROUP_TEST_AVAILABLE, total=CGROUP_TEST_TOTAL))
+    root = tmp_path / 'cgroup'
+    child = root / 'a' / 'b'
+    child.mkdir(parents=True)
+    (root / 'memory.max').write_text('max\n')
+    lim, cur, inactive = CGROUP_TEST_CHILD
+    (child / 'memory.max').write_text(f'{lim}\n')
+    (child / 'memory.current').write_text(f'{cur}\n')
+    (child / 'memory.stat').write_text(f'anon {cur}\ninactive_file {inactive}\n')
+    plim, pcur = CGROUP_TEST_PARENT
+    (root / 'a' / 'memory.max').write_text(f'{plim}\n')
+    (root / 'a' / 'memory.current').write_text(f'{pcur}\n')
+    proc = tmp_path / 'self_cgroup'
+    proc.write_text('0::/a/b\n')
+    monkeypatch.setattr(model, 'CGROUP_ROOT', str(root))
+    monkeypatch.setattr(model, 'PROC_SELF_CGROUP', str(proc))
+    assert model.host_free_bytes() == min(CGROUP_TEST_AVAILABLE, lim - cur + inactive, plim - pcur)
+    (root / 'a' / 'memory.max').write_text('max\n')                     # the parent sets no limit now
+    assert model.host_free_bytes() == min(CGROUP_TEST_AVAILABLE, lim - cur + inactive)
+    v1 = root / 'memory' / 'job'
+    v1.mkdir(parents=True)
+    vlim, vuse = CGROUP_TEST_V1
+    (v1 / 'memory.limit_in_bytes').write_text(f'{vlim}\n')
+    (v1 / 'memory.usage_in_bytes').write_text(f'{vuse}\n')
+    proc.write_text('5:cpu,cpuacct:/job\n4:memory:/job\n')
+    assert model.host_free_bytes() == min(CGROUP_TEST_AVAILABLE, vlim - vuse)
+    (v1 / 'memory.limit_in_bytes').write_text(f'{CGROUP_TEST_V1_HIGH}\n')
+    assert model.host_free_bytes() == CGROUP_TEST_AVAILABLE
+    monkeypatch.setattr(model, 'PROC_SELF_CGROUP', str(tmp_path / 'missing'))
+    assert model.host_free_bytes() == CGROUP_TEST_AVAILABLE
+
+
+def test_transmission_buffer_cpu():
+    """For a fit on the CPU, transmission_buffer gives a CPU tensor with storage 'device', and resolve_t_storage keeps
+    the given T. Nothing is warned."""
+    from mbirtorch.hsnt.strain.model import transmission_buffer, resolve_t_storage
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        buf, storage = transmission_buffer(BUFFER_TEST_SHAPE, torch.float32, 'cpu')
+        assert storage == 'device' and buf.device.type == 'cpu' and tuple(buf.shape) == BUFFER_TEST_SHAPE
+        assert buf.dtype == torch.float32
+        T = torch.ones(BUFFER_TEST_SHAPE)
+        place, kept = resolve_t_storage(T, 'cpu')
+        assert place == 'device' and kept is T
+
+
+def test_storage_messages(monkeypatch):
+    """Each warning about the transmission's storage gives its size, says that the results are the same, and names
+    what the user can do. Under WSL, the pinning warning does not suggest a locked-memory limit. A warning about a
+    transmission on the GPU names t_storage='device', which keeps it there without the warning."""
+    from mbirtorch.hsnt.strain import model
+    from mbirtorch.hsnt.strain.model import _storage_message, GB
+    for wsl in (False, True):
+        monkeypatch.setattr(model, '_under_wsl', lambda wsl=wsl: wsl)
+        remedies = {'pinning': 'without WSL' if wsl else 'ulimit -l unlimited',
+                    'host memory': 'give the job more memory'}
+        for reason in ('pinning', 'host memory'):
+            for kept_on in ('device', 'host'):
+                text = _storage_message(reason, kept_on, MESSAGE_TEST_BYTES, MESSAGE_TEST_HOST_FREE,
+                                        MESSAGE_TEST_GPU_FREE)
+                assert f'{MESSAGE_TEST_BYTES / GB:.1f} GB' in text and 'results are the same' in text, text
+                assert remedies[reason] in text, text
+                assert not (wsl and 'ulimit' in text), text
+                if kept_on == 'host':
+                    assert 'GPU with at least' in text and f'{MESSAGE_TEST_GPU_FREE / GB:.1f} GB free' in text, text
+                else:
+                    assert 'more GPU memory' in text and "t_storage='device'" in text, text
+    assert f'{MESSAGE_TEST_HOST_FREE / GB:.1f} GB of host memory' in _storage_message(
+        'host memory', 'device', MESSAGE_TEST_BYTES, MESSAGE_TEST_HOST_FREE, MESSAGE_TEST_GPU_FREE)
+    assert "t_storage='device'" in _storage_message('pinning', 'host', MESSAGE_TEST_BYTES)
+
+
+def test_storage_choice():
+    """_storage_choice chooses pinned host memory when the host has room and pinning is not known to fail. Otherwise
+    it chooses the GPU when the GPU has room, and pageable host memory when it has not. It names the cause: a known
+    pinning failure first, and the host memory otherwise."""
+    from mbirtorch.hsnt.strain.model import _storage_choice
+    b = MESSAGE_TEST_BYTES
+    room, tight = CHOICE_TEST_ROOM * b, CHOICE_TEST_TIGHT * b
+    assert _storage_choice(b, room, room, False) == ('pinned', None)
+    assert _storage_choice(b, room, room, True) == ('device', 'pinning')
+    assert _storage_choice(b, room, tight, True) == ('host', 'pinning')
+    assert _storage_choice(b, tight, room, True) == ('device', 'pinning')
+    assert _storage_choice(b, tight, room, False) == ('device', 'host memory')
+    assert _storage_choice(b, tight, tight, False) == ('host', 'host memory')
+
+
+def test_storage_warnings_once(monkeypatch):
+    """Each storage fallback warns once per process for its place, cause and size of the transmission. A
+    transmission of another size warns again."""
+    from mbirtorch.hsnt.strain import model
+    monkeypatch.setattr(model, '_PROCESS_WARNED', set())
+    monkeypatch.setattr(model, '_under_wsl', lambda: False)
+    sizes = (MESSAGE_TEST_BYTES, MESSAGE_TEST_HOST_FREE, MESSAGE_TEST_GPU_FREE)
+    for place, reason, match in (('device', 'pinning', 'cannot pin'), ('host', 'pinning', 'without pinning'),
+                                 ('device', 'host memory', 'of host memory is free'),
+                                 ('host', 'host memory', 'without pinning')):
+        with pytest.warns(FallbackWarning, match=match):
+            model._storage_warning(place, reason, *sizes)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', FallbackWarning)
+            model._storage_warning(place, reason, *sizes)
+    with pytest.warns(FallbackWarning, match='cannot pin'):
+        model._storage_warning('device', 'pinning', CHOICE_TEST_ROOM * MESSAGE_TEST_BYTES, *sizes[1:])
+
+
+def test_device_free_bytes_fraction(monkeypatch):
+    """On a GPU, device_free_bytes is the driver's free memory plus PyTorch's unused memory, or less when PyTorch's
+    per-process memory fraction leaves less. The GPU is simulated, so the test runs on the CPU."""
+    from mbirtorch.hsnt.strain import model
+    cuda = torch.cuda
+    monkeypatch.setattr(model, '_compute_device', lambda device: torch.device('cuda', 0))
+    monkeypatch.setattr(cuda, 'mem_get_info', lambda device=None: (FRACTION_TEST_FREE, FRACTION_TEST_TOTAL))
+    monkeypatch.setattr(cuda, 'memory_reserved', lambda device=None: FRACTION_TEST_RESERVED)
+    monkeypatch.setattr(cuda, 'memory_allocated', lambda device=None: FRACTION_TEST_ALLOCATED)
+    monkeypatch.setattr(cuda, 'get_device_properties',
+                        lambda device=None: types.SimpleNamespace(total_memory=FRACTION_TEST_TOTAL))
+    monkeypatch.setattr(cuda, 'get_per_process_memory_fraction', lambda device=None: FRACTION_TEST_SHARE,
+                        raising=False)
+    budget = FRACTION_TEST_FREE + FRACTION_TEST_RESERVED - FRACTION_TEST_ALLOCATED
+    allowed = int(FRACTION_TEST_SHARE * FRACTION_TEST_TOTAL) - FRACTION_TEST_ALLOCATED
+    assert allowed < budget
+    assert model.device_free_bytes('cuda') == allowed
+    monkeypatch.setattr(cuda, 'get_per_process_memory_fraction', lambda device=None: 1.0)
+    assert model.device_free_bytes('cuda') == budget
+
+
+def test_transmission_buffer_fallbacks_cpu(monkeypatch):
+    """transmission_buffer keeps the given host T in pageable host memory, with a warning, when pinning fails or the
+    host memory is short and the GPU has no room either. After one failure, it does not try to pin again. The GPU and
+    the memory are simulated, so the test runs on the CPU."""
+    from mbirtorch.hsnt.strain import model
+    monkeypatch.setattr(model, '_PROCESS_WARNED', set())
+    monkeypatch.setattr(model, '_PIN_FAILED', set())
+    monkeypatch.setattr(model, '_compute_device', lambda device: torch.device('cuda', 0))
+    monkeypatch.setattr(model, 'device_free_bytes', lambda device: 0)
+    tries = []
+
+    def no_pinning(shape, dtype, device=None):
+        tries.append(shape)
+        return _no_pinning(shape, dtype, device)
+    monkeypatch.setattr(model, 'pinned_empty', no_pinning)
+    T = torch.ones(BUFFER_TEST_SHAPE)
+    with pytest.warns(FallbackWarning, match='without pinning'):
+        buf, storage = model.transmission_buffer(T.shape, T.dtype, 'cuda', given=T)
+    assert buf is T and storage == 'host' and len(tries) == 1 and 0 in model._PIN_FAILED
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)            # The same size and cause are reported once.
+        buf, storage = model.transmission_buffer(T.shape, T.dtype, 'cuda', given=T)
+    assert buf is T and storage == 'host' and len(tries) == 1
+    monkeypatch.setattr(model, '_PIN_FAILED', set())
+    monkeypatch.setattr(model, 'host_free_bytes', lambda: T.numel() * T.element_size())
+    with pytest.warns(FallbackWarning, match='of host memory is free'):
+        buf, storage = model.transmission_buffer(T.shape, T.dtype, 'cuda', given=T)
+    assert buf is T and storage == 'host' and len(tries) == 1
+
+
+def _no_pinning(shape, dtype, device=None):
+    """A stand-in for model.pinned_empty on a computer where pinning fails: it returns pageable host memory."""
+    return torch.empty(tuple(int(s) for s in shape), dtype=dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='host storage needs a GPU')
+def test_t_storage_auto_pinning_fails(monkeypatch):
+    """When pinning fails, t_storage 'auto' keeps T on the GPU, without prefetch, and warns once per process. The fit
+    gives the data loss of an explicit 'device' fit. When the GPU has no room either, the fit keeps the given host T
+    itself, without a copy."""
+    from mbirtorch.hsnt.strain import model
+    monkeypatch.setattr(model, '_PROCESS_WARNED', set())
+    monkeypatch.setattr(model, '_PIN_FAILED', set())
+    monkeypatch.setattr(model, 'pinned_empty', _no_pinning)
+    ref = _small_fit_cubic4()
+    with pytest.warns(FallbackWarning, match='cannot (be )?pin'):
+        a = _storage_fit(ref, ref.T.clone(), 'cuda')
+    assert a.t_storage == 'device' and a.T.is_cuda and not a.t_prefetch
+    b = _storage_fit(ref, ref.T.clone().cuda(), 'cuda', t_storage='device')
+    assert abs(a.data_loss() - b.data_loss()) <= GPU_RTOL * abs(b.data_loss())
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)                # The same computer is reported once.
+        _storage_fit(ref, ref.T.clone(), 'cuda')
+    monkeypatch.setattr(model, '_PROCESS_WARNED', set())
+    monkeypatch.setattr(model, 'device_free_bytes', lambda device: 0)
+    T = ref.T.clone()
+    with pytest.warns(FallbackWarning, match='without pinning'):
+        c = _storage_fit(ref, T, 'cuda')
+    assert c.T is T and c.t_storage == 'host' and not c.t_prefetch
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='host storage needs a GPU')
+def test_t_storage_explicit_host_pin_fails(monkeypatch):
+    """When pinning fails, t_storage 'host' keeps the given host T itself instead of a second pageable copy, and it
+    warns once per process."""
+    from mbirtorch.hsnt.strain import model
+    monkeypatch.setattr(model, '_PROCESS_WARNED', set())
+    monkeypatch.setattr(model, '_PIN_FAILED', set())
+    monkeypatch.setattr(model, 'pinned_empty', _no_pinning)
+    ref = _small_fit_cubic4()
+    T = ref.T.clone()
+    with pytest.warns(FallbackWarning, match='cannot (be )?pin'):
+        fit = _storage_fit(ref, T, 'cuda', t_storage='host')
+    assert fit.T is T and fit.t_storage == 'host' and not fit.t_pinned and not fit.t_prefetch
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        _storage_fit(ref, ref.T.clone(), 'cuda', t_storage='host')
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='host storage needs a GPU')
+def test_t_storage_auto_low_host_memory(monkeypatch):
+    """When a pinned copy of T would take more than T_HOST_MAX_SHARE of the free host memory, t_storage 'auto' keeps T
+    on the GPU and warns about the host memory. When the GPU has no room either, the fit keeps the given host T
+    itself, without pinning and without prefetch, and warns about that."""
+    from mbirtorch.hsnt.strain import model
+    monkeypatch.setattr(model, '_PROCESS_WARNED', set())
+    monkeypatch.setattr(model, '_PIN_FAILED', set())
+    ref = _small_fit_cubic4()
+    T = ref.T.clone()
+    monkeypatch.setattr(model, 'host_free_bytes', lambda: T.numel() * T.element_size())
+    with pytest.warns(FallbackWarning, match='host memory'):
+        fit = _storage_fit(ref, T, 'cuda')
+    assert fit.t_storage == 'device' and fit.T.is_cuda
+    monkeypatch.setattr(model, 'device_free_bytes', lambda device: 0)
+    with pytest.warns(FallbackWarning, match='without pinning'):
+        fit = _storage_fit(ref, T, 'cuda')
+    assert fit.t_storage == 'host' and fit.T is T and not fit.t_prefetch
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='host storage needs a GPU')
+def test_t_storage_auto_host(monkeypatch):
+    """Where pinning works, t_storage 'auto' keeps a host T in pinned host memory with prefetch, and it keeps a T that
+    is already pinned as the same tensor. Nothing is warned."""
+    from mbirtorch.hsnt.strain import model
+    monkeypatch.setattr(model, '_PROCESS_WARNED', set())
+    monkeypatch.setattr(model, '_PIN_FAILED', set())
+    if not model.pinned_empty((1,), torch.float32, 'cuda').is_pinned():
+        pytest.skip('this computer cannot pin host memory (as under WSL)')
+    ref = _small_fit_cubic4()
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        fit = _storage_fit(ref, ref.T.clone(), 'cuda')
+        assert fit.t_storage == 'host' and fit.T.is_pinned() and fit.t_pinned and fit.t_prefetch
+        Tp = model.pinned_empty(ref.T.shape, ref.T.dtype, 'cuda')
+        Tp.copy_(ref.T)
+        kept = _storage_fit(ref, Tp, 'cuda')
+        assert kept.T is Tp and kept.t_storage == 'host' and kept.t_prefetch
+
+
+def test_lean_keep_small_free_memory(monkeypatch):
+    """With lean_passes and no free memory on the fit's device, the fit keeps no model parts, warns once over all its
+    iterations, and gives the objectives and states of the fit without lean_passes. keep_gb 0, the user's own setting,
+    is not warned about."""
+    from mbirtorch.hsnt.strain import model
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        _lean_run(False, True, True, keep='none')
+    ref, again = _lean_run(False, True, False), _lean_run(False, True, False)
+    records = []
+    keep_start = model.FitB._keep_start
+
+    def spy(self, g, cache=None):
+        rec = keep_start(self, g, cache)
+        records.append(rec)
+        return rec
+    monkeypatch.setattr(model.FitB, '_keep_start', spy)
+    monkeypatch.setattr(model, 'device_free_bytes', lambda device: 0)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        lean = _lean_run(False, True, True)
+    hits = [w for w in caught
+            if issubclass(w.category, FallbackWarning) and 'keeps the model values of 0' in str(w.message)]
+    assert len(hits) == 1, [str(w.message) for w in caught]
+    made = [r for r in records if r is not None]
+    assert len(made) > 1 and all(not r['parts'] for r in made)
+    noise, got = _lean_differences(again, ref), _lean_differences(lean, ref)
+    for k in got:
+        assert got[k] <= LEAN_NOISE_MARGIN * noise[k], (k, got[k], noise[k])
+
+
+def test_lean_keep_remedy(monkeypatch):
+    """The lean_passes warning names a remedy that works. When keep_gb holds all the model parts, it names the free
+    memory that keeps them all. When keep_gb holds only part of them, it names the free memory that reaches keep_gb,
+    and it says to raise keep_gb to keep them all."""
+    from mbirtorch.hsnt.strain import model
+    from mbirtorch.hsnt.strain.model import GB
+    monkeypatch.setattr(model, 'device_free_bytes', lambda device: 0)
+    fits = [_small_fit(), _small_fit()]
+    M = fits[0].M
+    need = fits[0].P * (M.K + M.J) * torch.finfo(M.dt).bits // 8
+    fits[1].keep_gb = KEEP_TEST_SHARE_OF_NEED * need / GB
+    with pytest.warns(FallbackWarning, match='To keep them all, free') as rec:
+        fits[0]._keep_start(fits[0].g)
+    assert all('keep_gb' not in str(w.message) for w in rec)
+    with pytest.warns(FallbackWarning, match="raise the fit's keep_gb to"):
+        fits[1]._keep_start(fits[1].g)
+
+
+def _outlier_fit():
+    """_lean_fit('powder') in float64 with lean_syncs on and the last chunk's strains at OUTLIER_STRAIN."""
+    fit = _lean_fit('powder', torch.float64)
+    eps = fit.eps.clone()
+    eps[fit.chunks()[-1]] = OUTLIER_STRAIN
+    fit.eps = eps
+    fit.lean_syncs = True
+    fit.use_memo = False
+    return fit
+
+
+def test_window_plan_oversized_falls_back():
+    """With lean_syncs, a material whose shared window would be more than WINDOW_PLAN_MAX_RATIO times any chunk's own
+    width gets per-chunk windows and a warning. The data loss and the ray systems equal those with lean_syncs off.
+    Without the outlying chunk, the shared width stays and nothing is warned."""
+    fit = _outlier_fit()
+    with pytest.warns(FallbackWarning, match='chunk by chunk'):
+        on = fit.data_loss()
+    assert fit._window_widths(fit.g, fit.eps)[0] is None
+    cache = fit._state(fit.g)
+    sys_on = [fit.ray_system(s, cache) for s in fit.chunks()]
+    fit.lean_syncs = False
+    off = fit.data_loss()
+    cache = fit._state(fit.g)
+    sys_off = [fit.ray_system(s, cache) for s in fit.chunks()]
+    assert abs(on - off) <= WINDOW_FALLBACK_RTOL * abs(off), (on, off)
+    for (G1, F1), (G0, F0) in zip(sys_on, sys_off):
+        assert _close(G1, G0, WINDOW_FALLBACK_RTOL) and _close(F1, F0, WINDOW_FALLBACK_RTOL)
+    plain = _lean_fit('powder', torch.float64)
+    plain.lean_syncs = True
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        plain.data_loss()
+        assert isinstance(plain._window_widths(plain.g, plain.eps)[0], int)
+
+
+def test_fallback_warns_once():
+    """A fallback warns once per fit, also when its cause is found again on later passes."""
+    fit = _outlier_fit()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        for _ in range(WARN_ONCE_PASSES):
+            fit.eps = fit.eps.clone()                 # new strains, so that each pass works out its windows again
+            fit.data_loss()
+    assert sum(issubclass(w.category, FallbackWarning) for w in caught) == 1
+
+
+def test_closed_form_strain_fallbacks():
+    """closed_form_strain falls back to forward mode for a chunk with a ray at CUBIC4_FLOOR, warns once, and gives the
+    result with the option off. A powder and the extinction shape model need no warning: the powder takes the closed
+    form, and the closed form does not apply to the extinction model."""
+    fit = _lean_fit('floor', torch.float64)
+    cache = fit._state(fit.g)
+    with torch.no_grad():
+        ref = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+        fit.closed_form_strain = True
+        with pytest.warns(FallbackWarning, match='texture'):
+            got = [fit.ray_jacobian(s, cache) for s in fit.chunks()]
+    for k, ((J0, m0), (J1, m1)) in enumerate(zip(ref, got)):
+        tol = CLOSED_FALLBACK_RTOL if k == 0 else CLOSED_FORM_RTOL          # chunk 0 reaches the floor
+        assert _close(J1, J0, tol) and _close(m1, m0, tol), k
+    for other in (_lean_fit('powder', torch.float64), _small_fit(shape_model='extinction')):
+        other.closed_form_strain = True
+        cache = other._state(other.g)
+        with warnings.catch_warnings(), torch.no_grad():
+            warnings.simplefilter('error', FallbackWarning)
+            for s in other.chunks():
+                other.ray_jacobian(s, cache)

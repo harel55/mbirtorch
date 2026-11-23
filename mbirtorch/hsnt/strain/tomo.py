@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from ...multiaxis_parallel import MultiAxisParallelModel
-from .model import LEGENDRE_DEGREE, Hybrid2, FitB, ls_init_material, _Keys
+from .model import LEGENDRE_DEGREE, T_STORAGE_AUTO, Hybrid2, FitB, ls_init_material, resolve_t_storage, _Keys
 from .bragg import warm_start, BraggSpectrum
 from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
@@ -170,12 +170,13 @@ class Projector:
     when the view offsets differ)."""
 
     def __init__(self, n, angles, Q, channel_offset=0.0, ror_mask=True, view_offsets=None, row_offset=0.0,
-                 one_model_views=False):
+                 one_model_views=True):
         """channel_offset: the projector's det_channel_offset (the rotation axis's offset from the detector centre);
         ror_mask=False lets the volume fill its square, for objects that reach past the inscribed circle.
         one_model_views=True projects views with their own channel offsets by one model for all views
         (MultiAxisModelWithViewOffsets) instead of one model per view. The projections are the same up to float
-        rounding, and they take less time when there are many views. It is off by default."""
+        rounding, and they take less time when there are many views. It is on by default. It applies only to views
+        with their own channel offsets."""
         import mbirtorch
         self.n, self.V, self.Q = n, len(angles), Q
         self.angles, self.channel_offset, self.ror_mask = np.asarray(angles), float(channel_offset), ror_mask
@@ -283,7 +284,7 @@ class MultiProjector:
     back-projections, permuted back to the sample frame. One series with the identity permutation is a Projector."""
 
     def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, view_extra=None, view_angle_extra=None,
-                 one_model_views=False):
+                 one_model_views=True):
         """series: a list of (axis, angles), axis a key of beam_geometry.PERMS, or (transform, angles) with transform =
         (perm, signs, shift[, rot]): the series' volume is the sample volume permuted (frame axis i = sample axis
         perm[i]), flipped where signs < 0, rotated by rot (degrees about the frame's axes 0, 1, 2, as a rotation vector,
@@ -294,7 +295,8 @@ class MultiProjector:
         (detector channels; None means zeros), for a view that is shifted on the detector relative to the others.
         view_angle_extra: per series, each view's own angle offset (radians; None means zeros), for a view taken at a
         slightly different angle than its metadata says. The strain's beam-direction weights keep the nominal angles.
-        one_model_views is passed to each series' Projector, and it is off by default."""
+        one_model_views is passed to each series' Projector, and it is on by default. It applies only to views with
+        their own channel offsets."""
         from .geometry import PERMS
         self.one_model_views = bool(one_model_views)
         self.n, self.Q, self.series = n, Q, list(series)
@@ -446,10 +448,11 @@ class FineProjector:
     (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n, also to
     set_mount and in parts, so TomoFit.mount_step works on it. view_extra and view_angle_extra: per series, each view's
     own channel offset (detector pixels) and angle offset (radians), as for a MultiProjector. one_model_views is passed
-    to each series' Projector, and it is off by default."""
+    to each series' Projector, and it is on by default. It applies only to views with their own channel
+    offsets."""
 
     def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2, view_extra=None, view_angle_extra=None,
-                 one_model_views=False):
+                 one_model_views=True):
         self.one_model_views = bool(one_model_views)
         self.n_det, self.factor, self.Q = n, int(factor), Q
         self.series, self.ror_mask = list(series), ror_mask
@@ -615,7 +618,8 @@ class TomoFit:
         # fft_compact=True (precond='fft' only) builds the 'fft' preconditioner with less memory and time.  It stores
         # the inverse on half of the spectrum, as real numbers when the priors' Fourier symbol is real.  It gets the
         # data's strain block from one forward projection.  Its output is the default preconditioner's up to rounding.
-        self.fft_compact = False
+        # It is on by default, and it applies only to precond fft.
+        self.fft_compact = True
         # support=True: MONSTR's support prior in place of the weak strain ridge (strain held at 0 outside the sample)
         self.support = support
         self.R = fit.M.R
@@ -706,9 +710,9 @@ class TomoFit:
         self._volume_steps = 0
         self.last_recenter = None            # recenter_strain's removed means: isotropic and per component (strain units)
         self._ray_sym, self._ray_sym_age = None, 0
-        # spread_grouped=True makes refresh_spread compute the same spread with much less memory (an option, off by
-        # default). Use it for large volumes and many rays.
-        self.spread_grouped = False
+        # spread_grouped=True makes refresh_spread compute the same spread with much less memory. Use it for large
+        # volumes and many rays. It is on by default, and it applies only with edge_spread.
+        self.spread_grouped = True
         self.sync()
 
     # ---- projections
@@ -1046,7 +1050,7 @@ class TomoFit:
     @property
     def lean_passes(self):
         """True when the fit's lean_passes option is on (FitB.lean_passes). This fit then skips the projections and the
-        passes over the rays whose results it already has. The results are the same. It is off by default."""
+        passes over the rays whose results it already has. The results are the same. It is on by default."""
         return bool(getattr(getattr(self, 'fit', None), 'lean_passes', False))
 
     @lean_passes.setter
@@ -2424,7 +2428,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
            init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
-           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage='device', t_dtype=None, t_prefetch=False):
+           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage=T_STORAGE_AUTO, t_dtype=None,
+           t_prefetch=True, fit_options=None):
     """The pipeline's start: returns a TomoFit. Each material (an entry of lattices and a0) is one of three kinds. With a
     starting spectrum (a row of init_spectra, e.g. a known material's table), it starts from that spectrum at its a0.
     With a lattice type and a0 only, warm_start searches its lattice parameter within a0 * (1 +- a_range). With
@@ -2472,19 +2477,29 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     relative standard deviation height_sd (FitB.height_prior). dec (user 2026-11-22: elastic anisotropy): per material
     None, (alpha, beta) per reflection, or a function of the reflections' h^2 + k^2 + l^2 returning them; each
     reflection's lattice strain alpha eps + beta tr(strain) from the diffraction elastic constants (Hybrid2.set_dec);
-    it needs the strain-tensor weights. t_storage is FitB's option. The default, 'device', keeps T as it is given, and
-    'host' keeps T in host memory during the fit. t_dtype is FitB's option too. The default, None, keeps T's dtype, and
-    'float16' stores T in float16 during the fit, which is not exact (see FitB). With either option, T may be given
-    in host memory, pinned for fast copies (model.pinned_empty). The noise measurement then copies T to the model's
-    device in parts, and the warm start's factorization copies T to that device as its memory plan allows. Both use
-    T as given, before any float16 rounding. t_prefetch is FitB's option as well. With 'host', it lets each pass's
-    copies overlap its computation, and the numbers stay the same."""
+    it needs the strain-tensor weights. t_storage is FitB's option, and 'auto' is the default (model.resolve_t_storage).
+    'device' keeps T as it is given, and 'host' keeps T in host memory during the fit. t_dtype is FitB's option too.
+    The default, None, keeps T's dtype, and 'float16' stores T in float16 during the fit, which is not exact (see FitB).
+    With either option, T may be given in host memory, pinned for fast copies (model.pinned_empty). The noise
+    measurement then copies T to the model's device in parts, and the warm start's factorization copies T to that
+    device as its memory plan allows. Both use T as given, before any float16 rounding. t_prefetch is FitB's option as
+    well, and it is on by default. With 'host', it lets each pass's copies overlap its computation, and the numbers stay
+    the same. fit_options is a dict of FitB attributes, such as dict(lean_syncs=False), or None. warmup sets them on
+    each fit right after it makes the fit. Use it to turn a speed option off for the whole pipeline, as an A/B
+    comparison does."""
     from mbirtorch import hsnt
     from .model import _compute_device
+    dev_ = _compute_device(device)
+    # With 'auto', T moves once to the place that the fit keeps it, so that the steps below read it there. With
+    # t_dtype, the fit stores its own copy in another dtype, and FitB's 'auto' chooses that copy's place by its size.
+    if t_storage == T_STORAGE_AUTO and t_dtype is None:
+        place, T = resolve_t_storage(T, dev_)
+    else:
+        place = t_storage
     # The steps that read the whole T compute on t_dev. It is None (T's own device) by default, and the model's device
-    # with the options.
-    t_default = t_storage == 'device' and t_dtype is None
-    t_dev = None if t_default else _compute_device(device)
+    # otherwise. After 'auto', the place 'device' means that T is on the model's device, or that the fit is on the CPU.
+    t_default = place == 'device' and t_dtype is None
+    t_dev = None if t_default else dev_
     t_kw = {} if t_default else dict(t_storage=t_storage, t_dtype=t_dtype, t_prefetch=t_prefetch)
     noise_info = None
     if noise == 'measure':
@@ -2602,6 +2617,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
     # the pipeline's per-ray fits of the maps to the initial spectra (no strain yet)
     fit0 = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), chunk=chunk, **t_kw)
+    _apply_fit_options(fit0, fit_options)
     fit0.open_beam_obs = open_beam_obs
     for _ in range(INIT_PIXEL_STEPS):
         fit0.pixel_step()
@@ -2620,6 +2636,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     V = x.clamp_min(0)
     fit = FitB(M, T_fit, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask, **t_kw)
+    _apply_fit_options(fit, fit_options)
     if fit.t_half_info is None:
         fit.t_half_info = half_info
     if h_tab:
@@ -2673,6 +2690,15 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     return tf, dict(found=[(lt, float(th[0])) for (lt, _), th in zip(found, thetas)],
                                                            resolution=[float(v) for v in resolution], traction=traction, smooth_sd=smooth_sd,
                                                            noise=noise_info)
+
+
+def _apply_fit_options(fit, options):
+    """Sets each FitB attribute that options (a dict, or None) names on fit. It raises ValueError for a name that fit
+    does not have, so that a misspelled option is not ignored."""
+    for name, value in (options or {}).items():
+        if not hasattr(fit, name):
+            raise ValueError(f"fit_options names {name!r}, which FitB does not have")
+        setattr(fit, name, value)
 
 
 def newton_step(F, g, rcond=1e-8):

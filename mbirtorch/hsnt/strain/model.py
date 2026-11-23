@@ -29,12 +29,18 @@ beam's counts per pixel in bin k; plus the L1 on f and a ridge on the splines.
 """
 import math
 import mmap
+import os
+import platform
+import sys
+import warnings
 import weakref
 
 import numpy as np
+import psutil
 import torch
 from scipy.stats import norm
 
+from ..._memory_estimate import device_budget_bytes
 from .bragg import legendre_columns, reflections
 from ._dist import all_sum, all_sum_float, rank
 
@@ -130,6 +136,7 @@ CUBIC4_BOUND = 1.0               # cubic4: the bound on each degree-4 texture co
 KERNEL_LAG_SE = 1.0              # a free resolution kernel moves only on the global step's Fisher iterations once its last
                                  # move was below this many standard errors (RMS); before that, on every step
 # FitB.fisher_rays takes this value to size the Fisher information's ray subset by the number of free global parameters.
+# It is FitB's default.
 FISHER_RAYS_AUTO = "auto"
 # With FISHER_RAYS_AUTO, the ray subset holds this many rays per free global parameter. The subset's error in the Fisher
 # information shrinks as one over the square root of its rays. A material's parameters learn only from the rays that
@@ -171,8 +178,28 @@ HALF_SAMPLE_RAYS = 4096      # half_rounding samples at most this many rays for 
 HOST_REGISTER_PORTABLE = 1
 # With lean_passes, the fit keeps at most this many GB of the chunks' model parts (FitB.mean's n and beta) on the device,
 # for a later pass at the same state. The chunks beyond it are computed again. FitB.keep_gb starts at this value.
+# The fit keeps less when LEAN_KEEP_FREE_SHARE of the device's free memory is smaller.
 LEAN_KEEP_GB = 8.0
 GB = 1e9                     # bytes per gigabyte (the unit of LEAN_KEEP_GB)
+# FitB's t_storage takes this value, the default, to choose 'host' or 'device' itself (transmission_buffer).
+T_STORAGE_AUTO = "auto"
+# Automatic storage pins a copy of T in host memory only when T takes at most this share of the free host memory.
+T_HOST_MAX_SHARE = 0.5
+# When T cannot be pinned, automatic storage moves T to the GPU only when T takes at most this share of the GPU's
+# available memory.
+DEVICE_T_SHARE = 0.5
+# When the fisher_rays subset would hold at least this share of the kept rays, the global step uses all rays.
+FISHER_RAYS_MAX_SHARE = 0.5
+# The fit uses all rays when the subset's Fisher diagonal for a parameter differs from the full one by more than this
+# fraction.
+FISHER_CHECK_TOL = 0.5
+# With lean_passes, the kept model parts take at most this share of the free memory of the fit's device.
+LEAN_KEEP_FREE_SHARE = 0.5
+# With lean_syncs, one window width serves a whole pass only while it is at most this many times the widest chunk's own
+# width.
+WINDOW_PLAN_MAX_RATIO = 3.0
+CGROUP_ROOT = "/sys/fs/cgroup"   # host_free_bytes reads the memory limits of the process's control groups below this.
+PROC_SELF_CGROUP = "/proc/self/cgroup"   # This file names the process's control groups.
 
 
 def half_rounding(T, d):
@@ -254,6 +281,232 @@ def _clear_cuda_error(dev):
         torch.ones(1, device=dev).add_(1)
     except Exception:
         pass
+
+
+class FallbackWarning(UserWarning):
+    """A FallbackWarning says that a fit turned off a speed option, or used a slower path, because of its data or its
+    computer. Its message says what this changes for the fit and what the user can do."""
+
+
+_PROCESS_WARNED = set()      # The keys of the warnings about the computer. Each of them is issued once per process.
+# _PIN_FAILED holds the GPU indices on which pinning failed in this process. Later calls do not try to pin again.
+_PIN_FAILED = set()
+CALLER_STACKLEVEL = 2        # warnings.warn names its caller's caller at this stack level.
+
+
+def _user_stacklevel():
+    """_user_stacklevel returns the stacklevel for a warnings.warn call in its caller, so that the warning names the
+    first line outside this package. It returns CALLER_STACKLEVEL when the stack ends inside the package."""
+    frame = sys._getframe(CALLER_STACKLEVEL)       # This frame is the one that the caller's warnings.warn names.
+    level = CALLER_STACKLEVEL
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("mbirtorch"):
+        frame = frame.f_back
+        level += 1
+    return level if frame is not None else CALLER_STACKLEVEL
+
+
+def _warn_once(owner, key, text):
+    """_warn_once issues text as a FallbackWarning once for owner and key. owner is a fit, or None for a warning about
+    the computer, which is issued once per process."""
+    seen = _PROCESS_WARNED if owner is None else owner.__dict__.setdefault("_warned", set())
+    if key in seen:
+        return
+    seen.add(key)
+    warnings.warn(text, FallbackWarning, stacklevel=_user_stacklevel())
+
+
+def _read_text(path):
+    """_read_text returns the stripped text of the file at path."""
+    with open(path) as fh:
+        return fh.read().strip()
+
+
+def _cgroup_room(folder, limit_name, usage_name, total, inactive=False):
+    """_cgroup_room returns the bytes that the control group in folder still allows, or None when it sets no limit.
+    limit_name and usage_name name its limit file and its usage file. A limit at or above total counts as no limit.
+    With inactive=True, the inactive file pages in memory.stat count as free, because the kernel can drop them."""
+    try:
+        text = _read_text(os.path.join(folder, limit_name))
+        if text == "max":
+            return None
+        limit = int(text)
+        if limit >= total:
+            return None
+        room = limit - int(_read_text(os.path.join(folder, usage_name)))
+    except (OSError, ValueError):
+        return None
+    if inactive:
+        try:
+            for line in _read_text(os.path.join(folder, "memory.stat")).splitlines():
+                name, _, value = line.partition(" ")
+                if name == "inactive_file":
+                    room += int(value)
+                    break
+        except (OSError, ValueError):
+            pass
+    return room
+
+
+def host_free_bytes():
+    """host_free_bytes returns the bytes of host memory that this process can still use. This is the system's available
+    memory, or less when a control group's limit leaves less, as in a Slurm job or a capped shell."""
+    mem = psutil.virtual_memory()
+    free = int(mem.available)
+    try:
+        lines = _read_text(PROC_SELF_CGROUP).splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, path = parts
+        if controllers == "":                      # A version 2 group is limited by its own limit and its parents'.
+            root = os.path.normpath(CGROUP_ROOT)
+            folder = os.path.normpath(os.path.join(root, path.strip("/")))
+            while folder == root or folder.startswith(root + os.sep):
+                room = _cgroup_room(folder, "memory.max", "memory.current", math.inf, inactive=True)
+                if room is not None:
+                    free = min(free, room)
+                if folder == root:
+                    break
+                folder = os.path.dirname(folder)
+        elif "memory" in controllers.split(","):
+            folder = os.path.join(CGROUP_ROOT, "memory", path.strip("/"))
+            room = _cgroup_room(folder, "memory.limit_in_bytes", "memory.usage_in_bytes", int(mem.total))
+            if room is not None:
+                free = min(free, room)
+    return max(free, 0)
+
+
+def device_free_bytes(device):
+    """device_free_bytes returns the bytes that a new allocation can still get on device. On a GPU, this is
+    device_budget_bytes, or less when PyTorch's per-process memory fraction leaves less. That fraction is set by
+    torch.cuda.set_per_process_memory_fraction or by per_process_memory_fraction in PYTORCH_CUDA_ALLOC_CONF. On any
+    other device, it is host_free_bytes."""
+    dev = _compute_device(device)
+    if dev.type != "cuda":
+        return host_free_bytes()
+    free = device_budget_bytes(dev)
+    get_fraction = getattr(torch.cuda, "get_per_process_memory_fraction", None)   # Older PyTorch versions lack it.
+    if get_fraction is not None:
+        allowed = get_fraction(dev) * torch.cuda.get_device_properties(dev).total_memory
+        free = min(free, int(allowed) - torch.cuda.memory_allocated(dev))
+    return max(free, 0)
+
+
+def _under_wsl():
+    """_under_wsl returns True when Python runs under WSL (Windows Subsystem for Linux)."""
+    return "microsoft" in platform.uname().release.lower()
+
+
+def _nbytes(shape, dtype):
+    """_nbytes returns the bytes of a tensor of this shape and dtype."""
+    return int(np.prod([int(s) for s in shape], dtype=np.int64)) * torch.empty(0, dtype=dtype).element_size()
+
+
+def _storage_message(reason, kept_on, nbytes, host_free=None, gpu_free=None):
+    """_storage_message returns the text of the warning that the transmission is not kept in pinned host memory.
+    reason is 'pinning' (this computer cannot pin memory) or 'host memory' (too little host memory is free). kept_on is
+    'device' or 'host'. host_free and gpu_free are the free bytes that the decision saw, or None when it did not
+    look."""
+    t = nbytes / GB
+    if reason == "pinning" and _under_wsl():
+        why = "host memory cannot be pinned (page-locked) under WSL (Windows Subsystem for Linux)"
+        fix = "run on Linux without WSL"
+    elif reason == "pinning":
+        why = "this computer cannot pin (page-lock) host memory, for example because its locked-memory limit is low"
+        fix = "raise the locked-memory limit with 'ulimit -l unlimited' before starting Python"
+    else:
+        free = (host_free or 0) / GB
+        why = (f"only {free:.1f} GB of host memory is free and a pinned copy may take at most "
+               f"{T_HOST_MAX_SHARE:.0%} of it")
+        fix = (f"free host memory or give the job more memory, so that at least {t / T_HOST_MAX_SHARE:.1f} GB is "
+               f"free")
+    if kept_on == "device":
+        return (f"The fit keeps the transmission ({t:.1f} GB) in GPU memory instead of pinned host memory, because "
+                f"{why}. The fit's results are the same, and it uses {t:.1f} GB more GPU memory. To keep it in host "
+                f"memory, {fix}. To keep it on the GPU without this warning, pass t_storage='device' (driver: "
+                f"--t-storage device).")
+    gpu = "" if gpu_free is None else f", and the GPU has only {gpu_free / GB:.1f} GB free"
+    if gpu_free is None:
+        more = ", or pass t_storage='device' (driver: --t-storage device) when the GPU has room for it"
+    else:
+        more = f", or use a GPU with at least {t / DEVICE_T_SHARE:.1f} GB free"
+    return (f"The fit keeps the transmission ({t:.1f} GB) in host memory without pinning it, because {why}{gpu}. "
+            f"The fit's results are the same, but each copy of the transmission to the GPU is slower and no longer "
+            f"overlaps the computation. To avoid this, {fix}{more}.")
+
+
+def transmission_buffer(shape, dtype, device, given=None):
+    """transmission_buffer returns (tensor, storage) for a transmission that a fit on device reads in chunks. storage
+    is "host" or "device". On a GPU, the tensor is pinned host memory when pinning works and the tensor takes at most
+    T_HOST_MAX_SHARE of the free host memory. Otherwise it is GPU memory when it takes at most DEVICE_T_SHARE of the
+    GPU's free memory (device_free_bytes), and pageable host memory (given itself, when given) otherwise. The choice
+    is _storage_choice's. A FallbackWarning says when it is not pinned host memory. Use it to load a large
+    transmission directly into its final place. given is a host tensor of this shape and dtype, or None. The tensor
+    is uninitialized unless it is given."""
+    dev = _compute_device(device)
+    if dev.type != "cuda":
+        return (given if given is not None else torch.empty(shape, dtype=dtype, device=dev)), "device"
+    if given is not None and given.is_pinned():
+        return given, "host"
+    nbytes = _nbytes(shape, dtype)
+    host_free, gpu_free = host_free_bytes(), device_free_bytes(dev)
+    place, reason = _storage_choice(nbytes, host_free, gpu_free, dev.index in _PIN_FAILED)
+    if place == "pinned":
+        buf = _pin_or_none(shape, dtype, dev)
+        if buf is not None:
+            return buf, "host"
+        place, reason = _storage_choice(nbytes, host_free, gpu_free, True)
+    _storage_warning(place, reason, nbytes, host_free, gpu_free)
+    if place == "device":
+        return torch.empty(shape, dtype=dtype, device=dev), "device"
+    return (given if given is not None else torch.empty(shape, dtype=dtype)), "host"
+
+
+def _storage_choice(nbytes, host_free, gpu_free, pin_failed):
+    """_storage_choice returns (place, reason) for the automatic storage of a transmission of nbytes on a GPU. place is
+    'pinned' (try pinned host memory), 'device' (GPU memory) or 'host' (pageable host memory). reason is None for
+    'pinned'. Otherwise it is 'pinning' or 'host memory', the cause that _storage_message explains. host_free and
+    gpu_free are the free bytes of host and GPU memory. pin_failed is True when pinning is known to fail."""
+    if not pin_failed and nbytes <= T_HOST_MAX_SHARE * host_free:
+        return "pinned", None
+    reason = "pinning" if pin_failed else "host memory"
+    return ("device" if nbytes <= DEVICE_T_SHARE * gpu_free else "host"), reason
+
+
+def _storage_warning(place, reason, nbytes, host_free=None, gpu_free=None):
+    """_storage_warning issues the FallbackWarning for a transmission of nbytes kept in place ('device' or 'host')
+    instead of pinned host memory, because of reason. It is issued once per process for each place, reason and size."""
+    _warn_once(None, (reason, place, round(nbytes / GB, 1)),
+               _storage_message(reason, place, nbytes, host_free, gpu_free))
+
+
+def _pin_or_none(shape, dtype, dev):
+    """_pin_or_none returns pinned_empty's tensor when it is pinned, and None when pinning fails on the GPU dev. After
+    one failure on a GPU, later calls in this process return None without trying."""
+    if dev.index in _PIN_FAILED:
+        return None
+    buf = pinned_empty(shape, dtype, dev)
+    if buf.is_pinned():
+        return buf
+    _PIN_FAILED.add(dev.index)                     # The pages of buf were never touched, so it cost no memory.
+    return None
+
+
+def resolve_t_storage(T, device):
+    """resolve_t_storage returns (storage, T) with T in the place that t_storage "auto" chooses for a fit on device. A T
+    on a GPU, or any T for a fit on the CPU, is kept as it is given. It keeps T's dtype, so it does not serve a fit
+    that stores T in another dtype (t_dtype)."""
+    dev = _compute_device(device)
+    if dev.type != "cuda" or T.is_cuda:
+        return "device", T
+    buf, storage = transmission_buffer(T.shape, T.dtype, dev, given=T)
+    if buf is not T:
+        for i in range(0, T.shape[0], STORE_BLOCK_RAYS):
+            buf[i:i + STORE_BLOCK_RAYS].copy_(T[i:i + STORE_BLOCK_RAYS])
+    return storage, buf
 
 
 _COPY_STREAMS = {}           # _copy_stream keeps the side stream of each GPU in this dictionary.
@@ -1168,33 +1421,47 @@ class FitB:
     derivatives by the chain rule through the banded operator, contamination per bin."""
 
     def __init__(self, model, T, g, W, f, eps=None, chunk=1024, ridge=None, z=None, alpha=0.05, inflation=1.0,
-                 ray_mask=None, t_storage="device", t_dtype=None, t_prefetch=False):
+                 ray_mask=None, t_storage=T_STORAGE_AUTO, t_dtype=None, t_prefetch=True):
         """ray_mask (rays,) bool: only the rays where it is True enter the likelihood (use it to leave out detector
         regions the model does not describe, such as a sample holder); None uses every ray.
-        t_storage says where the transmission T is kept. 'device' (the default) keeps T as it is given, and the fit
-        computes on T's device. 'host' keeps T in host memory, pinned when the model computes on a GPU, and the fit
-        computes on the model's device. Each pass over the rays then copies its chunks of T to that device. The
-        results are the same, and the GPU memory falls by the size of T. Use 'host' when T does not fit on the GPU
-        next to the fit. A pinned host T in the storage's dtype, such as one from pinned_empty, is kept as it is. Any
-        other T is copied into a tensor from pinned_empty, which pins only T's own pages. Host memory must hold T.
+        t_storage says where the transmission T is kept. 'auto' (the default) keeps T in pinned host memory when the
+        fit computes on a GPU, T is given in host memory and pinning works within T_HOST_MAX_SHARE of the free host
+        memory. Otherwise T goes to the GPU, or stays in pageable host memory when the GPU has no room, and a
+        FallbackWarning says so (transmission_buffer). A T on a GPU, or a fit on the CPU, keeps T as given. 'device'
+        keeps T as it is given, and the fit computes on T's device. 'host' keeps T in host memory, pinned when the
+        model computes on a GPU, and the fit computes on the model's device. Each pass over the rays then copies its
+        chunks of T to that device. The results are the same, and the GPU memory falls by the size of T. Use 'host'
+        when T does not fit on the GPU next to the fit. A pinned host T in the storage's dtype, such as one from
+        pinned_empty, is kept as it is. Any other T is copied into a tensor from pinned_empty, which pins only T's own
+        pages. Host memory must hold T.
         t_dtype None (the default) keeps T's own dtype. T_HALF ('float16') stores T in float16 on the storage that
         t_storage says (the model's device for 'device'), which halves T's memory and its copies. Each chunk is then
         converted to the model's dtype before use. This is not exact: the rounding is about 2^-11 of T, so its share
         of the error grows with the counts per bin (half_rounding, logged in t_half_info). Keep the default for
         noiseless data and very high counts.
         t_prefetch True, with t_storage 'host' on a GPU, starts the copy of the next chunk on a side stream while the
-        current one is in use, so that the copies overlap the computation. The numbers are the same. It is off by
-        default."""
-        if t_storage not in T_STORAGES:
-            raise ValueError(f"t_storage must be one of {T_STORAGES}, not {t_storage!r}")
+        current one is in use, so that the copies overlap the computation. The numbers are the same. It is on by
+        default, and it acts only with pinned host storage on a GPU."""
+        if t_storage not in T_STORAGES + (T_STORAGE_AUTO,):
+            raise ValueError(f"t_storage must be one of {T_STORAGES + (T_STORAGE_AUTO,)}, not {t_storage!r}")
         if t_dtype not in (None, T_HALF):
             raise ValueError(f"t_dtype must be None or {T_HALF!r}, not {t_dtype!r}")
-        self.M = model; self.t_storage = t_storage; self.t_dtype = t_dtype
-        self._t_default = t_storage == "device" and t_dtype is None      # The default storage keeps T as it is given.
+        self.M = model; self.t_dtype = t_dtype
+        self._t_target = None            # With 'auto', this holds T's storage until _store fills it.
+        if t_storage == T_STORAGE_AUTO:
+            if _compute_device(model.dev).type != "cuda" or T.is_cuda:
+                t_storage = "device"     # T is kept as it is given, as with 'device'.
+            else:
+                stored = torch.float16 if t_dtype == T_HALF else T.dtype
+                self._t_target, t_storage = transmission_buffer(T.shape, stored, model.dev,
+                                                                given=T if T.dtype == stored else None)
+        self.t_storage = t_storage
+        # The default storage keeps T as it is given.
+        self._t_default = t_storage == "device" and t_dtype is None and self._t_target is None
         self._device = T.device if self._t_default else _compute_device(model.dev)
         self._T_ratio = None             # Outside the default, T_chunk applies a shared open beam's ratio O / b.
         self.t_half_info = None          # This holds half_rounding's statistics when T is converted to float16.
-        self.t_prefetch = bool(t_prefetch) and t_storage == "host" and self._device.type == "cuda"
+        self._t_prefetch_asked = bool(t_prefetch)   # The T setter turns t_prefetch on only with pinned host storage.
         self._pending = None             # _fetch keeps the prefetched rows, their copy, its event and T's version here.
         self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
         self.ray_weight = None if ray_mask is None else ray_mask.to(self.device, self._t_cdt)
@@ -1221,10 +1488,15 @@ class FitB:
         # With fisher_rays above 0, the global step takes its Fisher information from a fixed subset of this many rays
         # (fisher_subset), and each sampled ray stands for the rays of its stratum. The gradient still comes from all
         # rays, so the steps reach the optimum of all the data. The resolution kernel then moves on every step.
-        # FISHER_RAYS_AUTO takes FISHER_RAYS_PER_PARAMETER rays per free global parameter. 0, the default, uses all rays.
-        self.fisher_rays = 0
+        # FISHER_RAYS_AUTO takes FISHER_RAYS_PER_PARAMETER rays per free global parameter. 0 uses all rays.
+        # FISHER_RAYS_AUTO is the default. The global step uses all rays when the subset would hold
+        # FISHER_RAYS_MAX_SHARE of them, or when it misjudges a parameter (_sampled_system).
+        self.fisher_rays = FISHER_RAYS_AUTO
         self.fisher_subset_info = None   # fisher_subset records here the rays it sampled, asked for and could use.
         self._fisher_sel = None          # fisher_subset keeps its selection here with the inputs it was made from.
+        # _fisher_fallback holds the subset key whose check failed. Its global steps then use all rays.
+        self._fisher_fallback = None
+        self._fisher_checked = set()     # This holds the (subset key, parameters) and (subset key, frozen set) checked.
         self.last_kernel_step_se = float('inf')   # the resolution kernel's last move, RMS in standard errors
         # contamination_newton: the contamination step takes a full Newton step on the atom coefficients
         # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
@@ -1233,19 +1505,19 @@ class FitB:
         # With lean_syncs, the passes over the rays wait less often for the GPU. The resolution band and the spectra
         # without strain are kept from one pass to the next while g does not change. Each pass works out the window
         # widths and the cubic4 floor of all its chunks at once (window_plan). The option serves the tomographic passes
-        # and the 2-D fit's pixel_step. The results are the same up to rounding.
-        self.lean_syncs = False
+        # and the 2-D fit's pixel_step. The results are the same up to rounding. It is on by default.
+        self.lean_syncs = True
         # With closed_form_strain, ray_jacobian takes the spectra's strain derivatives in closed form
         # (Hybrid2.spectra_de) in place of forward-mode differentiation, and it reuses the same spectra for the mean.
         # The results are the same up to rounding. A chunk with a ray at CUBIC4_FLOOR is differentiated by forward mode,
-        # as by default.
-        self.closed_form_strain = False
+        # as with the option off. It is on by default.
+        self.closed_form_strain = True
         # With lean_passes, the fit and its TomoFit skip the passes over the rays and the projections whose results they
         # already have. A contamination step's trials reuse each chunk's model parts n and beta (mean) from the step's
         # first pass, and that first pass reuses the parts that the global step's accepted trial computed. The parts are
-        # kept only within keep_gb, and the other chunks are computed again. The results are the same. It is off by
+        # kept only within keep_gb, and the other chunks are computed again. The results are the same. It is on by
         # default.
-        self.lean_passes = False
+        self.lean_passes = True
         self.keep_gb = LEAN_KEEP_GB
         self._kept = None                 # _keep_start records the kept model parts here.
         # rays_evaluated counts the rays whose model mean has computed since the fit was made (pass_count).
@@ -1264,26 +1536,41 @@ class FitB:
         self._t_cdt = value.dtype if self.t_dtype is None else self.M.dt
         self._pending = None                 # A chunk that was prefetched from an earlier T must not be used.
         self._T = self._store(value)
+        # Prefetch overlaps a copy with the computation only from pinned host memory on a GPU.
+        self.t_prefetch = getattr(self, "_t_prefetch_asked", False) and getattr(self, "t_pinned", False)
 
     def _store(self, value):
         """_store returns value (rays, bins) in the form that this fit keeps. The default storage keeps value itself.
         The other storages need a certain place and dtype. With t_storage 'host', the place is host memory, pinned when
         the fit computes on a GPU. With t_dtype T_HALF, the dtype is float16. _store keeps a value that already has
         the storage's place and dtype, and it copies any other value into a new tensor (pinned_empty for pinned
-        memory)."""
+        memory). When pinning fails, a host value in the storage's dtype is kept without a copy. With t_storage 'auto',
+        the first value goes into the storage that transmission_buffer chose."""
         if self._t_default:
             return value
-        host = self.t_storage == "host"
-        where = torch.device("cpu") if host else self._device
         dtype = torch.float16 if self.t_dtype == T_HALF else value.dtype
-        pin = host and self._device.type == "cuda"
         if dtype == torch.float16 and value.dtype != torch.float16:
             self.t_half_info = half_rounding(value, self.M.d)
+        target, self._t_target = getattr(self, "_t_target", None), None
+        if target is not None:
+            if target is not value:
+                for i in range(0, value.shape[0], STORE_BLOCK_RAYS):
+                    target[i:i + STORE_BLOCK_RAYS].copy_(value[i:i + STORE_BLOCK_RAYS])
+            self.t_pinned = bool(target.is_pinned())
+            return target
+        host = self.t_storage == "host"
+        where = torch.device("cpu") if host else self._device
+        pin = host and self._device.type == "cuda"
         if not (value.device == where and value.dtype == dtype and (not pin or value.is_pinned())):
-            out = (pinned_empty(value.shape, dtype, self._device) if pin
+            out = (_pin_or_none(value.shape, dtype, self._device) if pin
                    else torch.empty(value.shape, dtype=dtype, device=where))
-            for i in range(0, value.shape[0], STORE_BLOCK_RAYS):
-                out[i:i + STORE_BLOCK_RAYS].copy_(value[i:i + STORE_BLOCK_RAYS])
+            if out is None:                          # Pinning failed, so a pageable copy would only double host memory.
+                _storage_warning("host", "pinning", _nbytes(value.shape, dtype))
+                keep = value.device.type == "cpu" and value.dtype == dtype
+                out = value if keep else torch.empty(value.shape, dtype=dtype)
+            if out is not value:
+                for i in range(0, value.shape[0], STORE_BLOCK_RAYS):
+                    out[i:i + STORE_BLOCK_RAYS].copy_(value[i:i + STORE_BLOCK_RAYS])
             value = out
         self.t_pinned = pin and bool(value.is_pinned())     # Without pinning, each chunk's copy is synchronous.
         return value
@@ -1303,7 +1590,10 @@ class FitB:
         """_fetch returns the stored rows sl, copied to the compute device, for t_prefetch. If the previous call
         prefetched these rows from the same, unchanged T, _fetch waits for that copy instead of copying again. Before
         it returns, it starts to copy the next rows on a side stream. The next rows are as many rows as sl holds, and
-        they follow sl. At the end of T, the next rows are the first chunk of the next pass."""
+        they follow sl. At the end of T, the next rows are the first chunk of the next pass. A tensor of ray indices is
+        copied at once, with no prefetch."""
+        if not isinstance(sl, slice):
+            return self._T[sl].to(self._device, non_blocking=True)
         main = torch.cuda.current_stream(self._device)
         start, stop, step = sl.indices(self.P)
         pending, self._pending = self._pending, None
@@ -1575,7 +1865,8 @@ class FitB:
         """Returns, per material, a window width in fine bins that holds the window of any chunk of the rays with
         strains eps_all (all rays) and the current spreads. The width is the widest window over all rays, plus
         WINDOW_SLACK, rounded up to a multiple of WINDOW_BUCKET. It is kept while g, eps_all and the spreads do not
-        change, and computing it waits for the GPU once."""
+        change, and computing it waits for the GPU once. A material whose shared width would exceed
+        WINDOW_PLAN_MAX_RATIO times the widest chunk's own width gets None, so that each chunk finds its own width."""
         M = self.M; sd = self.eps_sd
         key = [g, eps_all, sd] + self._model_parts(M)
         kept = getattr(self, "_width_memo", None)
@@ -1583,19 +1874,41 @@ class FitB:
             return kept[2]
         gd = g.detach()
         with torch.no_grad():
-            wide = []
+            wide, own = [], []
             for r in range(M.R):
-                lo = hi = wd = None
+                lo = hi = wd = ow = None
                 for s in self.chunks():
                     l_, h_, w_ = M.window_extent(gd, r, eps_all[s], None if sd is None else sd[s])
                     lo = l_ if lo is None else torch.minimum(lo, l_)
                     hi = h_ if hi is None else torch.maximum(hi, h_)
                     wd = w_ if wd is None else torch.maximum(wd, w_)
+                    w_own = M.window_width(l_, h_, w_)                  # This is the chunk's own width.
+                    ow = w_own if ow is None else torch.maximum(ow, w_own)
                 wide.append(M.window_width(lo, hi, wd))
-            wide = torch.stack(wide).tolist()
-        widths = [WINDOW_BUCKET * math.ceil((max(int(w), 1) + WINDOW_SLACK) / WINDOW_BUCKET) for w in wide]
+                own.append(ow)
+            wide, own = torch.stack([torch.stack(wide), torch.stack(own)]).tolist()   # The plan waits for the GPU here.
+        widths = []
+        for r, (w, o) in enumerate(zip(wide, own)):
+            plan, chunk_max = self._bucket(w), self._bucket(o)
+            if plan > WINDOW_PLAN_MAX_RATIO * chunk_max:
+                widths.append(None)
+                _warn_once(self, "lean_syncs",
+                           f"The passes over the rays size the spectral window of {self._material_name(r)} chunk by "
+                           f"chunk, because the rays' strains differ much more across the sample than within any chunk "
+                           f"(one shared window would be {plan} fine bins wide, against at most {chunk_max} for any "
+                           f"chunk). The fit's "
+                           f"results are the same, and each pass waits for the GPU once more for each chunk of rays. "
+                           f"No action is needed.")
+            else:
+                widths.append(plan)
         self._width_memo = (M, _Keys(key), widths)
         return widths
+
+    @staticmethod
+    def _bucket(w):
+        """_bucket returns the window width w in fine bins plus WINDOW_SLACK, rounded up to a multiple of
+        WINDOW_BUCKET."""
+        return WINDOW_BUCKET * math.ceil((max(int(w), 1) + WINDOW_SLACK) / WINDOW_BUCKET)
 
     def _floor_hits(self, g):
         """Returns, per material, the sorted indices (numpy) of the rays whose cubic4 factor could reach CUBIC4_FLOOR.
@@ -1668,14 +1981,40 @@ class FitB:
         self._kept = None
         if self._traced(g):
             return None
-        self._kept = dict(model=self.M, chunk=self.chunk, rays=self.P, keys=_Keys(self._kept_items(g)), parts={},
-                          bytes=0, cache=cache)
+        M = self.M
+        cap = getattr(self, "keep_gb", LEAN_KEEP_GB) * GB
+        free = device_free_bytes(self.device)
+        budget = min(cap, LEAN_KEEP_FREE_SHARE * free)
+        self._kept = dict(model=M, chunk=self.chunk, rays=self.P, keys=_Keys(self._kept_items(g)), parts={},
+                          bytes=0, cache=cache, budget=budget)
+        per_ray = (M.K + M.J) * torch.empty(0, dtype=M.dt).element_size()
+        need = self.P * per_ray
+        if LEAN_KEEP_FREE_SHARE * free < cap and budget < need:
+            n_chunks = -(-self.P // self.chunk)
+            k = min(n_chunks, int(budget // (self.chunk * per_ray)))
+            kind = "GPU" if self.device.type == "cuda" else "host"
+            where = "a GPU" if self.device.type == "cuda" else "a computer"
+            if need <= cap:
+                remedy = (f"To keep them all, free {kind} memory or use {where} with at least "
+                          f"{need / LEAN_KEEP_FREE_SHARE / GB:.1f} GB free.")
+            else:                                    # keep_gb alone would still keep only part of them.
+                remedy = (f"To keep up to {cap / GB:.1f} GB of them (the fit's keep_gb), free {kind} memory or use "
+                          f"{where} with at least {cap / LEAN_KEEP_FREE_SHARE / GB:.1f} GB free. To keep them all, "
+                          f"also raise the fit's keep_gb to {need / GB:.1f}.")
+            _warn_once(self, "lean_passes",
+                       f"Between the global step and the contamination step, the fit keeps the model values of {k} of "
+                       f"{n_chunks} chunks of rays ({min(k * self.chunk, self.P) * per_ray / GB:.2f} of "
+                       f"{need / GB:.2f} GB), because "
+                       f"only {free / GB:.2f} GB of {kind} memory is free. The fit's results are the same, and the "
+                       f"contamination step computes the other {n_chunks - k} chunks again on each of its passes. "
+                       f"{remedy}")
         return self._kept
 
     def _keep_part(self, kept, sl, n, beta):
-        """Adds the model parts n and beta of the rays sl to the record kept, if the record then stays within keep_gb."""
+        """Adds the model parts n and beta of the rays sl to the record kept, if the record then stays within the
+        record's budget (keep_gb, and LEAN_KEEP_FREE_SHARE of the free memory)."""
         size = n.numel() * n.element_size() + beta.numel() * beta.element_size()
-        if kept["bytes"] + size <= getattr(self, "keep_gb", LEAN_KEEP_GB) * GB:
+        if kept["bytes"] + size <= kept.get("budget", getattr(self, "keep_gb", LEAN_KEEP_GB) * GB):
             kept["parts"][sl.start] = (n, beta)
             kept["bytes"] += size
 
@@ -1942,6 +2281,12 @@ class FitB:
             closed = self._ray_jacobian_closed(sl, cache)
             if closed is not None:
                 return closed
+            if M.shape_model in VIEW_TEXTURES and not M.dense_spectra:     # A ray of the chunk is at CUBIC4_FLOOR.
+                _warn_once(self, "closed_form_strain",
+                           "Some chunks of rays take their strain derivatives by the slower general method, because "
+                           "the fitted texture is strong enough that some rays' texture factor could reach its "
+                           "lower limit at some wavelength. The fit's results are the same, and those chunks' "
+                           "derivative passes cost as much as with closed_form_strain off. No action is needed.")
         W = self.W[sl]; eps = self.eps[sl]
         m, E, n, beta, s = self.mean(sl, cache=cache)
         _, Rb, kap = cache
@@ -2351,7 +2696,8 @@ class FitB:
         due = self.fisher_every <= 1 or lag is None or lag[0] != idx or lag[2] % self.fisher_every == 0
         if res and not self.last_kernel_step_se < KERNEL_LAG_SE:
             due = True
-        if self.fisher_rays:              # The Fisher information comes from a ray subset, and the gradient from all rays.
+        # The Fisher information comes from a ray subset, and the gradient from all rays.
+        if self.fisher_rays and self._fisher_sampled(len(idx)):
             return self._sampled_system(idx, lag, due)
         if due:
             grad, F = self.global_system(idx)
@@ -2474,14 +2820,84 @@ class FitB:
         """This is _lagged_system with fisher_rays on. Every call takes the gradient from all rays, the resolution
         kernel's slots included (global_grad). A call that is due takes the Fisher information from the ray subset
         (subset_fisher). The other calls reuse the last Fisher information, and the kernel moves with the other
-        parameters."""
-        grad = self.global_grad(idx)
-        if due:
-            F = self.subset_fisher(idx)
+        parameters. The first due call for a set of parameters, and a due call that freezes a new set of them, also
+        compute the full Fisher information, take the step with it, and switch to all rays for good when the subset
+        misjudges a parameter (_subset_misjudged)."""
+        if not due:
+            grad = self.global_grad(idx)
+            self._fisher = (lag[0], lag[1], lag[2] + 1)
+            return idx, grad, lag[1]
+        F = self.subset_fisher(idx)
+        key = self._fisher_sel[0]
+        d = torch.diagonal(F)
+        low = (d <= INFO_FLOOR * d.max()).tolist()
+        frozen = frozenset(i for i, f in zip(idx, low) if f)
+        checked = self.__dict__.setdefault("_fisher_checked", set())
+        if (key, tuple(idx)) in checked and (not frozen or (key, frozen) in checked):
+            grad = self.global_grad(idx)
             self._fisher = (list(idx), F, 1)
             return idx, grad, F
-        self._fisher = (lag[0], lag[1], lag[2] + 1)
-        return idx, grad, lag[1]
+        grad, Ff = self.global_system(idx)           # It runs last, so last_fisher_data holds the full data's part.
+        bad = self._subset_misjudged(F, Ff, idx)
+        if bad:
+            self._fisher_fallback = key
+            info = self.fisher_subset_info
+            owners, materials_only = self._parameter_owners(bad)
+            few = ", which few rays may cross" if materials_only else ""
+            _warn_once(self, "fisher_rays",
+                       f"The global step takes its Fisher information from all {info['kept']:,} rays instead of a "
+                       f"sample of {info['rays']:,}, because the sample misjudges how much the data tell about "
+                       f"{owners}{few}. The fit's results are the same, and each global step that recomputes the "
+                       f"Fisher information reads {info['kept']:,} rays instead of {info['rays']:,}. No action is "
+                       f"needed.")
+        else:
+            checked.add((key, tuple(idx)))
+            checked.add((key, frozen))
+        self._fisher = (list(idx), Ff, 1)
+        return idx, grad, Ff
+
+    def _fisher_sampled(self, n_params):
+        """Returns True when the global step takes its Fisher information from the fisher_rays subset: the subset holds
+        less than FISHER_RAYS_MAX_SHARE of the kept rays, and it has not failed _sampled_system's check."""
+        self.fisher_subset(n_params)
+        if getattr(self, "_fisher_fallback", None) == self._fisher_sel[0]:
+            return False
+        info = self.fisher_subset_info
+        return info["rays"] < FISHER_RAYS_MAX_SHARE * info["kept"]
+
+    @staticmethod
+    def _subset_misjudged(sub, full, idx):
+        """Returns the parameters of idx that carry information in full and whose diagonal entry in sub differs from
+        full's by more than FISHER_CHECK_TOL, a zero included."""
+        df, ds = torch.diagonal(full), torch.diagonal(sub)
+        live = df > INFO_FLOOR * df.max()
+        err = (ds / df.clamp_min(torch.finfo(df.dtype).tiny) - 1).abs()
+        return [idx[k] for k in torch.nonzero(live & (err > FISHER_CHECK_TOL)).flatten().tolist()]
+
+    def _material_name(self, r):
+        """Returns material r (counted from 0) in words that the user knows: its position counted from 1 among the
+        fit's materials, and its lattice type."""
+        return f"material {r + 1} of {self.M.R} ({self.M.mats[r]['lattice']})"
+
+    def _parameter_owners(self, params):
+        """Returns (text, materials_only). text says in plain words what the global parameters params describe: their
+        materials, the resolution kernel or other global parameters. materials_only is True when every one of them
+        belongs to a material."""
+        M = self.M
+        names, materials_only = set(), True
+        for i in params:
+            mat = [r for r, sl in enumerate(M.slices) if sl["a"] <= i < sl["s"][1]]
+            if mat:
+                names.add(self._material_name(mat[0]))
+            elif M.kap_sl[0] <= i < M.kap_sl[1]:
+                names.add(self._material_name((i - M.kap_sl[0]) % M.R))
+            elif M.res_sl[0] <= i < M.res_sl[1]:
+                names.add("the resolution kernel"); materials_only = False
+            else:
+                names.add("other global parameters"); materials_only = False
+        names = sorted(names)
+        text = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+        return text, materials_only
 
     def fisher_subset(self, n_params):
         """Returns the rays for the Fisher information with fisher_rays on, as a list of chunks (rays, count). rays is a
