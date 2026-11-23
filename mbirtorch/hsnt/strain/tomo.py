@@ -50,6 +50,12 @@ CG_ITERS = 30                   # conjugate-gradient iterations per volume step
 LINE_ALPHA_RANGE = (0.05, 2.0)  # the volume step's line search: the step lengths its parabola's minimizer is clamped to
 MOMENTUM_RANGE = (-1.0, 3.0)    # with momentum=True: the multiples of the previous step the volume step may add
 RAY_SYMBOL_REFRESH = 5          # precond='fft_ray': the data's strain symbol is recomputed every this many volume steps
+SYMBOL_IMAG_TOL = 1e-10         # fft_compact: the priors' Fourier symbol is stored as real numbers when its largest
+                                # imaginary part is at most this fraction of its largest real part (else as complex)
+FFT_INVERT_BATCH = 2 ** 17      # fft_compact: the spatial frequencies whose blocks are inverted at once (this bounds
+                                # the inversion's temporary memory)
+RAY_SUM_CHUNK = 2 ** 20         # fft_compact: the rays summed at once for the data's strain block (this bounds its
+                                # temporary memory)
 FULL_QUANTILE, FULL_REL = 0.99, 0.5  # normalize: a material's full level is the median volume fraction of the voxels above
                                     # FULL_REL of its FULL_QUANTILE quantile (the voxels that clearly hold it)
 FREE_LATTICE_RANGE = 0.01       # free_lattice: each lattice parameter may move this fraction either way in the global step
@@ -510,6 +516,10 @@ class TomoFit:
         # response to an impulse, in place of its average: the data constrain smooth strain far more than fine detail)
         assert precond in ('jacobi', 'block', 'fft', 'fft_ray'), precond
         self.precond = precond
+        # fft_compact=True (precond='fft' only) builds the 'fft' preconditioner with less memory and time.  It stores
+        # the inverse on half of the spectrum, as real numbers when the priors' Fourier symbol is real.  It gets the
+        # data's strain block from one forward projection.  Its output is the default preconditioner's up to rounding.
+        self.fft_compact = False
         # support=True: MONSTR's support prior in place of the weak strain ridge (strain held at 0 outside the sample)
         self.support = support
         self.R = fit.M.R
@@ -1580,6 +1590,8 @@ class TomoFit:
         weights) averaged over the material's voxels, plus the damping. The equilibrium prior is stiff and couples the
         components of neighbouring voxels, so a diagonal preconditioner leaves its smooth modes to converge slowly.
         Returns z = P(rV, rE)."""
+        if getattr(self, 'fft_compact', False) and self.precond == 'fft':
+            return self._fft_preconditioner_compact(F, lam_, pV, dE_, fV, fE)
         R, C, V = self.R, self.C, self.V
         n = V.shape[0]; P_ = F.shape[0]; w = self.w_ray
         dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
@@ -1604,6 +1616,95 @@ class TomoFit:
             z = torch.fft.ifftn(torch.einsum('xyzrab,xyzrb->xyzra', inv, torch.fft.fftn(rE.double(), dim=(0, 1, 2))), dim=(0, 1, 2))
             return rV / pV * fV, z.real.to(rE.dtype) * fE
         return apply
+
+    def _fft_preconditioner_compact(self, F, lam_, pV, dE_, fV, fE):
+        """The 'fft' preconditioner of _fft_preconditioner, built with less memory and time (fft_compact).  It returns
+        z = P(rV, rE), and its output equals the default preconditioner's up to rounding."""
+        R, C, V = self.R, self.C, self.V
+        own = self.material_voxels()
+        B = self._data_strain_block(F, own)
+        add = torch.zeros(R, C, C, device=V.device, dtype=torch.float64)
+        for r in range(R):
+            ins = own[..., r]
+            if not bool(ins.any()):
+                continue
+            add[r] = B[r] + torch.diag(lam_ * dE_[..., r, :][ins].double().mean(0))
+        inv = self._invert_blocks(self._prior_symbol_half(), add)          # the symbol's storage now holds the inverse
+
+        def apply(rV, rE):
+            f = torch.fft.rfftn(rE.double(), dim=(0, 1, 2))                                   # (n, n, n // 2 + 1, R, C)
+            if inv.is_complex():
+                f = torch.matmul(inv, f[..., None])[..., 0]
+            else:
+                f = torch.view_as_complex(torch.matmul(inv, torch.view_as_real(f)).contiguous())
+            z = torch.fft.irfftn(f, s=rE.shape[:3], dim=(0, 1, 2))
+            return rV / pV * fV, z.to(rE.dtype) * fE
+        return apply
+
+    def _prior_symbol_half(self):
+        """(n, n, n // 2 + 1, R, C, C): the strain priors' Fourier symbol (_prior_symbol) on the half of the spectrum
+        that torch.fft.rfftn returns.  The symbol is real when the priors do not change under reflection through a
+        voxel, and it is then stored as float64.  symbol_imag_rel records its largest imaginary part relative to its
+        largest real part.  When that ratio exceeds SYMBOL_IMAG_TOL, the symbol is built again and stored as
+        complex128, which takes twice the memory.  fft_compact_storage records which of the two was used."""
+        R, C, V = self.R, self.C, self.V
+        n = V.shape[0]; c = (n // 2,) * 3
+        full = torch.ones(n, n, n, R, dtype=torch.bool, device=V.device)
+        div = lambda Y: self._divergence(Y, full).reshape(*Y.shape[:3], -1)
+
+        def build(dtype):
+            out = torch.zeros(n, n, n // 2 + 1, R, C, C, dtype=dtype, device=V.device)
+            imag = torch.zeros((), dtype=torch.float64, device=V.device); real = torch.zeros_like(imag)
+            for r in range(R):
+                for k in range(C):
+                    X = torch.zeros(n, n, n, R, C, device=V.device, dtype=V.dtype); X[c + (r, k)] = 1.0
+                    s_r = 1.0 if getattr(self, 'prior_scale', None) is None else float(self.prior_scale[r])
+                    resp = s_r * (2 * self.lam_E * X + self.smooth_E * self._smooth_apply(X))
+                    if self.elastic is not None:
+                        resp = resp + self.eq_w * torch.func.vjp(div, X)[1](div(X))[0]
+                    resp = torch.roll(resp[..., r, :], shifts=tuple(-v for v in c), dims=(0, 1, 2)).double()
+                    f = torch.fft.rfftn(resp, dim=(0, 1, 2))
+                    imag = torch.maximum(imag, f.imag.abs().amax()); real = torch.maximum(real, f.real.abs().amax())
+                    out[..., r, :, k] = f if dtype.is_complex else f.real
+            return out, float(imag / real.clamp_min(torch.finfo(torch.float64).tiny))
+
+        out, self.symbol_imag_rel = build(torch.float64)
+        if self.symbol_imag_rel > SYMBOL_IMAG_TOL:
+            out = None                                      # the real symbol is freed before the complex one is built
+            out, _ = build(torch.complex128)
+        self.fft_compact_storage = 'complex' if out.is_complex() else 'real'
+        return out
+
+    def _data_strain_block(self, F, own):
+        """(R, C, C) float64: each material's data strain block, which the 'fft' preconditioner adds at every frequency.
+        It is the mean, over the material's own voxels (own), of the squared volume fraction times the back-projection
+        of dUU w_k w_l, as in _fft_preconditioner.  Here it comes from one forward projection of the squared volume
+        fractions, by the adjoint identity, in place of C back-projections."""
+        R, C, V = self.R, self.C, self.V
+        vol = torch.zeros(*V.shape[:3], self.proj.Q, device=V.device, dtype=V.dtype)    # the other channels stay zero
+        vol[..., :R] = V ** 2 * own
+        a = self.proj.fwd(vol)[:, :R]                                                     # (P, R)
+        del vol
+        dUU = torch.diagonal(F[:, R:, R:], dim1=1, dim2=2)
+        out = torch.zeros(R, C, C, device=V.device, dtype=torch.float64)
+        for i in range(0, a.shape[0], RAY_SUM_CHUNK):
+            w = self.w_ray[i:i + RAY_SUM_CHUNK].double()
+            h = a[i:i + RAY_SUM_CHUNK].double() * dUU[i:i + RAY_SUM_CHUNK].double()
+            for r in range(R):
+                out[r] += (w * h[:, r, None]).T @ w
+        all_sum(out)                                             # with the rays split over processes, sum their shares
+        return out / own.sum((0, 1, 2)).double().clamp_min(1)[:, None, None]
+
+    @staticmethod
+    def _invert_blocks(sym, add):
+        """Overwrites sym (..., R, C, C), float64 or complex128, with the inverse of sym + add at every frequency, and
+        returns it.  add (R, C, C) float64 is the block that is added at every frequency.  The blocks are inverted
+        FFT_INVERT_BATCH frequencies at a time.  The inverse is by LU, as in _fft_preconditioner, and not by Cholesky,
+        because a symbol built from single-precision responses is symmetric only to single-precision rounding."""
+        flat = sym.view(-1, *sym.shape[-3:])
+        for i in range(0, flat.shape[0], FFT_INVERT_BATCH):
+            flat[i:i + FFT_INVERT_BATCH] = torch.linalg.inv(flat[i:i + FFT_INVERT_BATCH] + add)
+        return sym
 
     def _ray_symbol(self, F):
         """(n, n, n, R, C, C) complex: the data's strain Hessian block at unit volume fraction as a function of spatial
