@@ -362,16 +362,25 @@ def _assemble_kernel(on_cuda):
     return _assemble_compiled
 
 
+def _float64(x):
+    """Returns the tensor x in float64. A value that is not a tensor, such as a Python float or None, is returned as it
+    is."""
+    return x.double() if torch.is_tensor(x) else x
+
+
 def deviance_terms(m, T, d, open_beam_obs=None):
     """Each ray and bin's share of the negative log-likelihood (up to a constant) of the transmission T at the model m,
     with d the counts at T = 1. Without open_beam_obs the counts are Poisson. With open_beam_obs (n, the open beam's
     counts over the sample's at T = 1) the transmission was divided by a measured open beam, and the counts are negative
-    binomial with variance d m (1 + m / n): the Poisson term m - T becomes (T + n) log(1 + (T - m) / (m + n))."""
+    binomial with variance d m (1 + m / n): the Poisson term m - T becomes (T + n) log(1 + (T - m) / (m + n)).
+    The terms are computed and returned in float64 for inputs of any dtype. When the model nearly equals the data, as
+    for noiseless data near the truth, each term is far smaller than the float32 rounding of its parts. Float32 terms
+    would then be mostly rounding error."""
+    m, T, d, n = (_float64(v) for v in (m, T, d, open_beam_obs))
     m = m.clamp_min(1e-12)
     tlogt = torch.where(T > 0, T * torch.log(T.clamp_min(1e-30)), torch.zeros_like(T))
-    if open_beam_obs is None:
+    if n is None:
         return d * (m - T - T * torch.log(m) + tlogt)
-    n = open_beam_obs
     return d * (tlogt - T * torch.log(m) - (T + n) * torch.log1p((T - m) / (m + n)))
 
 

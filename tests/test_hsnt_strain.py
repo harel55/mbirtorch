@@ -2248,6 +2248,14 @@ def test_lean_syncs_matches_default(case, dtype):
     assert built == [1]
 
 
+# test_lean_syncs_volume_step runs in float32, the model's default dtype. The variants' models agree to float32 rounding,
+# and the forward projector's atomic adds also change them by rounding from one run to the next. Near the truth, these
+# roundings leave the data loss uncertain by a few parts in a million. The deviance is computed in float64
+# (model.deviance_terms), so its own rounding adds almost nothing to that.
+VOLUME_STEP_LOSS_RTOL = 1e-5         # the trial data loss and the loss before the step, relative to the default path's
+VOLUME_STEP_AFTER_RTOL = 1e-3        # the loss after one volume step, relative to the default path's loss before it
+
+
 def test_lean_syncs_volume_step():
     """A tomographic fit with several chunks of rays and a strain spread along the beam, with FitB.lean_syncs, with
     FitB.closed_form_strain and with both: each gives the default path's data loss at a trial state (to rounding), and
@@ -2267,23 +2275,63 @@ def test_lean_syncs_volume_step():
     V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
     E_true = 1.5e-3 * torch.randn(N, N, N, 1, 1, generator=torch.Generator().manual_seed(6)).to(dev) * (V[..., None] > 0)
 
-    def run(lean, closed=False):
+    def run(lean, closed=False, T=None):
+        """Returns the trial data loss, the loss before one volume step and the loss after it, and the data. With T
+        None, the data are noiseless data at the truth. A given T is used as the data."""
         fit = FitB(M, torch.ones(P, M.K, **kw), g, torch.ones(P, 1, **kw), torch.zeros(1, M.K, **kw),
                    eps=torch.zeros(P, 1, **kw), chunk=512)
         tf = TomoFit(fit, pr, V.clone(), E_true.clone()); tf.sync(); tf.edge_spread = True; tf.refresh_spread()
-        with torch.no_grad():
-            fit.T = torch.cat([fit.mean(c)[0] for c in fit.chunks()])              # noiseless data at the truth
+        if T is None:
+            with torch.no_grad():
+                T = torch.cat([fit.mean(c)[0] for c in fit.chunks()])              # noiseless data at the truth
+        fit.T = T.clone()
         fit.lean_syncs = lean; fit.closed_form_strain = closed
         tf.E = 0.5 * E_true; tf.sync(); tf.refresh_spread()                         # the spread at the start
         trial = tf.data_loss(V, 0.8 * E_true)
         l0 = tf.loss(); tf.volume_step(); l1 = tf.loss()                           # data + prior
         assert isinstance(trial, float)
-        return trial, l0, l1
+        return (trial, l0, l1), T
     assert len(range(0, P, 512)) > 1                                                 # several chunks
-    ref = run(False)
-    for got in (run(True), run(False, True), run(True, True)):                       # lean, closed form, both
-        assert abs(got[0] - ref[0]) <= 1e-5 * abs(ref[0]) and abs(got[1] - ref[1]) <= 1e-5 * abs(ref[1])
-        assert got[2] < got[1] and abs(got[2] - ref[2]) <= 1e-3 * abs(ref[1])
+    # Every variant fits the default run's data. The projector's atomic adds would otherwise give each run its own data,
+    # and those data differ by rounding.
+    ref, T = run(False)
+    for name, lean, closed in (('lean_syncs', True, False), ('closed_form_strain', False, True),
+                               ('lean_syncs and closed_form_strain', True, True)):
+        got, _ = run(lean, closed, T)
+        for k, what in ((0, 'trial data loss'), (1, 'loss before the volume step')):
+            assert abs(got[k] - ref[k]) <= VOLUME_STEP_LOSS_RTOL * abs(ref[k]), \
+                f'{name}: the {what} is {got[k]!r}, and the default path gives {ref[k]!r}'
+        assert got[2] < got[1], f'{name}: the volume step raised the loss from {got[1]!r} to {got[2]!r}'
+        assert abs(got[2] - ref[2]) <= VOLUME_STEP_AFTER_RTOL * abs(ref[1]), \
+            f'{name}: the loss after the volume step is {got[2]!r}, and the default path gives {ref[2]!r}'
+
+
+DEVIANCE_TEST_SEED = 12              # the seed of test_deviance_terms_float64's random draws
+DEVIANCE_TEST_BINS = 4096            # the number of bins that the test draws
+DEVIANCE_TEST_COUNTS = 200.0         # each bin's counts at a transmission of 1
+DEVIANCE_TEST_T_RANGE = (0.3, 0.9)   # the range of the drawn transmissions
+DEVIANCE_TEST_MISFIT = 1e-4          # the standard deviation of the model's relative difference from the data
+DEVIANCE_TEST_RTOL = 1e-7            # the summed terms' tolerance, relative to their exact sum
+
+
+def test_deviance_terms_float64():
+    """deviance_terms computes its terms in float64 for a float32 model and float32 data. Here the model nearly equals
+    the data, and each term is smaller than the float32 rounding of its parts. The summed terms equal a sum that has no
+    such cancellation, which is d T (u - log(1 + u)) with u = (m - T) / T. Terms computed in float32 would carry
+    rounding errors larger than the terms themselves."""
+    from mbirtorch.hsnt.strain.model import deviance_terms
+    gen = torch.Generator().manual_seed(DEVIANCE_TEST_SEED)
+    lo, hi = DEVIANCE_TEST_T_RANGE
+    T = (lo + (hi - lo) * torch.rand(DEVIANCE_TEST_BINS, generator=gen, dtype=torch.float64)).float()
+    u = DEVIANCE_TEST_MISFIT * torch.randn(DEVIANCE_TEST_BINS, generator=gen, dtype=torch.float64)
+    m = (T.double() * (1 + u)).float()
+    d = torch.full((DEVIANCE_TEST_BINS,), DEVIANCE_TEST_COUNTS)
+    got = deviance_terms(m, T, d)
+    assert got.dtype == torch.float64
+    # The reference starts from the difference of the float32 values, which is exact in float64.
+    Td = T.double(); ud = (m.double() - Td) / Td
+    ref = float((DEVIANCE_TEST_COUNTS * Td * (ud - torch.log1p(ud))).sum())
+    assert abs(float(got.sum()) - ref) <= DEVIANCE_TEST_RTOL * ref, (float(got.sum()), ref)
 
 
 def _close(got, ref, tol):
