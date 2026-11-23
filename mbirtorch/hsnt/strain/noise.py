@@ -26,13 +26,26 @@ VIEW_OUTLIER = 5.0      # a view's level is flagged when it is this many robust 
 DISPERSION_BLOCK = 64   # adjacent bin pairs averaged for the per-bin dispersion
 
 
+def _device(T, device):
+    """The device on which a function of this module computes: device, or T's own device when device is None."""
+    return T.device if device is None else torch.device(device)
+
+
+def _rows(T, rows, dev):
+    """The rows of T (a slice or an index tensor) as a tensor on dev. T may be kept on another device, such as in host
+    memory, and then only these rows are copied."""
+    if torch.is_tensor(rows):
+        rows = rows.to(T.device)
+    return T[rows].to(dev)
+
+
 def _tile_slices(shape, tiles):
     """The (rows, channels) slices of each detector tile: the image split into tiles[0] x tiles[1] equal parts."""
     rs = np.linspace(0, shape[1], tiles[0] + 1).astype(int); cs = np.linspace(0, shape[2], tiles[1] + 1).astype(int)
     return [(slice(r0, r1), slice(c0, c1)) for r0, r1 in zip(rs[:-1], rs[1:]) for c0, c1 in zip(cs[:-1], cs[1:])]
 
 
-def air_rays(T, shape, excluded=None, tiles=(1, 1)):
+def air_rays(T, shape, excluded=None, tiles=(1, 1), device=None):
     """The rays that see only the open beam: True where a ray's mean transmission is within NOISE_SIGMAS standard
     errors of its image's open-beam level and the ray lies AIR_MARGIN pixels from any ray that falls short. T (rays,
     bins); shape (images, rows, channels), the rays' layout (one image per view); excluded (rays,) bool marks rays to
@@ -40,12 +53,15 @@ def air_rays(T, shape, excluded=None, tiles=(1, 1)):
     adjacent bins, so no noise level is assumed. The level is each image's own (its exposure may differ from the
     others'), and with tiles (rows, channels) each detector tile's own (a detector made of several sensors, such as a
     2 x 2 Timepix array, has a gain per sensor), from its brightest rays: at least 1 - AIR_QUANTILE of each image (or
-    tile) must be air."""
+    tile) must be air.
+    device is where the sums are computed. None (the default) uses T's device. Give the GPU when T is kept in host
+    memory, and each chunk of rays is then copied to it."""
     from scipy import ndimage as nd
     P, K = T.shape
-    mt = torch.empty(P, dtype=torch.float64, device=T.device); se = torch.empty_like(mt)
+    dev = _device(T, device)
+    mt = torch.empty(P, dtype=torch.float64, device=dev); se = torch.empty_like(mt)
     for s in range(0, P, CHUNK):
-        x = T[s:s + CHUNK].double()
+        x = T[s:s + CHUNK].to(dev).double()
         mt[s:s + CHUNK] = x.mean(1)
         se[s:s + CHUNK] = torch.sqrt((x.diff(dim=1) ** 2).sum(1) / 2) / K
     mt, se = mt.cpu().numpy().reshape(shape), se.cpu().numpy().reshape(shape)
@@ -62,21 +78,21 @@ def air_rays(T, shape, excluded=None, tiles=(1, 1)):
     return air
 
 
-def noise_statistics(T, d, air, shape):
+def noise_statistics(T, d, air, shape, device=None):
     """The dispersion, the noise correlation per neighbour offset and the inflation of the transmission T (rays,
     bins) at dose d (bins,), measured on the rays where air (rays,) is True; shape as for air_rays. The noise is taken
     from the differences between adjacent bins of each ray (independent noise; the differences also remove each ray's
     level), less the open beam's own difference; pairs of bins with a dose of zero (gaps) are left out. Only correlations more than SIGNIFICANCE standard errors from zero
     enter the inflation. With the rays split over processes, the sums are taken over all of them. Returns a dict:
     dispersion, inflation, inflation_se, correlations [(drow, dchannel, correlation, standard error, pairs)], air_rays,
-    and dispersion_per_bin, the dispersion of each bin as a list (_per_bin)."""
-    dev = T.device; K = T.shape[1]
+    and dispersion_per_bin, the dispersion of each bin as a list (_per_bin). device is as for air_rays."""
+    dev = _device(T, device); K = T.shape[1]
     d = torch.as_tensor(np.asarray(d, dtype=np.float64), device=dev)
     ids = torch.as_tensor(np.nonzero(air)[0], device=dev)
     n = all_sum_float(float(len(ids)), dev)
     sT = torch.zeros(K, dtype=torch.float64, device=dev); sD = torch.zeros(K - 1, dtype=torch.float64, device=dev)
     for s in range(0, len(ids), CHUNK):
-        x = T[ids[s:s + CHUNK]].double()
+        x = _rows(T, ids[s:s + CHUNK], dev).double()
         sT += x.sum(0); sD += (x[:, :-1] - x[:, 1:]).sum(0)
     m = all_sum(sT) / n; common = all_sum(sD) / n                      # open-beam level; its own difference
     ok = (d[:-1] > 0) & (d[1:] > 0); K1 = float(ok.sum())                # bin pairs with counts in both bins
@@ -84,7 +100,7 @@ def noise_statistics(T, d, air, shape):
     vd = ((m / dd)[:-1] + (m / dd)[1:])[ok]                              # Poisson variance of a difference per bin
 
     def z(rows):
-        x = T[rows].double()
+        x = _rows(T, rows, dev).double()
         return (x[:, :-1] - x[:, 1:] - common)[:, ok] / torch.sqrt(vd)
 
     pair_sum = torch.zeros(int(K1), dtype=torch.float64, device=dev)
@@ -130,23 +146,25 @@ def _per_bin(phi_pairs, ok, K, phi):
     return np.where(count > 0, np.where(have, both, 0.0).sum(0) / np.maximum(count, 1), phi)
 
 
-def measure_noise(T, d, shape, excluded=None, tiles=(1, 1)):
+def measure_noise(T, d, shape, excluded=None, tiles=(1, 1), device=None):
     """The dispersion and the inflation of the transmission T (rays, bins) at dose d (bins,), measured on its air
     rays (air_rays; shape and excluded as there). Use it before a fit: the dose divided by the dispersion, and the
     inflation for the contamination thresholds. Returns noise_statistics' dict, with each image's number of air rays
-    (air_rays_per_view; audit item 7: an image without air rays is normalized by its brightest sample rays)."""
-    air = air_rays(T, shape, excluded, tiles)
-    out = noise_statistics(T, d, air, shape)
+    (air_rays_per_view; audit item 7: an image without air rays is normalized by its brightest sample rays). device is
+    as for air_rays."""
+    air = air_rays(T, shape, excluded, tiles, device)
+    out = noise_statistics(T, d, air, shape, device)
     out['air_rays_per_view'] = np.asarray(air, bool).reshape(shape[0], -1).sum(1).tolist()
     return out
 
 
-def view_levels(T, air, shape, tiles=(1, 1)):
+def view_levels(T, air, shape, tiles=(1, 1), device=None):
     """Each image's (and each detector tile's) mean transmission over its air rays, relative to the median over all of
     them: the exposure and the tile's gain (1 where there are no air rays). T (rays, bins); air (rays,) bool; shape
     (images, rows, channels), one image per view; tiles as for air_rays. Returns the levels (images, number of tiles)
     and the flagged (image, tile) pairs (more than VIEW_OUTLIER robust spreads from the median, the spread from the
-    median absolute deviation)."""
+    median absolute deviation). device is as for air_rays."""
+    dev = _device(T, device)
     per = shape[1] * shape[2]; air = np.asarray(air, bool).reshape(shape)
     idx = np.arange(per).reshape(shape[1], shape[2]); sl = _tile_slices(shape, tiles)
     lv = np.ones((shape[0], len(sl)))
@@ -154,22 +172,28 @@ def view_levels(T, air, shape, tiles=(1, 1)):
         for t, (rs, cs) in enumerate(sl):
             a = idx[rs, cs][air[i, rs, cs]]
             if len(a):
-                lv[i, t] = float(T[torch.as_tensor(i * per + a, device=T.device)].double().mean())
+                lv[i, t] = float(_rows(T, torch.as_tensor(i * per + a, device=T.device), dev).double().mean())
     lv = lv / np.median(lv)
     spread = 1.4826 * np.median(np.abs(lv - 1.0))
     flagged = [(int(i), int(t)) for i, t in zip(*np.nonzero(np.abs(lv - 1.0) > VIEW_OUTLIER * max(spread, 1e-12)))]
     return lv, flagged
 
 
-def normalize_views(T, shape, excluded=None, tiles=(1, 1)):
+def normalize_views(T, shape, excluded=None, tiles=(1, 1), device=None):
     """Divide each view's (and each detector tile's) transmission by its level (view_levels, measured on its air rays),
     in place: views measured with different exposures, and sensors with different gains, otherwise disagree by
     factors that no model term absorbs. shape, excluded and tiles as for air_rays. Returns the levels and the flagged
-    (image, tile) pairs."""
-    lv, flagged = view_levels(T, air_rays(T, shape, excluded, tiles), shape, tiles)
+    (image, tile) pairs. device is as for air_rays. When it differs from T's device, each tile's rays are divided there
+    and copied back, so the result is the same as when T is on that device."""
+    dev = _device(T, device)
+    lv, flagged = view_levels(T, air_rays(T, shape, excluded, tiles, device), shape, tiles, device)
     per = shape[1] * shape[2]; idx = np.arange(per).reshape(shape[1], shape[2])
     with torch.no_grad():
         for i in range(shape[0]):
             for t, (rs, cs) in enumerate(_tile_slices(shape, tiles)):
-                T[torch.as_tensor(i * per + idx[rs, cs].ravel(), device=T.device)] /= float(lv[i, t])
+                rows = torch.as_tensor(i * per + idx[rs, cs].ravel(), device=T.device)
+                if dev == T.device:
+                    T[rows] /= float(lv[i, t])
+                else:
+                    T[rows] = (_rows(T, rows, dev) / float(lv[i, t])).to(T.device)
     return lv, flagged

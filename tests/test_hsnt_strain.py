@@ -1259,3 +1259,143 @@ def test_elastic_anisotropy():
     tf.E = torch.zeros_like(E_true); tf.sync()
     l0 = tf.data_loss(); tf.volume_step(); l1 = tf.data_loss()
     assert l1 < l0
+
+
+GPU_RTOL = 1e-8          # host storage against device storage on a GPU: its sums by atomic additions vary run to run
+FLOAT32_RTOL = 1e-6      # the same for float32 data: one unit in the last place of a float32 is about 1.2e-7
+
+
+def _storage_twins(device, shared):
+    """Two copies of the small cubic4 fit (_small_fit_cubic4) that compute on device: one with the default storage of
+    the transmission, and one with t_storage 'host' (FitB). With shared, both use one noisy open beam shared by every
+    view (FitB.set_shared_open_beam), drawn as in test_shared_open_beam."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    ref = _small_fit_cubic4()
+    P, K = ref.T.shape
+    T = ref.T
+    if shared:
+        pix = torch.arange(P) // 8; gen = torch.Generator().manual_seed(7)
+        with torch.no_grad():
+            m_true = torch.cat([ref.mean(s)[0] for s in ref.chunks()])
+        b_true = 50.0 * torch.ones(5, K, dtype=torch.float64)
+        s_ = 0.9 + 0.2 * torch.rand(P, generator=gen, dtype=torch.float64)
+        O = torch.poisson(b_true, generator=gen).clamp_min(1.0)
+        S = torch.poisson(s_[:, None] * b_true[pix] * m_true, generator=gen)
+        T = (S / (s_[:, None] * O[pix])).to(ref.T.dtype)
+    fits = []
+    for storage in ('device', 'host'):
+        M = Hybrid2(np.linspace(2.0, 4.4, 300), np.full(300, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))],
+                    smooth_degree=5, n_contam=1, device=device, dtype=torch.float64, shape_model='cubic4')
+        M.view_dirs = ref.M.view_dirs
+        fit = FitB(M, T.clone().to(device) if storage == 'device' else T.clone(), ref.g.to(device), ref.W.to(device),
+                   ref.f.to(device), eps=ref.eps.to(device), chunk=16, t_storage=storage)
+        fit.ray_view = ref.ray_view.to(device)
+        if shared:
+            fit.set_shared_open_beam(O, pix, s_)
+        fits.append(fit)
+    return fits
+
+
+@pytest.mark.parametrize('shared', [False, True])
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_host_storage_matches_device(device, shared):
+    """FitB with t_storage 'host' keeps T in host memory (pinned for a GPU) and gives the numbers of the default storage:
+    the data loss, every chunk of T, the ray and global systems, and pixel, contamination and global steps. They agree
+    bitwise on the CPU, and to GPU_RTOL on a GPU. With a shared open beam, T_chunk gives the bound's transmission that
+    refresh_open_beam builds in the default storage, and the exact deviance agrees too."""
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('no GPU')
+    a, b = _storage_twins(device, shared)
+    exact = device == 'cpu'
+
+    def same(x, y):
+        if not torch.is_tensor(x):
+            return x == y if exact else abs(x - y) <= GPU_RTOL * abs(y)
+        if exact:
+            return torch.equal(x, y)
+        return torch.allclose(x, y, rtol=GPU_RTOL, atol=GPU_RTOL * float(y.abs().max()))
+    assert b.T.device.type == 'cpu' and b.device == a.device and b.P == a.P
+    if device == 'cuda':
+        assert b.t_pinned and b.T.is_pinned()
+    assert same(b.data_loss(), a.data_loss())
+    ca, cb = a._state(a.g), b._state(b.g)
+    for sl in a.chunks():
+        assert b.T_chunk(sl).device == a.T_chunk(sl).device and same(b.T_chunk(sl), a.T_chunk(sl))
+        (Ga, Fa), (Gb, Fb) = a.ray_system(sl, ca), b.ray_system(sl, cb)
+        assert same(Gb, Ga) and same(Fb, Fa)
+    M = a.M
+    idx = [i for i in range(M.n_global) if not (M.res_sl[0] <= i < M.res_sl[1]) and float(M.ub[i]) > float(M.lb[i])]
+    (ga, Fga), (gb, Fgb) = a.global_system(idx), b.global_system(idx)
+    assert same(gb, ga) and same(Fgb, Fga)
+    for x in (a, b):
+        x.build_atoms(); x.contamination_newton = True
+        x.contamination_atoms_step(); x.pixel_step(); x.global_step(1e-3)
+    for key in ('g', 'W', 'eps', 'c', 'f'):
+        assert same(getattr(b, key), getattr(a, key)), key
+    assert same(b.data_loss(), a.data_loss())
+    if shared:
+        assert same(b.open_beam_deviance(), a.open_beam_deviance())
+        for sl in a.chunks():                                       # the bound moved with the state, in both storages
+            assert same(b.T_chunk(sl), a.T_chunk(sl))
+
+
+def test_noise_with_host_data():
+    """measure_noise and normalize_views on a T in host memory, with device set to a GPU, give what they give on the
+    same T kept on that GPU: the air rays, the dispersion, the inflation, the view levels and the normalized T."""
+    if not torch.cuda.is_available():
+        pytest.skip('no GPU')
+    from mbirtorch.hsnt.strain.noise import measure_noise, normalize_views
+    images, side, K = 12, 16, 200
+    g = torch.Generator().manual_seed(3)
+    yy, xx = np.meshgrid(np.arange(side) - side / 2, np.arange(side) - side / 2, indexing='ij')
+    disk = torch.as_tensor(np.broadcast_to(yy ** 2 + xx ** 2 < 16, (images, side, side)).reshape(-1))
+    m = torch.where(disk, 0.6, 1.0).double()[:, None].expand(-1, K)
+    gain = 1.0 + 0.004 * torch.randn(images, 2, 2, generator=g, dtype=torch.float64)
+    pix = gain.repeat_interleave(side // 2, 1).repeat_interleave(side // 2, 2).reshape(-1)
+    T = (m * pix[:, None] + 0.02 * torch.randn(images * side * side, K, generator=g, dtype=torch.float64)).float()
+    d = np.full(K, 2500.0)
+    shape = (images, side, side)
+    on_gpu = measure_noise(T.cuda(), d, shape, tiles=(2, 2))
+    on_host = measure_noise(T.clone().pin_memory(), d, shape, tiles=(2, 2), device='cuda')
+    assert on_host['air_rays'] == on_gpu['air_rays'] and on_host['air_rays_per_view'] == on_gpu['air_rays_per_view']
+    for key in ('dispersion', 'inflation'):
+        assert abs(on_host[key] - on_gpu[key]) <= GPU_RTOL * abs(on_gpu[key]), key
+    Tg, Th = T.cuda(), T.clone().pin_memory()
+    lv_g, flag_g = normalize_views(Tg, shape, tiles=(2, 2))
+    lv_h, flag_h = normalize_views(Th, shape, tiles=(2, 2), device='cuda')
+    assert Th.device.type == 'cpu' and flag_h == flag_g and np.allclose(lv_h, lv_g, rtol=GPU_RTOL, atol=0)
+    assert torch.allclose(Th, Tg.cpu(), rtol=FLOAT32_RTOL, atol=0)
+
+
+def test_warmup_host_storage():
+    """warmup with t_storage 'host' (here on the CPU, with a ray mask) gives a TomoFit whose fit keeps T in host memory,
+    and the same start as the default storage. The factorization inside may run on a GPU, whose sums vary in the last
+    bits from run to run, so the check allows for rounding."""
+    from mbirtorch.hsnt.strain.tomo import Projector, warmup
+    from mbirtorch.hsnt.strain.bragg import BraggSpectrum
+    n = 12; th = np.linspace(0, np.pi, 9, endpoint=False)
+    proj = Projector(n, th, 2, 0.0, False)
+    lam = np.linspace(1.5, 5.0, 500)
+    mats = [('fcc', 3.524), ('bcc', 2.8665)]
+    mu = []
+    for lt, a in mats:
+        m = BraggSpectrum(lam, lattice=lt, a_range=(a * 0.999, a * 1.001), resolution=(0.002, 0.0))
+        p_ = torch.zeros(m.n_params, dtype=torch.float64); p_[0] = a; p_[1:1 + m.n_edges] = 1.0; p_[1 + m.n_edges] = 0.3
+        mu.append(m(p_).detach().numpy())
+    mu = 0.08 * np.stack(mu) / np.stack(mu).mean(1, keepdims=True)
+    V = torch.zeros(n, n, n, 2); V[2:6, 3:9, 3:9, 0] = 1; V[6:10, 3:9, 3:9, 1] = 1
+    torch.manual_seed(0)
+    T = (torch.poisson(1e5 * torch.exp(-(proj.fwd(V).double() @ torch.as_tensor(mu)))) / 1e5).float()
+    ray_mask = torch.ones(T.shape[0], dtype=torch.bool); ray_mask[:n] = False         # one detector row of view 0
+    out = []
+    for storage in ('device', 'host'):
+        torch.manual_seed(0)
+        tf, _ = warmup(T.clone(), lam, np.full(lam.size, 1e5), [lt for lt, _ in mats], [a for _, a in mats], proj,
+                       device='cpu', init_spectra=list(mu), d0_from_data=True, noise=None, normalize=False,
+                       ray_mask=ray_mask, t_storage=storage)
+        out.append(tf)
+    a, b = out
+    assert b.fit.t_storage == 'host' and b.fit.T.device.type == 'cpu' and b.fit.P == a.fit.P
+    assert torch.allclose(b.V, a.V, rtol=1e-4, atol=1e-6 * float(a.V.abs().max()))
+    assert torch.allclose(b.fit.g, a.fit.g, rtol=1e-4, atol=1e-6 * float(a.fit.g.abs().max()))
+    assert abs(b.fit.data_loss() - a.fit.data_loss()) <= 1e-5 * abs(a.fit.data_loss())

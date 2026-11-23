@@ -2031,7 +2031,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
            init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
-           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None):
+           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage='device'):
     """The pipeline's start: returns a TomoFit. Each material (an entry of lattices and a0) is one of three kinds. With a
     starting spectrum (a row of init_spectra, e.g. a known material's table), it starts from that spectrum at its a0.
     With a lattice type and a0 only, warm_start searches its lattice parameter within a0 * (1 +- a_range). With
@@ -2079,14 +2079,21 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     relative standard deviation height_sd (FitB.height_prior). dec (user 2026-11-22: elastic anisotropy): per material
     None, (alpha, beta) per reflection, or a function of the reflections' h^2 + k^2 + l^2 returning them; each
     reflection's lattice strain alpha eps + beta tr(strain) from the diffraction elastic constants (Hybrid2.set_dec);
-    it needs the strain-tensor weights."""
+    it needs the strain-tensor weights. t_storage is FitB's: 'device' (the default) keeps T as it is given, and 'host'
+    keeps T in host memory during the fit. With 'host', T may be given in host memory (pinned for fast copies). The
+    noise measurement then copies T to the model's device in chunks, and the warm start's factorization copies T to
+    that device as its memory plan allows."""
     from mbirtorch import hsnt
+    from .model import _compute_device
+    # the device for the steps that read the whole T: None (T's own) by default, the model's device with host storage
+    t_dev = None if t_storage == 'device' else _compute_device(device)
+    t_kw = {} if t_storage == 'device' else dict(t_storage=t_storage)
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n); side = int(round(math.sqrt(rpv)))
         noise_info = measure_noise(T, d, (T.shape[0] // rpv, side, side), None if ray_mask is None else ~ray_mask.bool(),
-                                   detector_tiles)
+                                   detector_tiles, device=t_dev)
         phi = np.asarray(noise_info['dispersion_per_bin']) if per_bin_dispersion else noise_info['dispersion']
         if shared_open_beam is not None:              # the air rays' variance includes the open beam's: keep the detector's
             open_beam_obs = 1.0 / float(np.mean(np.asarray(shared_open_beam['exposure'], dtype=np.float64)))
@@ -2098,6 +2105,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         raise ValueError(f"noise must be None or 'measure', not {noise!r}")
     R = len(lattices)
     dev = str(T.device) if T.is_cuda else None   # a GPU tensor is factored on its own GPU, without a host copy
+    if dev is None and t_dev is not None and t_dev.type == 'cuda':
+        dev = str(t_dev)                          # host storage: T in host memory is factored on the model's GPU
     # the counts per bin as the strain fit's likelihood counts them (the open beam over the noise dispersion), so the
     # warm start weights each bin as the fit does
     open_beam = np.broadcast_to(np.asarray(d, dtype=np.float64), (T.shape[-1],))
@@ -2194,10 +2203,11 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     Mx = np.linalg.lstsq(targets.T, H0_local.T.astype(np.float64), rcond=None)[0].T
     Wr = torch.as_tensor(np.clip(W0 @ Mx, 0, None), device=device, dtype=torch.float32)
     # the pipeline's per-ray fits of the maps to the initial spectra (no strain yet)
-    fit0 = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), chunk=chunk)
+    fit0 = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), chunk=chunk, **t_kw)
     fit0.open_beam_obs = open_beam_obs
     for _ in range(INIT_PIXEL_STEPS):
         fit0.pixel_step()
+    T_fit = fit0.T                     # T as FitB stores it (T itself by default), so the fit below makes no second copy
     Wr = fit0.W; del fit0
     # least-squares reconstruction of the ray maps (CGLS), clipped to >= 0
     n = proj.n; pr = proj.with_q(R)
@@ -2209,8 +2219,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         x += al * p; r_ -= al * q; s = pr.back(r_); gnew = float((s * s).sum())
         p = s + (gnew / gam) * p; gam = gnew
     V = x.clamp_min(0)
-    fit = FitB(M, T, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
-               ray_mask=ray_mask)
+    fit = FitB(M, T_fit, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
+               ray_mask=ray_mask, **t_kw)
     if h_tab:
         fit.height_prior = dict(targets=h_tab, sd=height_sd)
     if shared_open_beam is not None:                  # exact: each pixel's open beam profiled out (open_beam_obs not used)
@@ -2224,7 +2234,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
         assert weights is not None, 'a view-dependent texture needs the strain-tensor weights (they hold the beam directions)'
         rpv = getattr(proj, 'rays_per_view', proj.n * proj.n)
         M.view_dirs = directions_from_weights(weights)
-        fit.ray_view = torch.arange(T.shape[0] // rpv, device=T.device).repeat_interleave(rpv)
+        fit.ray_view = torch.arange(T.shape[0] // rpv, device=fit.device).repeat_interleave(rpv)
     if kappa_prior is not None:
         # the standard deviation as a multiple of the warm-up spectra's mean attenuation (kappa's own units)
         fit.kappa_prior = kappa_prior * float(np.abs(targets).mean())

@@ -141,6 +141,16 @@ CONTAM_STEP_MARGIN = 1.05    # the inner step is 1 / (this x the largest curvatu
 LEGENDRE_DEGREE = 8          # the smooth part's polynomial degree (the spline's effective degrees of freedom
                              # on the real Fe cube, q79, were 8.9)
 LEGENDRE_CURVATURE = 1e-2    # the smooth part's curvature penalty weight relative to FitB.ridge (q79 used 1.1e-2)
+T_STORAGES = ("device", "host")   # FitB t_storage: the transmission as given (the default), or in host memory
+STORE_BLOCK_RAYS = 65536     # rays copied at a time when FitB moves the transmission into its storage
+
+
+def _compute_device(dev):
+    """The torch device dev, with a GPU's index made explicit (the current GPU when dev names no index)."""
+    d = torch.device(dev)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return d
 
 
 def edge_step(off, hf, width=None):
@@ -855,12 +865,22 @@ class FitB:
     derivatives by the chain rule through the banded operator, contamination per bin."""
 
     def __init__(self, model, T, g, W, f, eps=None, chunk=1024, ridge=None, z=None, alpha=0.05, inflation=1.0,
-                 ray_mask=None):
+                 ray_mask=None, t_storage="device"):
         """ray_mask (rays,) bool: only the rays where it is True enter the likelihood (use it to leave out detector
-        regions the model does not describe, such as a sample holder); None uses every ray."""
-        self.M = model; self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
-        self.ray_weight = None if ray_mask is None else ray_mask.to(T.device, T.dtype)
-        self.n_points = int(all_sum_float((T.shape[0] if ray_mask is None else int(ray_mask.sum())) * T.shape[1], T.device))
+        regions the model does not describe, such as a sample holder); None uses every ray.
+        t_storage says where the transmission T is kept. 'device' (the default) keeps T as it is given, and the fit
+        computes on T's device. 'host' keeps T in host memory, pinned when the model computes on a GPU, and the fit
+        computes on the model's device. Each pass over the rays then copies its chunks of T to that device. The
+        results are the same, and the GPU memory falls by the size of T. Use 'host' when T does not fit on the GPU
+        next to the fit."""
+        if t_storage not in T_STORAGES:
+            raise ValueError(f"t_storage must be one of {T_STORAGES}, not {t_storage!r}")
+        self.M = model; self.t_storage = t_storage
+        self._device = T.device if t_storage == "device" else _compute_device(model.dev)
+        self._T_ratio = None             # the shared open beam's per-pixel factor, which T_chunk applies outside 'device'
+        self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
+        self.ray_weight = None if ray_mask is None else ray_mask.to(self.device, self._t_cdt)
+        self.n_points = int(all_sum_float((self.P if ray_mask is None else int(ray_mask.sum())) * T.shape[1], self.device))
         # variance inflation of pixel sums from spatially correlated counts (noise.py); scales score variances
         self.inflation = float(inflation)
         self.eps = None if eps is None else eps.clone()
@@ -870,7 +890,7 @@ class FitB:
         self.eps_sd = None               # (rays, R) each ray's spread of strain along the beam (TomoFit.refresh_spread)
         self.tex_Q = None                # texture field: per material, the rays' basis weights (rays, nb) (TomoFit.sync)
         self.chunk = chunk
-        self.ridge = (1e-3 * all_sum_float(T.shape[0], T.device) * float(model.d.mean())) if ridge is None else ridge
+        self.ridge = (1e-3 * all_sum_float(self.P, self.device) * float(model.d.mean())) if ridge is None else ridge
         self.z = norm.isf(alpha / (2 * model.K)) if z is None else z
         self.lam1 = torch.zeros_like(self.f); self.dispersion = 1.0
         self.history = []
@@ -895,11 +915,35 @@ class FitB:
 
     @T.setter
     def T(self, value):
-        self._T = value
+        self._t_cdt = value.dtype            # the dtype in which T_chunk returns the transmission
+        self._T = self._store(value)
+
+    def _store(self, value):
+        """value (rays, bins) as this fit keeps it. The default storage keeps value itself. With t_storage 'host', a
+        host tensor (pinned when the fit computes on a GPU) is kept as it is, and any other value is copied into one."""
+        if self.t_storage == "device":
+            return value
+        pin = self._device.type == "cuda"
+        if value.device.type == "cpu" and (not pin or value.is_pinned()):
+            self.t_pinned = pin
+            return value
+        try:
+            out = torch.empty(value.shape, dtype=value.dtype, pin_memory=pin)
+        except RuntimeError:                 # pinning can fail (for example under WSL); pageable memory still works
+            out = torch.empty(value.shape, dtype=value.dtype)
+        self.t_pinned = pin and bool(out.is_pinned())     # without pinning, each chunk's copy is synchronous
+        for i in range(0, value.shape[0], STORE_BLOCK_RAYS):
+            out[i:i + STORE_BLOCK_RAYS].copy_(value[i:i + STORE_BLOCK_RAYS])
+        return out
 
     def T_chunk(self, sl):
         """The transmission of the rays sl, on the device where the fit computes."""
-        return self._T[sl]
+        if self.t_storage == "device":
+            return self._T[sl]
+        x = self._T[sl].to(self._device, non_blocking=True)
+        if self._T_ratio is not None:        # a shared open beam: the bound's transmission, computed as refresh_open_beam does
+            x = (x.double() * self._T_ratio[self.shared_open_beam["pix"][sl]]).to(self._t_cdt)
+        return x
 
     @property
     def P(self):
@@ -909,12 +953,12 @@ class FitB:
     @property
     def device(self):
         """The device on which the fit computes."""
-        return self._T.device
+        return self._T.device if self.t_storage == "device" else self._device
 
     def _data_tensors(self):
         """The tensors that hold the data. The state key of the remembered data loss includes them, so a new tensor or
         an in-place change of one makes the remembered loss stale."""
-        return (self._T,)
+        return (self._T,) if self.t_storage == "device" else (self._T, self._T_ratio)
 
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
@@ -954,7 +998,8 @@ class FitB:
 
     def refresh_open_beam(self):
         """Moves the Poisson bound of the shared open beam's likelihood to the current state: the open beam's estimate b
-        per pixel and bin, each ray's dose s_v b, and the transmission T O / b. A no-op without a shared open beam."""
+        per pixel and bin, each ray's dose s_v b, and the transmission T O / b. A no-op without a shared open beam.
+        With t_storage 'host', T stays the measured transmission, and T_chunk multiplies each chunk by O / b."""
         ob = self.shared_open_beam
         if ob is None:
             return
@@ -975,6 +1020,9 @@ class FitB:
         ob["b"] = (ob["O"] + ob["S_sum"]) / (1 + A)
         ob["A"] = A
         ratio = (ob["O"] / ob["b"].clamp_min(1e-12))
+        if self.t_storage != "device":       # T_chunk applies the ratio to each chunk, so no second full T is built
+            self._T_ratio = ratio
+            return
         T = torch.empty_like(self.T_measured)
         for sl in self.chunks():
             T[sl] = (self.T_measured[sl].double() * ratio[ob["pix"][sl]]).to(T.dtype)
