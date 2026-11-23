@@ -1087,6 +1087,12 @@ class FitB:
         P = self.T.shape[0]
         return [slice(i, min(i + self.chunk, P)) for i in range(0, P, self.chunk)]
 
+    def _chunk_total(self, t):
+        """One chunk's share of a sum over a pass, from a 0-dim float64 tensor t. By default it is read from the GPU at
+        once, as a Python float. With lean_syncs it stays on the device, and the pass reads its total once, at its
+        end. The sum is the same, because float64 additions in the same order give the same result on either side."""
+        return t.detach() if getattr(self, "lean_syncs", False) else float(t)
+
     def _texture(self, g):
         """The texture factors per material at g (cubic4), computed once per state of g and kept; None when g carries
         derivatives (automatic differentiation then goes through the factor) or there is no view-dependent texture."""
@@ -1358,8 +1364,8 @@ class FitB:
             for sl in self.chunks():
                 Ws = None if W is None else W[sl]; es = None if eps is None else eps[sl]
                 m = self.mean(sl, g, Ws, f, es, cache, eps_all=eps)[0]
-                tot += float(self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64))
-        tot = all_sum_float(tot, self.T.device)
+                tot += self._chunk_total(self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64))
+        tot = all_sum_float(float(tot), self.T.device)
         if current:
             self.remember_data_loss(tot)
         return tot
@@ -1412,14 +1418,15 @@ class FitB:
         """Gradient (Pc, 2R) and Fisher information (Pc, 2R, 2R) of the deviance of the rays sl with respect to
         (W, U), where U = W * eps is the projected strain (the ray's mean strain times its projected density). Used by
         a tomographic fit, where W and U are projections of volumes. Needs per-ray strain (eps not None). deviance: a
-        list to which the rays' deviance at the current state is appended (it costs nothing extra here)."""
+        list to which the rays' deviance at the current state is appended (it costs nothing extra here). The value is
+        a Python float, or a 0-dim tensor on the device with lean_syncs (_chunk_total)."""
         M = self.M
         Jac, m = self.ray_jacobian(sl, cache)
         mm = m.clamp_min(1e-12); T = self.T[sl]
         grad = torch.einsum('pk,pkn->pn', self.residual(sl, T, mm), Jac).double()
         F = torch.einsum('pk,pka,pkb->pab', self.weight(sl, mm), Jac, Jac).double()
         if deviance is not None:
-            deviance.append(float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64)))
+            deviance.append(self._chunk_total(self.deviance_terms(sl, m, T).sum(dtype=torch.float64)))
         return grad, F
 
     def global_derivatives(self, idx):
@@ -1579,7 +1586,7 @@ class FitB:
                 T = self.T[sl]
                 m, E, n, beta, s = self.mean(sl, cache=cache)
                 mm = m.clamp_min(1e-12)
-                dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
+                dev += self._chunk_total(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
                 Dm = beta[:, None, :] - n[:, :, None]
                 grad += torch.einsum('pk,pkj->kj', self.residual(sl, T, mm), Dm).double()
                 Fx += torch.einsum('pk,pka,pkb->kab', self.weight(sl, mm), Dm, Dm).double()
@@ -1587,8 +1594,8 @@ class FitB:
                 # contrast, a fully penetrating contaminant (beta = 1), so a contaminant that imitates the neutrons
                 # (beta near n, a vanishing score variance) is not free
                 Fi0 += (self.weight(sl, n.clamp_min(1e-12)) * (1 - n) ** 2).sum(0).double()[:, None].expand(-1, J)
-                pear += float((self.weight(sl, mm) * (T - m) ** 2).sum(dtype=torch.float64))
-        all_sum(grad); all_sum(Fx); all_sum(Fi0); pear = all_sum_float(pear, M.dev); dev = all_sum_float(dev, M.dev)
+                pear += self._chunk_total((self.weight(sl, mm) * (T - m) ** 2).sum(dtype=torch.float64))
+        all_sum(grad); all_sum(Fx); all_sum(Fi0); pear = all_sum_float(float(pear), M.dev); dev = all_sum_float(float(dev), M.dev)
         self.remember_data_loss(dev)
         Fd = torch.diagonal(Fx, dim1=1, dim2=2)
         self.dispersion = pear / self.n_points
@@ -1646,8 +1653,8 @@ class FitB:
         cache = self._state(self.g); dv = 0.0
         with torch.no_grad():
             for sl in self.chunks():
-                dv += float(self.deviance_terms(sl, self.mean(sl, f=f, cache=cache)[0], self.T[sl]).sum(dtype=torch.float64))
-        return all_sum_float(dv, self.T.device)
+                dv += self._chunk_total(self.deviance_terms(sl, self.mean(sl, f=f, cache=cache)[0], self.T[sl]).sum(dtype=torch.float64))
+        return all_sum_float(float(dv), self.T.device)
 
     def loss_c(self, c):
         return self.loss_c_data(c) + float((self.lam_c * c).sum())
@@ -1672,8 +1679,8 @@ class FitB:
                 grad += torch.einsum('pk,pkj->kj', self.residual(sl, T, mm), Dm).double()
                 F += torch.einsum('pk,pka,pkb->kab', self.weight(sl, mm), Dm, Dm).double()
                 Fi0 += torch.einsum('pk,pkj->kj', self.weight(sl, n.clamp_min(1e-12)), Dm * Dm).double()
-                pear += float((self.weight(sl, mm) * (T - m) ** 2).sum(dtype=torch.float64))
-        all_sum(grad); all_sum(F); all_sum(Fi0); pear = all_sum_float(pear, M.dev)
+                pear += self._chunk_total((self.weight(sl, mm) * (T - m) ** 2).sum(dtype=torch.float64))
+        all_sum(grad); all_sum(F); all_sum(Fi0); pear = all_sum_float(float(pear), M.dev)
         self.dispersion = pear / self.n_points
         self.lam1 = _l1_threshold(Fi0, self.dispersion * self.inflation, self.z).T.to(M.dt)
         grad += self.lam1.T.double()
@@ -1867,9 +1874,9 @@ class FitB:
             cache = (M.spectra(gp).to(M.dt), band, M.kappa(gp).to(M.dt))
             m = self.mean(sl, g=gp, cache=cache)[0]
             dv = self.deviance_terms(sl, m, self.T[sl]).sum(dtype=torch.float64)
-            grad += torch.autograd.grad(dv, gp)[0]; dev += float(dv)
+            grad += torch.autograd.grad(dv, gp)[0]; dev += self._chunk_total(dv)
         all_sum(grad)
-        self.remember_data_loss(all_sum_float(dev, self.T.device))
+        self.remember_data_loss(all_sum_float(float(dev), self.T.device))
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):
             grad += torch.autograd.grad(pen, gp)[0]
@@ -1916,10 +1923,10 @@ class FitB:
             mm = m.clamp_min(1e-12); T = self.T[sl]
             grad += torch.einsum('pk,npk->n', self.residual(sl, T, mm), Jg).double()
             F += torch.einsum('pk,apk,bpk->ab', self.weight(sl, mm), Jg, Jg).double()
-            dev += float(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
+            dev += self._chunk_total(self.deviance_terms(sl, m, T).sum(dtype=torch.float64))
             del Jg
         all_sum(grad); all_sum(F)
-        self.remember_data_loss(all_sum_float(dev, self.T.device))
+        self.remember_data_loss(all_sum_float(float(dev), self.T.device))
         gp = g0.clone().requires_grad_(True)
         pen = self.spline_penalty(gp)
         if torch.is_tensor(pen):

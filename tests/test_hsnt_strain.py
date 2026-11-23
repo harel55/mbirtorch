@@ -1315,7 +1315,9 @@ def _lean_outputs(fit):
     cache = fit._state(fit.g)
     out['mu'], out['band'], out['kappa'] = cache
     fit.use_memo = False
-    out['loss'] = torch.tensor(fit.data_loss())
+    loss = fit.data_loss()
+    assert isinstance(loss, float)
+    out['loss'] = torch.tensor(loss)
     eps2 = fit.eps * 1.3
     out['loss_eps'] = torch.tensor(fit.data_loss(eps=eps2))
     with torch.no_grad():
@@ -1331,6 +1333,14 @@ def _lean_outputs(fit):
     out['gg'] = fit.global_grad(idx)
     full = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]
     out['gs_grad_kernel'], out['gs_F_kernel'] = fit.global_system(full)
+    # the contamination's passes: a trial loss, and the Pearson dispersion and thresholds of a step (state restored)
+    fit.build_atoms()
+    out['loss_c'] = torch.tensor(fit.loss_c_data(0.01 * torch.ones_like(fit.c)))
+    f0, lam0, disp0 = fit.f.clone(), fit.lam1.clone(), fit.dispersion
+    fit.contamination_step()
+    assert isinstance(fit.dispersion, float)
+    out['dispersion'], out['lam1'] = torch.tensor(fit.dispersion), fit.lam1.clone()
+    fit.f, fit.lam1, fit.dispersion = f0, lam0, disp0
     g0 = fit.g.clone()
     with torch.no_grad():
         out['lattice'] = torch.tensor(fit.lattice_search(0, half_width=0.002))
@@ -1375,3 +1385,39 @@ def test_lean_syncs_matches_default(case, dtype):
     fit.data_loss()
     del M.band
     assert built == [1]
+
+
+def test_lean_syncs_volume_step():
+    """A tomographic fit with FitB.lean_syncs, several chunks of rays and a strain spread along the beam gives the
+    default path's data loss at a trial state (to rounding), and a volume step that lowers the objective as much."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    dev = pr.fwd(torch.zeros(N, N, N, 2)).device
+    lam = np.linspace(2.0, 4.4, 80)
+    M = Hybrid2(lam, np.full_like(lam, 200.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
+                device=dev)
+    g = torch.zeros(M.n_global, dtype=torch.float64, device=dev); s = M.slices[0]
+    g[s['a']] = 2.8665; g[s['h'][0]:s['h'][1]] = 0.3; g[s['c'][0]] = 0.2
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor([0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0], dtype=torch.float64,
+                                              device=dev)
+    P = sum(pr.counts); kw = dict(device=dev)
+    V = torch.zeros(N, N, N, 1, device=dev); V[3:9, 3:9, 3:9] = 0.05
+    E_true = 1.5e-3 * torch.randn(N, N, N, 1, 1, generator=torch.Generator().manual_seed(6)).to(dev) * (V[..., None] > 0)
+
+    def run(lean):
+        fit = FitB(M, torch.ones(P, M.K, **kw), g, torch.ones(P, 1, **kw), torch.zeros(1, M.K, **kw),
+                   eps=torch.zeros(P, 1, **kw), chunk=512)
+        tf = TomoFit(fit, pr, V.clone(), E_true.clone()); tf.sync(); tf.edge_spread = True; tf.refresh_spread()
+        with torch.no_grad():
+            fit.T = torch.cat([fit.mean(c)[0] for c in fit.chunks()])              # noiseless data at the truth
+        fit.lean_syncs = lean
+        tf.E = 0.5 * E_true; tf.sync(); tf.refresh_spread()                         # the spread at the start
+        trial = tf.data_loss(V, 0.8 * E_true)
+        l0 = tf.loss(); tf.volume_step(); l1 = tf.loss()                           # data + prior
+        assert isinstance(trial, float)
+        return trial, l0, l1
+    ref, got = run(False), run(True)
+    assert len(range(0, P, 512)) > 1                                                 # several chunks
+    assert abs(got[0] - ref[0]) <= 1e-5 * abs(ref[0]) and abs(got[1] - ref[1]) <= 1e-5 * abs(ref[1])
+    assert got[2] < got[1] and abs(got[2] - ref[2]) <= 1e-3 * abs(ref[1])
