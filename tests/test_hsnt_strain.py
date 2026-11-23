@@ -658,13 +658,14 @@ def test_fft_compact_data_block_projectors(fine):
     assert rel < 1e-5, rel
 
 
-def _volume_step_fit(seed=0):
+def _volume_step_fit(seed=0, one_model_views=True):
     """A TomoFit for one volume step on a MultiProjector with mounts: one bcc material in a cube, flat data, random
-    strain tensors, random view weights and the equilibrium prior."""
+    strain tensors, random view weights and the equilibrium prior. one_model_views is passed to the MultiProjector."""
     from mbirtorch.hsnt.strain.model import Hybrid2, FitB
     from mbirtorch.hsnt.strain.tomo import TomoFit
     C = 6
-    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False)
+    pr = MultiProjector(N, MOUNTS, 2, channel_offsets=[0.0, 0.3, -0.2], ror_mask=False,
+                        one_model_views=one_model_views)
     dev = pr.fwd(torch.zeros(N, N, N, 2)).device                 # the device the projector runs on
     lam = np.linspace(2.0, 4.4, 60)
     M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=3, n_contam=1,
@@ -951,6 +952,21 @@ RARE_BCC_MIN_FRACTION = 0.5      # The bcc material's map on each ray is this va
 TEST_KERNEL = (0.0, 0.001, 0.002, 0.0, 0.1, 0.02, 0.0, 0.0)
 UNIFORM_TEST_STEPS = 3           # test_fisher_rays_uniform_sample_no_fallback takes this many global steps.
 SMALL_TEST_STEPS = 2             # test_fisher_rays_small_problem_default_path takes this many global steps.
+# _check_fit holds these resolution-kernel slots (s0, s1 and lam_R, as offsets from Hybrid2.res_sl[0]), because the
+# model's derivative with respect to each of them is zero at its lower bound 0.
+ZERO_SLOPE_KERNEL_SLOTS = (0, 1, 4)
+CHECK_FISHER_EVERY = 1           # The tests of the fisher_rays check recompute the Fisher information on every step.
+# On global step k, test_fisher_rays_check_bound sets to zero the Fisher information's rows and columns of the edge
+# heights in entry k, each given by its offset from the first edge height of material 0 (M.slices[0]['h'][0]).
+CHECK_BOUND_SCHEDULE = ((), (0,), (1,), (0, 1), (0,), (), (1,))
+CHECK_BOUND_FULL_STEPS = (0, 1, 2)   # The global steps of that test that compute the full Fisher information are these.
+# On global step k, test_fisher_rays_rechecks_new_information sets to zero the Fisher information's rows and columns of
+# the edge heights in entry k, each given by its offset from the first edge height of material 0.
+NEW_INFO_SCHEDULE = ((0,), (), (0,), ())
+NEW_INFO_FULL_STEPS = (0, 1)     # The global steps of that test that compute the full Fisher information are these.
+# From this global step on, test_fisher_rays_late_fallback sets to zero the subset's Fisher information of the first
+# edge height of material 0.
+LATE_FALLBACK_STEP = 2
 
 
 def _rare_material_fit():
@@ -1004,12 +1020,81 @@ def test_fisher_rays_rare_material_falls_back():
     assert calls == []
 
 
+def _check_fit():
+    """Returns the fit of the tests of the fisher_rays check: _fisher_fit with ACCURACY_TEST_RAYS rays, a ray subset of
+    one ray in FISHER_SUBSET_SHARE, and the Fisher information recomputed on every global step (CHECK_FISHER_EVERY).
+    The kernel slots ZERO_SLOPE_KERNEL_SLOTS are held at their start values, so that no parameter loses its information
+    during the steps."""
+    fit = _fisher_fit(ACCURACY_TEST_RAYS)
+    M = fit.M
+    for k in ZERO_SLOPE_KERNEL_SLOTS:                 # A parameter whose bounds are equal is held (global_step).
+        i = M.res_sl[0] + k
+        M.lb[i] = M.ub[i] = fit.g[i]
+    fit.fisher_rays = fit.P // FISHER_SUBSET_SHARE
+    fit.fisher_every = CHECK_FISHER_EVERY
+    return fit
+
+
+class _FisherSchedule:
+    """_FisherSchedule wraps a fit's subset_fisher and global_system for the tests of the fisher_rays check. Each
+    wrapper sets to zero the rows and columns of its Fisher information that belong to the global parameters in sub
+    (subset_fisher) or in full (global_system). A test sets step, sub and full before each global step. The wrappers
+    record the step of each of their calls in sub_steps and full_steps."""
+
+    def __init__(self, fit):
+        self.step, self.sub, self.full = None, (), ()
+        self.sub_steps, self.full_steps = [], []
+        subset_fisher, global_system = fit.subset_fisher, fit.global_system
+
+        def subset_fisher_(idx):
+            self.sub_steps.append(self.step)
+            return self.zeroed(subset_fisher(idx), idx, self.sub)
+
+        def global_system_(idx):
+            self.full_steps.append(self.step)
+            grad, F = global_system(idx)
+            return grad, self.zeroed(F, idx, self.full)
+        fit.subset_fisher, fit.global_system = subset_fisher_, global_system_
+
+    @staticmethod
+    def zeroed(F, idx, params):
+        """Returns F, the Fisher information of the global parameters idx, with the rows and columns of the parameters
+        params set to zero. F itself is not changed."""
+        if not params:
+            return F
+        k = [list(idx).index(i) for i in params]
+        F = F.clone()
+        F[k, :] = 0.0
+        F[:, k] = 0.0
+        return F
+
+
+def _scheduled_full_steps(schedule):
+    """Takes one global step of a new _check_fit per entry of schedule. Each entry names edge heights by their offset
+    from the first edge height of material 0 (M.slices[0]['h'][0]). Their rows and columns of the Fisher information
+    are zero on that step. The subset's and the full Fisher information are changed alike. Returns the steps that
+    computed the full Fisher information. It asserts that each step used the subset, that nothing was warned and that
+    the fit did not switch to all rays."""
+    fit = _check_fit()
+    h0 = fit.M.slices[0]['h'][0]
+    wrap = _FisherSchedule(fit)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        for step, edges in enumerate(schedule):
+            wrap.step = step
+            wrap.sub = wrap.full = tuple(h0 + e for e in edges)
+            fit.global_step()
+    assert fit._fisher_fallback is None
+    assert wrap.sub_steps == list(range(len(schedule))), wrap.sub_steps
+    return tuple(wrap.full_steps)
+
+
 def test_fisher_rays_uniform_sample_no_fallback():
     """When every parameter's information is spread over many rays, the fisher_rays subset passes the check: the first
     global step computes the full Fisher information once, and the later steps use the subset alone. Nothing is
-    warned."""
-    fit = _fisher_fit(ACCURACY_TEST_RAYS)
-    fit.fisher_rays = fit.P // FISHER_SUBSET_SHARE
+    warned. The fit holds the kernel slots that lose their information at their lower bound (_check_fit), because such
+    a parameter would ask for a new check."""
+    fit = _check_fit()
     full, sub = [], []
     global_system, subset_fisher = fit.global_system, fit.subset_fisher
     fit.global_system = lambda idx_: full.append(1) or global_system(idx_)
@@ -1020,6 +1105,52 @@ def test_fisher_rays_uniform_sample_no_fallback():
             fit.global_step()
     assert fit._fisher_fallback is None
     assert len(full) == 1 and len(sub) == UNIFORM_TEST_STEPS, (full, sub)
+
+
+def test_fisher_rays_check_bound():
+    """A due global step checks the fisher_rays subset against all rays only when the subset informs or freezes a
+    parameter in a way that no earlier check confirmed. Two edge heights lose and regain their information on the
+    schedule CHECK_BOUND_SCHEDULE. Only the first step and the first step that freezes each of them compute the full
+    Fisher information, so the checks stay within one plus the number of free parameters."""
+    assert _scheduled_full_steps(CHECK_BOUND_SCHEDULE) == CHECK_BOUND_FULL_STEPS
+
+
+def test_fisher_rays_rechecks_new_information():
+    """An edge height that the fisher_rays subset first freezes and then informs gets a full check both times, because
+    a check of the frozen parameter does not confirm the subset's information on it. The later steps of
+    NEW_INFO_SCHEDULE repeat both states and use the subset alone."""
+    assert _scheduled_full_steps(NEW_INFO_SCHEDULE) == NEW_INFO_FULL_STEPS
+
+
+def test_fisher_rays_late_fallback():
+    """The fit switches to all rays when the fisher_rays subset misjudges a parameter after an earlier check passed.
+    From step LATE_FALLBACK_STEP on, the subset's Fisher information of an edge height is zero, and the full one's is
+    not. That step warns once, and it takes its step with global_system's Fisher information. The next step uses all
+    rays without the subset."""
+    fit = _check_fit()
+    global_system = fit.global_system           # This method is not wrapped. Its call does not count as a check.
+    wrap = _FisherSchedule(fit)
+    h0 = fit.M.slices[0]['h'][0]
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)
+        for step in range(LATE_FALLBACK_STEP):
+            wrap.step = step
+            fit.global_step()
+    assert fit._fisher_fallback is None
+    _, F_ref = global_system(_free_globals(fit))
+    wrap.step, wrap.sub = LATE_FALLBACK_STEP, (h0,)
+    with pytest.warns(FallbackWarning, match='all .* rays'):
+        fit.global_step()
+    assert fit._fisher_fallback == fit._fisher_sel[0]
+    assert LATE_FALLBACK_STEP in wrap.full_steps, wrap.full_steps
+    F = fit._fisher[1]
+    assert torch.allclose(F, F_ref, rtol=FISHER_EXACT_RTOL,
+                          atol=FISHER_EXACT_RTOL * float(torch.diagonal(F_ref).abs().max()))
+    wrap.step = LATE_FALLBACK_STEP + 1
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', FallbackWarning)          # The fit warns only once.
+        fit.global_step()
+    assert wrap.step not in wrap.sub_steps, wrap.sub_steps
 
 
 def test_fisher_rays_small_problem_default_path():
@@ -2696,6 +2827,9 @@ LEAN_GPU_TOL = 1e-4
 MOUNT_TEST_SHIFT = 0.3          # _mount_fit: the data's shift of series 1's mount (voxels) ...
 VIEW_TEST_OFFSET = 0.3          # ... and of one view's own channel offset in series 0 (detector channels)
 VIEW_TEST_INDEX = 2             # ... that view's index
+# _mount_fit gives series 2 this mount shift (voxels), whose components and their MOUNT_FD probes stay off the
+# half-voxel rounding ties of MultiProjector._split.
+MOUNT_TEST_SERIES2_SHIFT = (3.0, -0.4, 0.25)
 
 
 class _LeanProjector:
@@ -2862,12 +2996,17 @@ def test_lean_passes_matches_default(texture, normalize, keep, saved):
         assert sum(lean[1]) < sum(ref[1]), (ref[1], lean[1])
 
 
-def _mount_fit(seed=0):
+def _mount_fit(seed=0, speedups=False, one_model_views=True):
     """_volume_step_fit with noiseless data made with series 1's mount shifted by MOUNT_TEST_SHIFT voxels and one view
     of series 0 shifted by VIEW_TEST_OFFSET channels, so that a mount step and a view-offset step each have a clear way
-    down. The fit starts at the unshifted geometry. The speedup options are off (_speedups_off)."""
-    tf = _speedups_off(_volume_step_fit(seed))
+    down. The fit starts at the unshifted geometry. Series 2's mount shift is MOUNT_TEST_SERIES2_SHIFT, in the data and
+    in the fit. With speedups False, the speedup options are off (_speedups_off), and with True they keep their
+    defaults. one_model_views is passed to the MultiProjector."""
+    tf = _volume_step_fit(seed, one_model_views)
+    if not speedups:
+        _speedups_off(tf)
     fit, pr = tf.fit, tf.proj
+    pr.set_mount(2, shift=MOUNT_TEST_SERIES2_SHIFT)           # The rotation stays as it is.
     (_, _, shift0, _), _ = pr.parts[1]
     views0 = len(pr.series[0][1])
     offs = np.zeros(views0); offs[VIEW_TEST_INDEX] = VIEW_TEST_OFFSET
@@ -2882,11 +3021,21 @@ def _mount_fit(seed=0):
     return tf
 
 
+def _mount_geometry(out_m, out_v):
+    """Returns, as one float64 vector, the mounts that TomoFit.mount_step reported in out_m (each series' shift,
+    rotation and offset) and the view offsets that view_offset_step reported in out_v."""
+    geometry = [v for m in out_m['mounts'] for v in m['shift'] + m['rot'] + [m['offset']]] + \
+        [v for offs in out_v['offsets'] for v in offs]
+    return torch.tensor(geometry, dtype=torch.float64)
+
+
 def _mount_run(lean):
     """A mount step and a view-offset step on a new _mount_fit, with lean_passes on or off, from a synced state whose
     data loss the fit holds (as after a contamination step). Returns each step's passes over the rays, each step's
-    length, the loss after them, the mounts and view offsets after them, and the fit's device."""
-    tf = _mount_fit()
+    length, the loss after them, the mounts and view offsets after them, and the fit's device. The projectors keep one
+    model per view (one_model_views off), because the one-model projector is not bitwise reproducible on the CPU.
+    test_mount_steps_with_defaults covers one_model_views with lean_passes."""
+    tf = _mount_fit(one_model_views=False)
     fit = tf.fit
     fit.lean_passes = lean
     tf.sync(); fit.data_loss()
@@ -2895,9 +3044,7 @@ def _mount_run(lean):
     p1 = fit.pass_count()
     out_v = tf.view_offset_step()
     p2 = fit.pass_count()
-    geometry = [v for m in out_m['mounts'] for v in m['shift'] + m['rot'] + [m['offset']]] + \
-        [v for offs in out_v['offsets'] for v in offs]
-    return ((p1 - p0, p2 - p1), (out_m['alpha'], out_v['alpha']), tf.loss(), torch.tensor(geometry, dtype=torch.float64),
+    return ((p1 - p0, p2 - p1), (out_m['alpha'], out_v['alpha']), tf.loss(), _mount_geometry(out_m, out_v),
             fit.device)
 
 
@@ -2947,18 +3094,22 @@ def test_lean_passes_with_other_options(texture, normalize, monkeypatch):
     assert sum(lean[1]) < sum(ref[1]), (ref[1], lean[1])
 
 
+@pytest.mark.parametrize('check', [False, True])
 @pytest.mark.parametrize('device', ['cpu', 'cuda'])
-def test_fisher_rays_with_host_storage(device, monkeypatch):
+def test_fisher_rays_with_host_storage(device, check, monkeypatch):
     """With fisher_rays and lean_syncs, a fit with t_storage 'host', t_prefetch and lean_passes takes the same pixel,
     global and contamination steps as a fit with the default storage. The two fits agree bitwise on the CPU, and to
     GPU_RTOL on a GPU. After each global step, the data loss that each fit remembers is the data loss of a new pass.
     After each contamination step, a remembered data loss is that of a new pass too. The fit with lean_passes makes
-    fewer passes over the rays, and it holds no kept model parts at the end."""
+    fewer passes over the rays, and it holds no kept model parts at the end. With check False, FISHER_CHECK_TOL is
+    infinite, so the subset's check never switches a fit to all rays. With check True, the check runs as in a real fit,
+    and the two fits switch to all rays in the same round or not at all."""
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('no GPU')
     from mbirtorch.hsnt.strain import model
-    # This test checks the subset path, not the subset's check. So the check never switches the fit to all rays.
-    monkeypatch.setattr(model, 'FISHER_CHECK_TOL', math.inf)
+    if not check:
+        # This variant checks the subset path, not the subset's check. So the check never switches the fit to all rays.
+        monkeypatch.setattr(model, 'FISHER_CHECK_TOL', math.inf)
     ref = _small_fit_cubic4()
     a = _storage_fit(ref, ref.T.clone().to(device), device, t_storage='device')
     b = _storage_fit(ref, ref.T.clone(), device, t_storage='host', t_prefetch=True)
@@ -2999,10 +3150,59 @@ def test_fisher_rays_with_host_storage(device, monkeypatch):
             assert memo_is_current(x, False)
         for key in ('g', 'W', 'eps', 'c', 'f'):
             assert same(getattr(b, key), getattr(a, key)), key
+        assert b._fisher_fallback == a._fisher_fallback, (a._fisher_fallback, b._fisher_fallback)
     assert b.fisher_subset_info['rays'] == a.P // FISHER_SUBSET_SHARE
-    assert a._fisher_fallback is None and b._fisher_fallback is None
+    if not check:
+        assert a._fisher_fallback is None
     assert b.pass_count() < a.pass_count(), (a.pass_count(), b.pass_count())
     assert b._kept is None
+
+
+# test_mount_steps_with_defaults compares the mount and view-offset steps of a fit with every speedup option at its
+# default against those of a fit with every option off and a model per view. The two fits' models agree only to
+# rounding. lean_syncs and closed_form_strain agree to rounding in the model's dtype, float32, and one_model_views
+# agrees to float32 rounding of the projections. The steps' finite differences (MOUNT_FD, VIEW_OFFSET_FD) divide that
+# rounding by their small steps, so the two fits' steps differ by more than the rounding itself. That difference is
+# estimated at about 1e-5 in the mounts and view offsets. The geometry tolerance below is 100 times that estimate. It
+# stays below the 0.0057 change in a view offset that one flip of a rounding tie in MultiProjector._split caused.
+# The loss tolerance has the same value and the same reference loss as VOLUME_STEP_AFTER_RTOL, which bounds the same
+# kind of difference after a volume step.
+# The two fits' data losses before and after the steps differ by at most this share of the loss before them.
+DEFAULTS_MOUNT_LOSS_RTOL = 1e-3
+# The two fits' mounts and view offsets after the steps differ by at most this many voxels, degrees or detector
+# channels.
+DEFAULTS_MOUNT_GEOMETRY_TOL = 1e-3
+
+
+def test_mount_steps_with_defaults():
+    """With every speedup option at its default, one_model_views, lean_passes, lean_syncs and closed_form_strain among
+    them, TomoFit.mount_step and view_offset_step take the steps of a fit with every option off and a model per view.
+    The step lengths are equal. The data losses before and after the steps agree to DEFAULTS_MOUNT_LOSS_RTOL, and the
+    mounts and view offsets agree to DEFAULTS_MOUNT_GEOMETRY_TOL. Both fits use the data that the fit with every option
+    off makes."""
+
+    def run(on, T=None):
+        """Runs a mount step and a view-offset step on a new _mount_fit with every option at its default (on True) or
+        off (on False), from a synced state. A given T replaces the fit's data. Returns each step's length, the data
+        loss before and after the steps, the mounts and view offsets after them, and the data."""
+        tf = _mount_fit(speedups=on, one_model_views=on)
+        fit = tf.fit
+        if T is not None:
+            fit.T = T.clone()
+        tf.sync()
+        before = fit.data_loss()
+        out_m = tf.mount_step()
+        out_v = tf.view_offset_step()
+        return (out_m['alpha'], out_v['alpha']), (before, fit.data_loss()), _mount_geometry(out_m, out_v), fit.T
+
+    off = run(False)
+    on = run(True, off[3])
+    assert on[0] == off[0], (on[0], off[0])
+    assert off[0][0] > 0, off[0]                                       # the mount step was taken
+    for got, ref in zip(on[1], off[1]):
+        assert abs(got - ref) <= DEFAULTS_MOUNT_LOSS_RTOL * abs(off[1][0]), (on[1], off[1])
+    diff = float((on[2] - off[2]).abs().max())
+    assert diff <= DEFAULTS_MOUNT_GEOMETRY_TOL, (diff, on[2], off[2])
 
 
 ONE_MODEL_RTOL = 1e-5           # one_model_views against a model per view: the largest difference relative to the largest

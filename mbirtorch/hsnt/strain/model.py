@@ -1496,7 +1496,9 @@ class FitB:
         self._fisher_sel = None          # fisher_subset keeps its selection here with the inputs it was made from.
         # _fisher_fallback holds the subset key whose check failed. Its global steps then use all rays.
         self._fisher_fallback = None
-        self._fisher_checked = set()     # This holds the (subset key, parameters) and (subset key, frozen set) checked.
+        # For each subset key, this holds the (parameter, informed by the subset) pairs that a check with all rays
+        # confirmed.
+        self._fisher_checked = {}
         self.last_kernel_step_se = float('inf')   # the resolution kernel's last move, RMS in standard errors
         # contamination_newton: the contamination step takes a full Newton step on the atom coefficients
         # (contamination_atoms_step); use it for a converged fit, as the diagonal step converges slowly
@@ -2820,9 +2822,9 @@ class FitB:
         """This is _lagged_system with fisher_rays on. Every call takes the gradient from all rays, the resolution
         kernel's slots included (global_grad). A call that is due takes the Fisher information from the ray subset
         (subset_fisher). The other calls reuse the last Fisher information, and the kernel moves with the other
-        parameters. The first due call for a set of parameters, and a due call that freezes a new set of them, also
-        compute the full Fisher information, take the step with it, and switch to all rays for good when the subset
-        misjudges a parameter (_subset_misjudged)."""
+        parameters. A due call also computes the full Fisher information, and takes the step with it, when the subset
+        informs or freezes a parameter in a way that no earlier check confirmed. That call switches to all rays for
+        good when the subset misjudges a parameter (_subset_misjudged)."""
         if not due:
             grad = self.global_grad(idx)
             self._fisher = (lag[0], lag[1], lag[2] + 1)
@@ -2830,10 +2832,10 @@ class FitB:
         F = self.subset_fisher(idx)
         key = self._fisher_sel[0]
         d = torch.diagonal(F)
-        low = (d <= INFO_FLOOR * d.max()).tolist()
-        frozen = frozenset(i for i, f in zip(idx, low) if f)
-        checked = self.__dict__.setdefault("_fisher_checked", set())
-        if (key, tuple(idx)) in checked and (not frozen or (key, frozen) in checked):
+        informed = (d > INFO_FLOOR * d.max()).tolist()
+        status = set(zip(idx, informed))
+        checked = self.__dict__.setdefault("_fisher_checked", {}).setdefault(key, set())
+        if status <= checked:
             grad = self.global_grad(idx)
             self._fisher = (list(idx), F, 1)
             return idx, grad, F
@@ -2851,8 +2853,7 @@ class FitB:
                        f"Fisher information reads {info['kept']:,} rays instead of {info['rays']:,}. No action is "
                        f"needed.")
         else:
-            checked.add((key, tuple(idx)))
-            checked.add((key, frozen))
+            checked |= status
         self._fisher = (list(idx), Ff, 1)
         return idx, grad, Ff
 
