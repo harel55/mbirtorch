@@ -26,6 +26,7 @@ import weakref
 import numpy as np
 import torch
 
+from ...multiaxis_parallel import MultiAxisParallelModel
 from .model import LEGENDRE_DEGREE, Hybrid2, FitB, ls_init_material
 from .bragg import warm_start, BraggSpectrum
 from ._dist import all_sum, all_sum_float, broadcast_objects, rank
@@ -104,6 +105,60 @@ def detector_directions(angles, n=16):
     return -nd[:, 0], nd[:, 1]
 
 
+# The package reads these attributes of a projection function: whether to compile it, whether it adds into its output,
+# and its memory use.
+_BODY_ATTRIBUTES = ('_mbirtorch_no_compile', '_adds_into_output', '_view_batch_cost', '_view_peak_bytes')
+_VIEW_OFFSET_BODIES = {}        # the projection functions of MultiAxisModelWithViewOffsets, one per package function
+
+
+def _view_offset_body(body):
+    """Returns a projection function for view parameters with a third column that holds each view's channel offset.
+    It calls the package's projection function body with that offset added to det_channel_offset. The package's
+    functions compute each view's channel positions from det_channel_offset, so they accept one offset per view. The
+    function is made once per body, so the package's compile cache keeps one entry per body."""
+    if body not in _VIEW_OFFSET_BODIES:
+        def with_view_offsets(data, pixel_indices, view_params_batch, *, det_channel_offset, **kwargs):
+            offsets = det_channel_offset + view_params_batch[:, 2:3]                   # (views, 1)
+            return body(data, pixel_indices, view_params_batch[:, :2], det_channel_offset=offsets, **kwargs)
+        for name in _BODY_ATTRIBUTES:
+            if hasattr(body, name):
+                setattr(with_view_offsets, name, getattr(body, name))
+        with_view_offsets.__name__ = f'{body.__name__}_with_view_offsets'
+        with_view_offsets.body = body
+        _VIEW_OFFSET_BODIES[body] = with_view_offsets
+    return _VIEW_OFFSET_BODIES[body]
+
+
+class MultiAxisModelWithViewOffsets(MultiAxisParallelModel):
+    """A MultiAxisParallelModel whose views each have their own detector channel offset. Its view parameters ('angles',
+    shape (views, 3)) hold each view's azimuth, elevation and channel offset. A view's channel offset adds to the
+    model's det_channel_offset. Use it in place of one MultiAxisParallelModel per view, because it projects all views
+    in one call."""
+
+    def __init__(self, sinogram_shape, view_params, view_batch_size=None, compile_mode='auto'):
+        # The parent's constructor accepts only two columns. This calls the constructor of TomographyModel with the
+        # arguments that the parent's constructor passes to it.
+        super(MultiAxisParallelModel, self).__init__(
+            sinogram_shape, view_batch_size=view_batch_size, compile_mode=compile_mode, geometry_type=str(type(self)),
+            view_params_name='angles', angles=np.asarray(view_params, dtype=np.float64), recon_slice_offset=0.0)
+
+    def verify_valid_params(self):
+        """Checks that the view parameters have one row per view and three columns."""
+        super(MultiAxisParallelModel, self).verify_valid_params()
+        views = self.get_params('sinogram_shape')[0]
+        shape = np.shape(self.get_params('angles'))
+        if shape != (views, 3):
+            raise ValueError(f'angles must have shape ({views}, 3): azimuth, elevation and channel offset. Got {shape}.')
+
+    def _view_batch_bodies(self):
+        fwd_body, back_body = super()._view_batch_bodies()
+        return _view_offset_body(fwd_body), _view_offset_body(back_body)
+
+    def _project_points_batch(self, points, view_params):
+        row, channel = super()._project_points_batch(points, view_params[:, :2])
+        return row, channel + view_params[:, 2:3] / self.get_params('delta_det_channel')
+
+
 class Projector:
     """Parallel-beam projection of Q stacked volumes (n, n, n, Q) to rays (P, Q), P = views * n * n ordered (view,
     detector row, channel), and its adjoint. One package model projects all Q volumes at once (stacked slices).
@@ -111,14 +166,19 @@ class Projector:
     object by a fraction of a voxel without resampling it (MultiAxisParallelModel at zero elevation, one model per view
     when the view offsets differ)."""
 
-    def __init__(self, n, angles, Q, channel_offset=0.0, ror_mask=True, view_offsets=None, row_offset=0.0):
+    def __init__(self, n, angles, Q, channel_offset=0.0, ror_mask=True, view_offsets=None, row_offset=0.0,
+                 one_model_views=False):
         """channel_offset: the projector's det_channel_offset (the rotation axis's offset from the detector centre);
-        ror_mask=False lets the volume fill its square, for objects that reach past the inscribed circle."""
+        ror_mask=False lets the volume fill its square, for objects that reach past the inscribed circle.
+        one_model_views=True projects views with their own channel offsets by one model for all views
+        (MultiAxisModelWithViewOffsets) instead of one model per view. The projections are the same up to float
+        rounding, and they take less time when there are many views. It is off by default."""
         import mbirtorch
         self.n, self.V, self.Q = n, len(angles), Q
         self.angles, self.channel_offset, self.ror_mask = np.asarray(angles), float(channel_offset), ror_mask
         self.view_offsets = None if view_offsets is None or not np.any(view_offsets) else np.asarray(view_offsets, float)
         self.row_offset = float(row_offset)
+        self.one_model_views = bool(one_model_views)
         self.kind = self._kind(self.view_offsets, self.row_offset)
         self.gap = 0 if self.kind == 'plain' else STACK_GAP
         h = n + self.gap
@@ -126,18 +186,26 @@ class Projector:
             self.models = [mbirtorch.ParallelBeamModel((self.V, Q * n, n), angles)]
         elif self.kind == 'rows':
             self.models = [mbirtorch.MultiAxisParallelModel((self.V, Q * h, n), np.stack([angles, np.zeros(self.V)], 1))]
+        elif self.one_model_views:
+            self.models = [MultiAxisModelWithViewOffsets((self.V, Q * h, n), self._view_params(np.zeros(self.V)))]
         else:
             self.models = [mbirtorch.MultiAxisParallelModel((1, Q * h, n), np.array([[a, 0.0]])) for a in angles]
         self._set_offsets()
 
     def set_angles(self, angles, channel_offset, view_offsets=None, row_offset=0.0):
         """Rebuild the projector with new view angles (radians) and offsets. Returns self."""
-        self.__init__(self.n, angles, self.Q, channel_offset, self.ror_mask, view_offsets, row_offset)
+        self.__init__(self.n, angles, self.Q, channel_offset, self.ror_mask, view_offsets, row_offset,
+                      self.one_model_views)
         return self
+
+    def _view_params(self, offsets):
+        """The view parameters of MultiAxisModelWithViewOffsets: each view's angle, zero elevation and channel offset."""
+        return np.stack([self.angles, np.zeros(self.V), np.asarray(offsets, float)], 1)
 
     @staticmethod
     def _kind(view_offsets, row_offset):
-        """'plain' (one parallel-beam model), 'rows' (one multi-axis model: a row offset) or 'views' (a model per view)."""
+        """'plain' (one parallel-beam model), 'rows' (one multi-axis model: a row offset) or 'views' (a model per view,
+        or one model with one_model_views)."""
         return 'views' if view_offsets is not None else ('rows' if row_offset else 'plain')
 
     def _set_offsets(self):
@@ -148,6 +216,10 @@ class Projector:
         if self.kind == 'rows':
             self.models[0].set_params(det_channel_offset=self.channel_offset, det_row_offset=self.row_offset,
                                       use_ror_mask=bool(self.ror_mask))
+        elif self.one_model_views:
+            # The model's own channel offset stays zero, so each view's offset is the same sum as in a model per view.
+            self.models[0].set_params(angles=self._view_params(offs), det_channel_offset=0.0,
+                                      det_row_offset=self.row_offset, use_ror_mask=bool(self.ror_mask))
         else:
             for m, o in zip(self.models, offs):
                 m.set_params(det_channel_offset=float(o), det_row_offset=self.row_offset, use_ror_mask=bool(self.ror_mask))
@@ -155,13 +227,14 @@ class Projector:
     def with_q(self, Q):
         """The same geometry for Q stacked volumes."""
         return self if Q == self.Q else Projector(self.n, self.angles, Q, self.channel_offset, self.ror_mask,
-                                                  self.view_offsets, self.row_offset)
+                                                  self.view_offsets, self.row_offset, self.one_model_views)
 
     def set_geometry(self, channel_offset, view_offsets=None, row_offset=0.0):
         """Change the offsets: in place when the kind of model stays the same, else by rebuilding. Returns self."""
         vo = None if view_offsets is None or not np.any(view_offsets) else np.asarray(view_offsets, float)
         if self._kind(vo, row_offset) != self.kind:
-            self.__init__(self.n, self.angles, self.Q, channel_offset, self.ror_mask, vo, row_offset)
+            self.__init__(self.n, self.angles, self.Q, channel_offset, self.ror_mask, vo, row_offset,
+                          self.one_model_views)
             return self
         self.channel_offset, self.view_offsets, self.row_offset = float(channel_offset), vo, float(row_offset)
         self._set_offsets()
@@ -206,7 +279,8 @@ class MultiProjector:
     (beam_geometry.PERMS) with its own angles. fwd stacks the series' rays (series-major); back sums the series'
     back-projections, permuted back to the sample frame. One series with the identity permutation is a Projector."""
 
-    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, view_extra=None, view_angle_extra=None):
+    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, view_extra=None, view_angle_extra=None,
+                 one_model_views=False):
         """series: a list of (axis, angles), axis a key of beam_geometry.PERMS, or (transform, angles) with transform =
         (perm, signs, shift[, rot]): the series' volume is the sample volume permuted (frame axis i = sample axis
         perm[i]), flipped where signs < 0, rotated by rot (degrees about the frame's axes 0, 1, 2, as a rotation vector,
@@ -216,8 +290,10 @@ class MultiProjector:
         (beam_geometry.series_weights) do not include rot. view_extra: per series, each view's own channel offset
         (detector channels; None means zeros), for a view that is shifted on the detector relative to the others.
         view_angle_extra: per series, each view's own angle offset (radians; None means zeros), for a view taken at a
-        slightly different angle than its metadata says. The strain's beam-direction weights keep the nominal angles."""
+        slightly different angle than its metadata says. The strain's beam-direction weights keep the nominal angles.
+        one_model_views is passed to each series' Projector, and it is off by default."""
         from .geometry import PERMS
+        self.one_model_views = bool(one_model_views)
         self.n, self.Q, self.series = n, Q, list(series)
         offs = channel_offsets or [0.0] * len(self.series)
         self.offsets, self.ror_mask = [float(o) for o in offs], ror_mask
@@ -233,13 +309,13 @@ class MultiProjector:
                  tuple(float(v) for v in ax[3]) if len(ax) > 3 else (0.0, 0.0, 0.0))
             self._dirs.append(None)
             vo, ro = self._view_offsets(len(self.parts), ang, tr[2])
-            self.parts.append((tr, Projector(n, ang, Q, off, ror_mask, vo, ro)))
+            self.parts.append((tr, Projector(n, ang, Q, off, ror_mask, vo, ro, self.one_model_views)))
         self.counts = [p.V * n * n for _, p in self.parts]
         self.V = sum(p.V for _, p in self.parts)
 
     def with_q(self, Q):
         return self if Q == self.Q else MultiProjector(self.n, self.series, Q, self.offsets, self.ror_mask, self.view_extra,
-                                                       self.view_angle_extra)
+                                                       self.view_angle_extra, self.one_model_views)
 
     def _view_offsets(self, s, angles, shift):
         """Series s's per-view channel offsets (its fractional shift's and each view's own) and its row offset."""
@@ -366,9 +442,12 @@ class FineProjector:
     factor^3 the voxels. Lengths are in units of the detector pixel, as for a MultiProjector of side n. Mount shifts
     (voxels of n) and channel offsets (detector pixels) are given as for a MultiProjector of side n, also to
     set_mount and in parts, so TomoFit.mount_step works on it. view_extra and view_angle_extra: per series, each view's
-    own channel offset (detector pixels) and angle offset (radians), as for a MultiProjector."""
+    own channel offset (detector pixels) and angle offset (radians), as for a MultiProjector. one_model_views is passed
+    to each series' Projector, and it is off by default."""
 
-    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2, view_extra=None, view_angle_extra=None):
+    def __init__(self, n, series, Q, channel_offsets=None, ror_mask=True, factor=2, view_extra=None, view_angle_extra=None,
+                 one_model_views=False):
+        self.one_model_views = bool(one_model_views)
         self.n_det, self.factor, self.Q = n, int(factor), Q
         self.series, self.ror_mask = list(series), ror_mask
         self.offsets = [float(o) for o in (channel_offsets or [0.0] * len(self.series))]
@@ -385,7 +464,7 @@ class FineProjector:
                 tr = (ax[0], ax[1], tuple(float(v) * f for v in ax[2])) + ((tuple(ax[3]),) if len(ax) > 3 else ())
                 fine_series.append((tr, ang))
         self.inner = MultiProjector(f * n, fine_series, Q, [o * f for o in self.offsets], ror_mask,
-                                    [e * f for e in self.view_extra], self.view_angle_extra)
+                                    [e * f for e in self.view_extra], self.view_angle_extra, self.one_model_views)
         self.n = f * n                                       # the volume's side
         self.V = self.inner.V
         self.rays_per_view = n * n
@@ -393,7 +472,7 @@ class FineProjector:
 
     def with_q(self, Q):
         return self if Q == self.Q else FineProjector(self.n_det, self.series, Q, self.offsets, self.ror_mask, self.factor,
-                                                      self.view_extra, self.view_angle_extra)
+                                                      self.view_extra, self.view_angle_extra, self.one_model_views)
 
     def set_view_angles(self, s, extra):
         """Set each view's own angle offset in series s (radians)."""
