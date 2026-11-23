@@ -880,6 +880,14 @@ class Hybrid2:
         return g[self.kap_sl[0]:self.kap_sl[1]].reshape(self.J, self.R)
 
 
+class _BandLater:
+    """A Jacobian row before the resolution band, held so that all rows of a chunk pass the band in one product."""
+    __slots__ = ("x",)
+
+    def __init__(self, x):
+        self.x = x
+
+
 class FitB:
     """Stage-B fit: per-pixel maps (and strain), global parameters by Levenberg-Marquardt Fisher scoring with
     derivatives by the chain rule through the banded operator, contamination per bin."""
@@ -1525,13 +1533,13 @@ class FitB:
                     j, b = divmod(i - slr["x"][0], M.tex_nb)
                     Y, Q = terms[("YQ", r)]
                     dm = terms[("G", r)] * (Y[:, j] * Q[:, b])[:, None]
-                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                    out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 elif field and slr["h"][0] <= i < slr["h"][1]:
                     # a height under a texture field: its edge term times the rays' texture factor (cubic4 links no
                     # other shape to the heights), in place of a derivative of the whole spectrum per height
                     e_ = i - slr["h"][0]
                     dm = terms[("E", r)][:, e_] * terms[("F", r)][:, e_]
-                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                    out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 elif tex is not None and dtex is not None and eps is not None and (
                         slr["h"][0] <= i < slr["h"][1] or slr["x"][0] <= i < slr["x"][1]):
                     # cubic4: a height's derivative is its edge term times the view's factor; a texture parameter's
@@ -1544,32 +1552,39 @@ class FitB:
                     else:
                         h = self.g[slr["h"][0]:slr["h"][1]].to(M.dt)
                         dm = (h[None, :, None] * terms[r] * dtex[r][i - slr["x"][0]][views]).sum(1)
-                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                    out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 elif eps is not None and M.shape_model is None and slr["h"][0] <= i < slr["h"][1]:
                     # a height under per-pixel strain, without a linked shape model: its derivative is its own edge
                     # term, so one evaluation serves all heights of the material
                     if r not in terms:
                         terms[r] = M.edge_terms(self.g, eps, r, self._sd(sl))
                     dm = terms[r][:, i - slr["h"][0]]
-                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                    out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 elif eps is not None and i == slr["a"] and \
                         (mu_da := M.spectra_da(self.g, eps, r, self._views(sl), self._sd(sl))) is not None:
                     # the lattice parameter: its closed-form derivative (every edge moves in proportion to a)
                     dm = mu_da[1]
-                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                    out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 elif eps is not None and i < M.slices[r]["c"][0]:
                     # an edge parameter (a, h, t, x) under per-pixel strain: its derivative moves with each pixel's
                     # edges (the smooth part is not dilated, so the unstrained derivative serves for c and s)
                     tg = torch.zeros_like(self.g); tg[i] = 1
                     _, dm = torch.func.jvp(lambda gg: M.spectra(gg, eps, self._views(sl), sd=self._sd(sl))[:, r], (self.g,), (tg,))
-                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dm.to(M.dt)), Rb))
+                    out.append(_BandLater(E * (W[:, r:r + 1] * dm.to(M.dt))))
                 else:
-                    out.append(-s * M.apply_band(E * (W[:, r:r + 1] * dmu[i][r][None, :]), Rb))
+                    out.append(_BandLater(E * (W[:, r:r + 1] * dmu[i][r][None, :])))
             elif i < M.res_sl[1]:
                 out.append(s * M.apply_band(E, dRb[i - M.res_sl[0]]))
             else:
                 jr = i - M.kap_sl[0]; j, r = divmod(jr, M.R)
                 out.append(-(self.f[j][None, :] * (beta[:, j:j + 1] * W[:, r:r + 1])))
+        # the parameters through the band, all in one product: one sparse multiply per chunk, not one per parameter
+        later = [k for k, o in enumerate(out) if isinstance(o, _BandLater)]
+        if later:
+            Pc = out[later[0]].x.shape[0]
+            B = M.apply_band(torch.cat([out[k].x for k in later], 0), Rb)
+            for n_, k in enumerate(later):
+                out[k] = -s * B[n_ * Pc:(n_ + 1) * Pc]
         return torch.stack(out, 0), m
 
     def global_step(self, damping=1e-3, which=None, max_tries=8, system=None):
