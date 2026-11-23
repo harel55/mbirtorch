@@ -143,6 +143,28 @@ LEGENDRE_DEGREE = 8          # the smooth part's polynomial degree (the spline's
 LEGENDRE_CURVATURE = 1e-2    # the smooth part's curvature penalty weight relative to FitB.ridge (q79 used 1.1e-2)
 T_STORAGES = ("device", "host")   # FitB t_storage: the transmission as given (the default), or in host memory
 STORE_BLOCK_RAYS = 65536     # rays copied at a time when FitB moves the transmission into its storage
+T_HALF = "float16"           # FitB t_dtype: the transmission stored in float16 (None, the default, keeps its own dtype)
+HALF_MAX = 6.0e4             # the largest transmission that float16 storage accepts (float16 holds values up to 65504)
+HALF_TINY = 6.1e-5           # float16's smallest normal number: positive values below it keep fewer significant bits
+HALF_SAMPLE_RAYS = 4096      # rays sampled for the logged rounding statistics of float16 storage
+
+
+def half_rounding(T, d):
+    """What float16 storage does to the transmission T (rays, bins) at the counts per bin d (bins,), for a log. It
+    returns the largest T, and, over a sample of every k-th ray (at most HALF_SAMPLE_RAYS rays): the share of positive
+    values below HALF_TINY, the root mean square relative rounding error of the positive values, and the median counts
+    per bin (T times d). It raises ValueError when T exceeds HALF_MAX."""
+    t_max = float(T.max())
+    if t_max > HALF_MAX:
+        raise ValueError(f"float16 storage needs a transmission of at most {HALF_MAX}; the largest value is {t_max}")
+    x = T[::max(1, T.shape[0] // HALF_SAMPLE_RAYS)].double()
+    xp = x[x > 0]
+    rel = (xp.half().double() - xp) / xp
+    counts = x * torch.as_tensor(d, device=x.device, dtype=torch.float64)
+    return dict(max=t_max, sampled_rays=int(x.shape[0]),
+                tiny_share=float((xp < HALF_TINY).double().mean()) if xp.numel() else 0.0,
+                rms_relative_rounding=float(rel.pow(2).mean().sqrt()) if xp.numel() else 0.0,
+                median_counts_per_bin=float(counts.median()))
 
 
 def _compute_device(dev):
@@ -865,19 +887,28 @@ class FitB:
     derivatives by the chain rule through the banded operator, contamination per bin."""
 
     def __init__(self, model, T, g, W, f, eps=None, chunk=1024, ridge=None, z=None, alpha=0.05, inflation=1.0,
-                 ray_mask=None, t_storage="device"):
+                 ray_mask=None, t_storage="device", t_dtype=None):
         """ray_mask (rays,) bool: only the rays where it is True enter the likelihood (use it to leave out detector
         regions the model does not describe, such as a sample holder); None uses every ray.
         t_storage says where the transmission T is kept. 'device' (the default) keeps T as it is given, and the fit
         computes on T's device. 'host' keeps T in host memory, pinned when the model computes on a GPU, and the fit
         computes on the model's device. Each pass over the rays then copies its chunks of T to that device. The
         results are the same, and the GPU memory falls by the size of T. Use 'host' when T does not fit on the GPU
-        next to the fit."""
+        next to the fit.
+        t_dtype None (the default) keeps T's own dtype. T_HALF ('float16') stores T in float16 on the storage that
+        t_storage says (the model's device for 'device'), which halves T's memory and its copies. Each chunk is then
+        converted to the model's dtype before use. This is not exact: the rounding is about 2^-11 of T, so its share
+        of the error grows with the counts per bin (half_rounding, logged in t_half_info). Keep the default for
+        noiseless data and very high counts."""
         if t_storage not in T_STORAGES:
             raise ValueError(f"t_storage must be one of {T_STORAGES}, not {t_storage!r}")
-        self.M = model; self.t_storage = t_storage
-        self._device = T.device if t_storage == "device" else _compute_device(model.dev)
-        self._T_ratio = None             # the shared open beam's per-pixel factor, which T_chunk applies outside 'device'
+        if t_dtype not in (None, T_HALF):
+            raise ValueError(f"t_dtype must be None or {T_HALF!r}, not {t_dtype!r}")
+        self.M = model; self.t_storage = t_storage; self.t_dtype = t_dtype
+        self._t_default = t_storage == "device" and t_dtype is None      # T kept as given, read by slicing
+        self._device = T.device if self._t_default else _compute_device(model.dev)
+        self._T_ratio = None             # the shared open beam's per-pixel factor, which T_chunk applies outside the default
+        self.t_half_info = None          # half_rounding's statistics when T was converted to float16
         self.T = T; self.g = g.clone(); self.W = W.clone(); self.f = f.clone()
         self.ray_weight = None if ray_mask is None else ray_mask.to(self.device, self._t_cdt)
         self.n_points = int(all_sum_float((self.P if ray_mask is None else int(ray_mask.sum())) * T.shape[1], self.device))
@@ -915,32 +946,40 @@ class FitB:
 
     @T.setter
     def T(self, value):
-        self._t_cdt = value.dtype            # the dtype in which T_chunk returns the transmission
+        # the dtype in which T_chunk returns the transmission: T's own, or the model's with float16 storage
+        self._t_cdt = value.dtype if self.t_dtype is None else self.M.dt
         self._T = self._store(value)
 
     def _store(self, value):
-        """value (rays, bins) as this fit keeps it. The default storage keeps value itself. With t_storage 'host', a
-        host tensor (pinned when the fit computes on a GPU) is kept as it is, and any other value is copied into one."""
-        if self.t_storage == "device":
+        """value (rays, bins) as this fit keeps it. The default storage keeps value itself. Otherwise a tensor that is
+        already in the storage's place and dtype (on the host, pinned when the fit computes on a GPU, for t_storage
+        'host'; in float16 for t_dtype T_HALF) is kept as it is, and any other value is copied into one."""
+        if self._t_default:
             return value
-        pin = self._device.type == "cuda"
-        if value.device.type == "cpu" and (not pin or value.is_pinned()):
-            self.t_pinned = pin
-            return value
-        try:
-            out = torch.empty(value.shape, dtype=value.dtype, pin_memory=pin)
-        except RuntimeError:                 # pinning can fail (for example under WSL); pageable memory still works
-            out = torch.empty(value.shape, dtype=value.dtype)
-        self.t_pinned = pin and bool(out.is_pinned())     # without pinning, each chunk's copy is synchronous
-        for i in range(0, value.shape[0], STORE_BLOCK_RAYS):
-            out[i:i + STORE_BLOCK_RAYS].copy_(value[i:i + STORE_BLOCK_RAYS])
-        return out
+        host = self.t_storage == "host"
+        where = torch.device("cpu") if host else self._device
+        dtype = torch.float16 if self.t_dtype == T_HALF else value.dtype
+        pin = host and self._device.type == "cuda"
+        if dtype == torch.float16 and value.dtype != torch.float16:
+            self.t_half_info = half_rounding(value, self.M.d)
+        if not (value.device == where and value.dtype == dtype and (not pin or value.is_pinned())):
+            try:
+                out = torch.empty(value.shape, dtype=dtype, device=where, pin_memory=pin)
+            except RuntimeError:             # pinning can fail (for example under WSL); pageable memory still works
+                out = torch.empty(value.shape, dtype=dtype, device=where)
+            for i in range(0, value.shape[0], STORE_BLOCK_RAYS):
+                out[i:i + STORE_BLOCK_RAYS].copy_(value[i:i + STORE_BLOCK_RAYS])
+            value = out
+        self.t_pinned = pin and bool(value.is_pinned())     # without pinning, each chunk's copy is synchronous
+        return value
 
     def T_chunk(self, sl):
         """The transmission of the rays sl, on the device where the fit computes."""
-        if self.t_storage == "device":
+        if self._t_default:
             return self._T[sl]
         x = self._T[sl].to(self._device, non_blocking=True)
+        if x.dtype != self._t_cdt:           # float16 storage: converted on the device, after the (half-size) copy
+            x = x.to(self._t_cdt)
         if self._T_ratio is not None:        # a shared open beam: the bound's transmission, computed as refresh_open_beam does
             x = (x.double() * self._T_ratio[self.shared_open_beam["pix"][sl]]).to(self._t_cdt)
         return x
@@ -953,12 +992,12 @@ class FitB:
     @property
     def device(self):
         """The device on which the fit computes."""
-        return self._T.device if self.t_storage == "device" else self._device
+        return self._T.device if self._t_default else self._device
 
     def _data_tensors(self):
         """The tensors that hold the data. The state key of the remembered data loss includes them, so a new tensor or
         an in-place change of one makes the remembered loss stale."""
-        return (self._T,) if self.t_storage == "device" else (self._T, self._T_ratio)
+        return (self._T,) if self._t_default else (self._T, self._T_ratio)
 
     def dose(self, sl):
         """The counts per bin of the rays sl, (K,) or (Pc, K): zero for the rays left out by ray_mask. With a shared open
@@ -999,7 +1038,8 @@ class FitB:
     def refresh_open_beam(self):
         """Moves the Poisson bound of the shared open beam's likelihood to the current state: the open beam's estimate b
         per pixel and bin, each ray's dose s_v b, and the transmission T O / b. A no-op without a shared open beam.
-        With t_storage 'host', T stays the measured transmission, and T_chunk multiplies each chunk by O / b."""
+        With t_storage 'host' or t_dtype T_HALF, T stays the measured transmission, and T_chunk multiplies each chunk by
+        O / b."""
         ob = self.shared_open_beam
         if ob is None:
             return
@@ -1020,7 +1060,7 @@ class FitB:
         ob["b"] = (ob["O"] + ob["S_sum"]) / (1 + A)
         ob["A"] = A
         ratio = (ob["O"] / ob["b"].clamp_min(1e-12))
-        if self.t_storage != "device":       # T_chunk applies the ratio to each chunk, so no second full T is built
+        if not self._t_default:              # T_chunk applies the ratio to each chunk, so no second full T is built
             self._T_ratio = ratio
             return
         T = torch.empty_like(self.T_measured)

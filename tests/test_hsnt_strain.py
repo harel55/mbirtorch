@@ -1265,35 +1265,43 @@ GPU_RTOL = 1e-8          # host storage against device storage on a GPU: its sum
 FLOAT32_RTOL = 1e-6      # the same for float32 data: one unit in the last place of a float32 is about 1.2e-7
 
 
+def _shared_open_beam_data(ref):
+    """Counts for the small fit ref (_small_fit_cubic4) with one noisy open beam shared by every view, drawn as in
+    test_shared_open_beam. Returns the measured transmission T and (the open beam (5 pixels, bins), each ray's pixel,
+    each ray's exposure), the arguments of FitB.set_shared_open_beam."""
+    P, K = ref.T.shape
+    pix = torch.arange(P) // 8; gen = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        m_true = torch.cat([ref.mean(s)[0] for s in ref.chunks()])
+    b_true = 50.0 * torch.ones(5, K, dtype=torch.float64)
+    s_ = 0.9 + 0.2 * torch.rand(P, generator=gen, dtype=torch.float64)
+    O = torch.poisson(b_true, generator=gen).clamp_min(1.0)
+    S = torch.poisson(s_[:, None] * b_true[pix] * m_true, generator=gen)
+    return (S / (s_[:, None] * O[pix])).to(ref.T.dtype), (O, pix, s_)
+
+
+def _storage_fit(ref, T, device, shared=None, **storage):
+    """A copy of the small cubic4 fit ref (_small_fit_cubic4) that computes on device, with the transmission T and the
+    FitB storage options in storage. shared: the arguments of FitB.set_shared_open_beam, or None for none."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    M = Hybrid2(np.linspace(2.0, 4.4, 300), np.full(300, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))],
+                smooth_degree=5, n_contam=1, device=device, dtype=torch.float64, shape_model='cubic4')
+    M.view_dirs = ref.M.view_dirs
+    fit = FitB(M, T, ref.g.to(device), ref.W.to(device), ref.f.to(device), eps=ref.eps.to(device), chunk=16, **storage)
+    fit.ray_view = ref.ray_view.to(device)
+    if shared is not None:
+        fit.set_shared_open_beam(*shared)
+    return fit
+
+
 def _storage_twins(device, shared):
     """Two copies of the small cubic4 fit (_small_fit_cubic4) that compute on device: one with the default storage of
     the transmission, and one with t_storage 'host' (FitB). With shared, both use one noisy open beam shared by every
-    view (FitB.set_shared_open_beam), drawn as in test_shared_open_beam."""
-    from mbirtorch.hsnt.strain.model import Hybrid2, FitB
+    view (_shared_open_beam_data)."""
     ref = _small_fit_cubic4()
-    P, K = ref.T.shape
-    T = ref.T
-    if shared:
-        pix = torch.arange(P) // 8; gen = torch.Generator().manual_seed(7)
-        with torch.no_grad():
-            m_true = torch.cat([ref.mean(s)[0] for s in ref.chunks()])
-        b_true = 50.0 * torch.ones(5, K, dtype=torch.float64)
-        s_ = 0.9 + 0.2 * torch.rand(P, generator=gen, dtype=torch.float64)
-        O = torch.poisson(b_true, generator=gen).clamp_min(1.0)
-        S = torch.poisson(s_[:, None] * b_true[pix] * m_true, generator=gen)
-        T = (S / (s_[:, None] * O[pix])).to(ref.T.dtype)
-    fits = []
-    for storage in ('device', 'host'):
-        M = Hybrid2(np.linspace(2.0, 4.4, 300), np.full(300, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))],
-                    smooth_degree=5, n_contam=1, device=device, dtype=torch.float64, shape_model='cubic4')
-        M.view_dirs = ref.M.view_dirs
-        fit = FitB(M, T.clone().to(device) if storage == 'device' else T.clone(), ref.g.to(device), ref.W.to(device),
-                   ref.f.to(device), eps=ref.eps.to(device), chunk=16, t_storage=storage)
-        fit.ray_view = ref.ray_view.to(device)
-        if shared:
-            fit.set_shared_open_beam(O, pix, s_)
-        fits.append(fit)
-    return fits
+    T, ob = _shared_open_beam_data(ref) if shared else (ref.T, None)
+    return (_storage_fit(ref, T.clone().to(device), device, ob),
+            _storage_fit(ref, T.clone(), device, ob, t_storage='host'))
 
 
 @pytest.mark.parametrize('shared', [False, True])
@@ -1399,3 +1407,36 @@ def test_warmup_host_storage():
     assert torch.allclose(b.V, a.V, rtol=1e-4, atol=1e-6 * float(a.V.abs().max()))
     assert torch.allclose(b.fit.g, a.fit.g, rtol=1e-4, atol=1e-6 * float(a.fit.g.abs().max()))
     assert abs(b.fit.data_loss() - a.fit.data_loss()) <= 1e-5 * abs(a.fit.data_loss())
+
+
+HALF_NOISE_UNITS = 0.1   # float16 storage may move the small fit's deviance by at most this many noise units, sqrt(N / 2)
+
+
+@pytest.mark.parametrize('shared', [False, True])
+@pytest.mark.parametrize('storage', ['device', 'host'])
+def test_half_storage(storage, shared):
+    """FitB with t_dtype 'float16' stores T in float16 (on the model's device, or in host memory for t_storage 'host')
+    and gives each chunk as the float16-rounded T in the model's dtype. With a shared open beam, each chunk is the
+    rounded measured T times the bound's ratio, within float16's rounding of the default storage's. At the small fit's
+    counts (50 per bin), the deviance moves by far less than one noise unit. The logged relative rounding is below
+    float16's half unit, 2^-11, and a T above HALF_MAX is refused."""
+    from mbirtorch.hsnt.strain.model import HALF_MAX
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ref = _small_fit_cubic4()
+    T, ob = _shared_open_beam_data(ref) if shared else (ref.T, None)
+    a = _storage_fit(ref, T.clone().to(device), device, ob)
+    b = _storage_fit(ref, T.clone(), device, ob, t_storage=storage, t_dtype='float16')
+    assert b.T.dtype == torch.float16 and b.T.device.type == ('cpu' if storage == 'host' else a.device.type)
+    for sl in a.chunks():
+        x = b.T_chunk(sl)
+        assert x.dtype == a.M.dt and x.device == a.device
+        if shared:
+            assert torch.allclose(x, a.T_chunk(sl), rtol=2.0 ** -10, atol=0)
+        else:
+            assert torch.equal(x, a.T_chunk(sl).half().to(a.M.dt))
+    assert abs(b.data_loss() - a.data_loss()) < HALF_NOISE_UNITS * math.sqrt(a.n_points / 2)
+    info = b.t_half_info
+    assert info['max'] == float(T.max()) and 0 < info['rms_relative_rounding'] < 2.0 ** -11
+    assert info['median_counts_per_bin'] > 0 and info['tiny_share'] == 0.0
+    with pytest.raises(ValueError, match='float16 storage'):
+        _storage_fit(ref, torch.full_like(ref.T, 2 * HALF_MAX), device, t_dtype='float16')

@@ -2031,7 +2031,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
            eq_stencil='corner',
            noise=None, detector_tiles=(1, 1), shape_model=None, per_bin_dispersion=False, texture_knots=1,
            init_spectra=None, texture_voxels=None, open_beam_obs=None, shared_open_beam=None, edge_spread=True,
-           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage='device'):
+           tables=None, height_sd=HEIGHT_PRIOR_SD, dec=None, t_storage='device', t_dtype=None):
     """The pipeline's start: returns a TomoFit. Each material (an entry of lattices and a0) is one of three kinds. With a
     starting spectrum (a row of init_spectra, e.g. a known material's table), it starts from that spectrum at its a0.
     With a lattice type and a0 only, warm_start searches its lattice parameter within a0 * (1 +- a_range). With
@@ -2080,14 +2080,17 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     None, (alpha, beta) per reflection, or a function of the reflections' h^2 + k^2 + l^2 returning them; each
     reflection's lattice strain alpha eps + beta tr(strain) from the diffraction elastic constants (Hybrid2.set_dec);
     it needs the strain-tensor weights. t_storage is FitB's: 'device' (the default) keeps T as it is given, and 'host'
-    keeps T in host memory during the fit. With 'host', T may be given in host memory (pinned for fast copies). The
-    noise measurement then copies T to the model's device in chunks, and the warm start's factorization copies T to
-    that device as its memory plan allows."""
+    keeps T in host memory during the fit. t_dtype is FitB's too: None (the default) keeps T's dtype, and 'float16'
+    stores it in float16 during the fit (not exact; FitB). With either option, T may be given in host memory (pinned
+    for fast copies). The noise measurement then copies T to the model's device in chunks, and the warm start's
+    factorization copies T to that device as its memory plan allows. Both use T as given, before any float16
+    rounding."""
     from mbirtorch import hsnt
     from .model import _compute_device
-    # the device for the steps that read the whole T: None (T's own) by default, the model's device with host storage
-    t_dev = None if t_storage == 'device' else _compute_device(device)
-    t_kw = {} if t_storage == 'device' else dict(t_storage=t_storage)
+    # the device for the steps that read the whole T: None (T's own) by default, the model's device with the options
+    t_default = t_storage == 'device' and t_dtype is None
+    t_dev = None if t_default else _compute_device(device)
+    t_kw = {} if t_default else dict(t_storage=t_storage, t_dtype=t_dtype)
     noise_info = None
     if noise == 'measure':
         from .noise import measure_noise
@@ -2208,6 +2211,7 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     for _ in range(INIT_PIXEL_STEPS):
         fit0.pixel_step()
     T_fit = fit0.T                     # T as FitB stores it (T itself by default), so the fit below makes no second copy
+    half_info = fit0.t_half_info       # the float16 rounding statistics, measured when fit0 converted T
     Wr = fit0.W; del fit0
     # least-squares reconstruction of the ray maps (CGLS), clipped to >= 0
     n = proj.n; pr = proj.with_q(R)
@@ -2221,6 +2225,8 @@ def warmup(T, lam, d, lattices, a0, proj, device='cuda', smooth_degree=LEGENDRE_
     V = x.clamp_min(0)
     fit = FitB(M, T_fit, g, Wr, torch.zeros(M.J, M.K, device=device), eps=torch.zeros_like(Wr), chunk=chunk, inflation=inflation,
                ray_mask=ray_mask, **t_kw)
+    if fit.t_half_info is None:
+        fit.t_half_info = half_info
     if h_tab:
         fit.height_prior = dict(targets=h_tab, sd=height_sd)
     if shared_open_beam is not None:                  # exact: each pixel's open beam profiled out (open_beam_obs not used)
