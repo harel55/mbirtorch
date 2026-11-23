@@ -27,6 +27,7 @@ the contamination is separated from the neutron spectra before any lattice is so
 replaces H by Bragg materials. Loss: Poisson deviance of the counts, sum_pk d_k (m - T + T log(T / m)), d_k the open
 beam's counts per pixel in bin k; plus the L1 on f and a ridge on the splines.
 """
+import contextlib
 import math
 import mmap
 import weakref
@@ -34,6 +35,7 @@ import weakref
 import numpy as np
 import torch
 from scipy.stats import norm
+from torch.autograd.function import once_differentiable
 
 from .bragg import legendre_columns, reflections
 from ._dist import all_sum, all_sum_float
@@ -158,6 +160,16 @@ HALF_TINY = float(torch.finfo(torch.float16).tiny)
 HALF_SAMPLE_RAYS = 4096      # half_rounding samples at most this many rays for its logged statistics.
 # pinned_empty passes this cudaHostRegister flag (cudaHostRegisterPortable), so every GPU treats the memory as pinned.
 HOST_REGISTER_PORTABLE = 1
+# Hybrid2.band_precision takes the values in BAND_PRECISIONS. 'float32' multiplies by the band in one float32 product.
+# BAND_3XTF32 multiplies by the band in three TF32 tensor-core products, whose sum keeps about float32 accuracy.
+BAND_3XTF32 = "3xtf32"
+BAND_PRECISIONS = ("float32", BAND_3XTF32)
+TF32_DROPPED_BITS = 13       # A TF32 number keeps 10 of a float32's 23 mantissa bits, so it drops the low 13 bits.
+# Adding this number to a float32's bits, before TF32_MASK clears the low bits, rounds it to the nearest TF32 number.
+TF32_HALF_STEP = 1 << (TF32_DROPPED_BITS - 1)
+TF32_MASK = -(1 << TF32_DROPPED_BITS)    # This int32 clears the low TF32_DROPPED_BITS bits and keeps the others.
+TF32_SPLIT_ROWS = 32768      # The 3xtf32 product splits this many rows of its left factor at a time.
+TF32_SPLIT_COMPILE = True    # On a GPU, the 3xtf32 product splits its factors with one compiled kernel.
 
 
 def half_rounding(T, d):
@@ -345,6 +357,109 @@ def _assemble_kernel(on_cuda):
     if _assemble_compiled is None:
         _assemble_compiled = torch.compile(_assemble_spectrum, dynamic=True)
     return _assemble_compiled
+
+
+def _tf32_round(x):
+    """Returns the float32 tensor x rounded to the nearest TF32 number, with ties away from zero. The result's low
+    TF32_DROPPED_BITS mantissa bits are zero, so a TF32 tensor core holds it exactly. The rounding works on the bits:
+    it adds TF32_HALF_STEP to them and then clears the low bits with TF32_MASK."""
+    return ((x.view(torch.int32) + TF32_HALF_STEP) & TF32_MASK).view(torch.float32)
+
+
+def _tf32_pair(x):
+    """Returns [hi | lo] (rows, 2 cols) for a float32 matrix x (rows, cols). hi is x rounded to TF32 (_tf32_round). lo
+    is the remainder x - hi, which float32 holds exactly, rounded to TF32. Both are exact TF32 numbers, and hi + lo
+    equals x to 2^-22 of |x|."""
+    hi = _tf32_round(x)
+    return torch.cat([hi, _tf32_round(x - hi)], 1)
+
+
+_tf32_pair_compiled = None
+
+
+def _tf32_pair_kernel(fused):
+    """Returns the function that splits a factor of _mm_3xtf32. With fused and TF32_SPLIT_COMPILE, it is _tf32_pair
+    compiled into one GPU kernel (compiled once, for any size). Otherwise it is the plain _tf32_pair."""
+    global _tf32_pair_compiled
+    if not (fused and TF32_SPLIT_COMPILE):
+        return _tf32_pair
+    if _tf32_pair_compiled is None:
+        _tf32_pair_compiled = torch.compile(_tf32_pair, dynamic=True)
+    return _tf32_pair_compiled
+
+
+@contextlib.contextmanager
+def _tf32_products():
+    """Inside the block, torch's float32 matrix products on a GPU use TF32 tensor cores. When the block ends, it
+    restores the earlier setting of torch.backends.cuda.matmul.allow_tf32, so other products keep their precision."""
+    matmul = torch.backends.cuda.matmul
+    before = matmul.allow_tf32
+    matmul.allow_tf32 = True
+    try:
+        yield
+    finally:
+        matmul.allow_tf32 = before
+
+
+def _mm_3xtf32(A, B, fused=True):
+    """Returns A @ B for float32 matrices A (m, k) and B (k, n) on a GPU, to about float32 accuracy, from TF32
+    tensor-core products (the error-compensated split of Ootomo and Yokota, 2022). Each factor is split into a TF32 part
+    and a TF32 remainder (_tf32_pair), and A @ B is taken as hi_A hi_B + hi_A lo_B + lo_A hi_B. One product of
+    [hi_A | lo_A] and [lo_B; hi_B] gives the two small terms, and a second product adds hi_A hi_B to them. TF32 is
+    enabled for these two products alone (_tf32_products). The split takes TF32_SPLIT_ROWS rows of A at a time, so it
+    needs at most twice the memory of that many rows. fused says whether the split may use the compiled kernel
+    (_tf32_pair_kernel)."""
+    k = A.shape[1]
+    split = _tf32_pair_kernel(fused)
+    with torch.no_grad():
+        Bp = split(B.detach().T)                                   # (n, 2k): [hi | lo] of B's columns
+        B_hi = Bp[:, :k].T                                         # (k, n)
+        B_swap = torch.cat([Bp[:, k:], Bp[:, :k]], 1).T            # (2k, n): lo_B above hi_B
+        out = torch.empty(A.shape[0], B.shape[1], dtype=torch.float32, device=A.device)
+        for i in range(0, A.shape[0], TF32_SPLIT_ROWS):
+            Ap = split(A.detach()[i:i + TF32_SPLIT_ROWS])          # (rows, 2k): [hi | lo] of A's rows
+            o = out[i:i + TF32_SPLIT_ROWS]
+            with _tf32_products():
+                torch.mm(Ap, B_swap, out=o)                        # hi_A lo_B + lo_A hi_B
+                o.addmm_(Ap[:, :k], B_hi)                          # plus hi_A hi_B
+    return out
+
+
+class _Band3xTF32(torch.autograd.Function):
+    """E @ St by _mm_3xtf32, with derivatives, for Hybrid2.apply_band under automatic differentiation. The derivative
+    with respect to E is a 3xtf32 product too. The derivative with respect to St is a float32 product."""
+
+    @staticmethod
+    def forward(ctx, E, St):
+        ctx.save_for_backward(E, St)
+        return _mm_3xtf32(E, St)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad):
+        E, St = ctx.saved_tensors
+        # The backward pass may run on the autograd engine's own thread, so its split does not use the compiled kernel.
+        dE = _mm_3xtf32(grad, St.T, fused=False) if ctx.needs_input_grad[0] else None
+        dSt = E.T @ grad if ctx.needs_input_grad[1] else None
+        return dE, dSt
+
+
+def _band_3xtf32_applies(E, S):
+    """Returns True when Hybrid2.apply_band's 3xtf32 product can take E and the dense band S. E must be a float32
+    matrix on a GPU, and S must be on the same GPU. Neither may carry forward-mode derivatives or be inside a torch.func
+    transform. Otherwise apply_band uses the float32 product."""
+    if E.dtype != torch.float32 or E.dim() != 2 or E.device.type != "cuda" or S.device != E.device:
+        return False
+    return not any(_functorch_wrapped(t) or torch.autograd.forward_ad.unpack_dual(t).tangent is not None for t in (E, S))
+
+
+def _band_3xtf32(E, S):
+    """Returns E @ S.T by three TF32 products (_mm_3xtf32), for E (Pc, Kf) in float32 on a GPU and the dense band S
+    (K, Kf). Under automatic differentiation, the derivative with respect to E uses three TF32 products too."""
+    St = S.T.to(torch.float32)
+    if torch.is_grad_enabled() and (E.requires_grad or St.requires_grad):
+        return _Band3xTF32.apply(E, St)
+    return _mm_3xtf32(E, St)
 
 
 def deviance_terms(m, T, d, open_beam_obs=None):
@@ -568,6 +683,7 @@ class Hybrid2:
     penalty (FitB.spline_penalty). A physical form (absorption, incoherent and Debye phonon cross-sections) was tried on
     2026-10-23 and dropped: the same strain on NCrystal phantoms, too rigid on measured multi-material data."""
     BAND = (-240, 220)                                   # fine-grid offsets of a bin's band: the tail is on the left
+    _band_precision = BAND_PRECISIONS[0]                 # band_precision's default, 'float32'
 
     def __init__(self, lam, dose_per_bin, lattices, smooth_degree=LEGENDRE_DEGREE, n_contam=2, device="cuda", dtype=torch.float32,
                  pad=0.1, edge_slope=False, shape_model=None, texture_basis=1):
@@ -1120,11 +1236,28 @@ class Hybrid2:
         (the band covers about a sixth of the fine grid), and the matrix is small (K x Kf)."""
         return self.sparse(Rb, dtype).to_dense()
 
+    @property
+    def band_precision(self):
+        """How apply_band multiplies a float32 E by the dense band. 'float32' (the default) uses one float32 product.
+        '3xtf32' uses three TF32 tensor-core products on a GPU (_mm_3xtf32). They keep about float32 accuracy, and on a
+        GPU with TF32 tensor cores they should take less time than one float32 product, more so when the bins are many.
+        On the CPU and for float64 data, '3xtf32' uses the float32 product. The sparse band keeps its sparse product."""
+        return self._band_precision
+
+    @band_precision.setter
+    def band_precision(self, value):
+        if value not in BAND_PRECISIONS:
+            raise ValueError(f"band_precision must be one of {BAND_PRECISIONS}, not {value!r}")
+        self._band_precision = value
+
     def apply_band(self, E, Rb):
-        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw), its sparse matrix, or its dense matrix."""
+        """sum_i Rt_ki E_pi for E (Pc, Kf); Rb the band values (K, bw), its sparse matrix, or its dense matrix. With
+        band_precision '3xtf32', a float32 E on a GPU is multiplied by the dense band in three TF32 products."""
         if Rb.layout == torch.sparse_csr:
             return (Rb @ E.T).T
         S = Rb if Rb.shape == (self.K, self.Kf) else self.band_matrix(Rb, E.dtype)
+        if self._band_precision == BAND_3XTF32 and _band_3xtf32_applies(E, S):
+            return _band_3xtf32(E, S)
         return E @ S.T.to(E.dtype)
 
     def kappa(self, g):

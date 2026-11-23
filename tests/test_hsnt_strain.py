@@ -2294,3 +2294,200 @@ def test_prolong_projections():
     pf = fp.fwd(prolong(xc, f, 'constant')).cpu()
     pb = pf.reshape(cp.V, n, f, n, f, 1).mean((2, 4)).reshape(-1, 1)
     assert torch.allclose(pb, f * pc, rtol=1e-5, atol=1e-5 * float(pc.abs().max()))
+
+
+# The band product checks below use the weld phantom's wavelength axis: this range in Angstrom and this many bins
+# (WIDE_AXIS in drivers/strain/weld_phantom of the jobs repository).
+BAND_TEST_AXIS = (1.035, 6.027, 1420)
+# They use the weld phantom's Ikeda-Carpenter kernel (IC_KERNEL in drivers/strain/strain_phantoms of the jobs
+# repository). Their case 'storage' gives it the warm-up's starting storage share and decay length, a longer tail.
+BAND_TEST_KERNEL = (0.0, 0.00118, 0.00039, 0.00059, 0.0, 0.0002, 0.0, 0.0)
+BAND_TEST_RAYS = 4096          # The band product checks multiply this many rays by the band.
+BAND_TEST_ATTENUATION = 3.0    # The rays' attenuation reaches up to this value, so exp(-X) lies between exp(-3) and 1.
+BAND_ERROR_RATIO = 2.0         # The 3xtf32 product's errors are at most this many times the float32 product's.
+TF32_ERROR_RATIO = 10.0        # One TF32 product's errors are at least this many times the float32 product's.
+BAND_FIT_RTOL = 1e-5           # In test_band_3xtf32_fit, a pass over the chunks matches data_loss to this tolerance.
+TF32_TEST_DECADES = 20         # test_tf32_split draws values over this many decades on either side of 1.
+
+
+def _band_test_case(kernel):
+    """Returns a float32 model on the GPU, on the weld phantom's axis (BAND_TEST_AXIS) with one bcc material, its dense
+    band S (K, Kf), whose rows sum to 1, and BAND_TEST_RAYS rays E = exp(-X) (rays, Kf) in float32. Each ray's
+    attenuation X is the material's spectrum times a random path length, and it reaches up to BAND_TEST_ATTENUATION.
+    kernel is 'phantom' (BAND_TEST_KERNEL) or 'storage' (the same kernel with the warm-up's starting storage share and
+    decay length, tomo.IC_START_LAM_R and tomo.IC_START_TS)."""
+    from mbirtorch.hsnt.strain.model import Hybrid2
+    from mbirtorch.hsnt.strain.tomo import IC_START_LAM_R, IC_START_TS
+    lam = np.linspace(*BAND_TEST_AXIS)
+    M = Hybrid2(lam, np.ones_like(lam), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5, n_contam=1,
+                device='cuda')
+    gen = torch.Generator().manual_seed(5)
+    g = torch.zeros(M.n_global, dtype=torch.float64)
+    sl = M.slices[0]; ne = sl['h'][1] - sl['h'][0]
+    g[sl['a']] = 2.8665; g[sl['h'][0]:sl['h'][1]] = 0.3 + 0.1 * torch.rand(ne, generator=gen, dtype=torch.float64)
+    g[sl['c'][0]] = 0.2
+    kv = list(BAND_TEST_KERNEL)
+    if kernel == 'storage':
+        kv[4], kv[5] = IC_START_LAM_R, IC_START_TS
+    g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(kv, dtype=torch.float64)
+    g = g.cuda()
+    with torch.no_grad():
+        mu = M.spectra(g)[0]                                                    # (Kf,), float64
+        S = M.band_matrix(M.band(g))
+    path = torch.rand(BAND_TEST_RAYS, 1, generator=gen, dtype=torch.float64).cuda()
+    E = torch.exp(-BAND_TEST_ATTENUATION * path * mu / mu.max()).float()
+    return M, E, S
+
+
+def _errors(got, ref, normwise=False):
+    """Returns the largest and the root mean square error of got against the float64 reference ref. The errors are
+    relative to each element of ref (positive), or with normwise relative to the largest element of ref."""
+    r = (got.double() - ref).abs() / (ref.abs().max() if normwise else ref)
+    return float(r.max()), float(r.pow(2).mean().sqrt())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='the check needs a GPU')
+@pytest.mark.parametrize('kernel', ['phantom', 'storage'])
+def test_band_3xtf32_accuracy(kernel):
+    """Hybrid2.apply_band with band_precision '3xtf32' multiplies realistic rays exp(-X) by a band whose rows sum to 1.
+    Against a float64 product, its largest and its root mean square relative errors are at most BAND_ERROR_RATIO times
+    those of the float32 product. One TF32 product's errors are at least TF32_ERROR_RATIO times the float32 product's,
+    which shows that the check can fail. Under automatic differentiation, the derivative with respect to E is as
+    accurate. The product leaves torch.backends.cuda.matmul.allow_tf32 as it found it, and it does not depend on it."""
+    from mbirtorch.hsnt.strain.model import BAND_PRECISIONS
+    M, E, S = _band_test_case(kernel)
+    matmul = torch.backends.cuda.matmul
+    before = matmul.allow_tf32
+    try:
+        matmul.allow_tf32 = False
+        ref = E.double() @ S.double().T
+        f32 = M.apply_band(E, S)
+        M.band_precision = '3xtf32'
+        x3 = M.apply_band(E, S)
+        assert matmul.allow_tf32 is False
+        matmul.allow_tf32 = True
+        x1 = E @ S.T                                                            # one TF32 product
+        assert torch.equal(M.apply_band(E, S), x3) and matmul.allow_tf32 is True
+        matmul.allow_tf32 = False
+        w = torch.rand(E.shape[0], M.K, generator=torch.Generator().manual_seed(6)).cuda()
+        grads = {}
+        for precision in BAND_PRECISIONS:
+            M.band_precision = precision
+            Eg = E.clone().requires_grad_(True)
+            (M.apply_band(Eg, S) * w).sum().backward()
+            grads[precision] = Eg.grad
+        assert matmul.allow_tf32 is False
+    finally:
+        matmul.allow_tf32 = before
+    e32, e3, e1 = (_errors(x, ref) for x in (f32, x3, x1))
+    ref_g = w.double() @ S.double()
+    g32, g3 = (_errors(grads[p], ref_g, normwise=True) for p in BAND_PRECISIONS)
+    for k in range(2):                                                          # the largest, then the RMS error
+        assert e3[k] <= BAND_ERROR_RATIO * e32[k], ('3xtf32', e3, 'float32', e32)
+        assert e1[k] >= TF32_ERROR_RATIO * e32[k], ('tf32', e1, 'float32', e32)
+        assert g3[k] <= BAND_ERROR_RATIO * g32[k], ('3xtf32 derivative', g3, 'float32 derivative', g32)
+
+
+def test_tf32_split():
+    """_tf32_pair splits a float32 matrix x into [hi | lo]. Both halves have their low TF32_DROPPED_BITS mantissa bits
+    clear. hi is the nearest TF32 number to x, within half a TF32 step, and hi + lo equals x within half a step of
+    half a step. Zeros of either sign and values over many magnitudes are checked. On a GPU, the compiled split
+    (_tf32_pair_kernel) gives the same bits as the plain one, also for a transposed input."""
+    from mbirtorch.hsnt.strain.model import _tf32_pair, _tf32_pair_kernel, TF32_DROPPED_BITS
+    gen = torch.Generator().manual_seed(8)
+    shape = (64, 33)
+    x = (torch.randn(shape, generator=gen, dtype=torch.float64)
+         * 10.0 ** torch.randint(-TF32_TEST_DECADES, TF32_TEST_DECADES + 1, shape, generator=gen)).float()
+    x[0, :2] = torch.tensor([0.0, -0.0])
+    k = x.shape[1]
+    half = 2.0 ** TF32_DROPPED_BITS * torch.finfo(torch.float32).eps / 2        # half a TF32 step, relative to x
+    low = (1 << TF32_DROPPED_BITS) - 1
+    p = _tf32_pair(x)
+    hi, lo = p[:, :k], p[:, k:]
+    for part in (hi, lo):
+        assert bool(((part.view(torch.int32) & low) == 0).all())
+    xd, hd, ld = x.double(), hi.double(), lo.double()
+    assert bool(((xd - hd).abs() <= half * xd.abs()).all())
+    assert bool(((xd - hd - ld).abs() <= half * half * xd.abs()).all())
+    if torch.cuda.is_available():
+        xc = x.cuda()
+        assert torch.equal(_tf32_pair_kernel(True)(xc).cpu(), p)
+        assert torch.equal(_tf32_pair_kernel(True)(xc.T).cpu(), _tf32_pair(x.T.contiguous()))
+
+
+def test_band_precision_option():
+    """Hybrid2.band_precision is 'float32' by default, and it refuses values outside BAND_PRECISIONS. The default path
+    is the float32 product. With '3xtf32', the CPU and float64 data on a GPU keep the float32 product bitwise. On the
+    CPU, this holds also for the band's values and for the sparse band."""
+    from mbirtorch.hsnt.strain.model import Hybrid2, BAND_PRECISIONS
+    for dev in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+        for dt in (torch.float32, torch.float64):
+            lam = np.linspace(2.0, 4.4, 300)
+            M = Hybrid2(lam, np.full_like(lam, 50.0), [('bcc', (2.8665 * 0.99, 2.8665 * 1.01))], smooth_degree=5,
+                        n_contam=1, device=dev, dtype=dt)
+            assert M.band_precision == BAND_PRECISIONS[0]
+            with pytest.raises(ValueError, match='band_precision'):
+                M.band_precision = 'tf32'
+            g = torch.zeros(M.n_global, dtype=torch.float64)
+            g[M.res_sl[0]:M.res_sl[1]] = torch.tensor(BAND_TEST_KERNEL, dtype=torch.float64)
+            Rb = M.band(g.to(dev)); S = M.band_matrix(Rb, dt)
+            E = torch.rand(16, M.Kf, generator=torch.Generator().manual_seed(9), dtype=torch.float64).to(dev, dt)
+            ref = M.apply_band(E, S)
+            assert torch.equal(ref, E @ S.T)
+            M.band_precision = '3xtf32'
+            if dev == 'cpu' or dt == torch.float64:
+                assert torch.equal(M.apply_band(E, S), ref)
+            if dev == 'cpu':
+                assert torch.equal(M.apply_band(E, Rb), ref)
+                Sp = M.sparse(Rb, dt)
+                assert torch.equal(M.apply_band(E, Sp), (Sp @ E.T).T)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='the check needs a GPU')
+def test_band_3xtf32_fit():
+    """A float32 fit on the GPU is as accurate with band_precision '3xtf32' as with the default. A float64 twin of the
+    fit, with the same data, maps and strains, gives the reference. The data loss, the ray systems, the global gradient
+    and the global system differ from the twin's by at most BAND_ERROR_RATIO times the default's differences, relative
+    to each quantity's largest value. The global system includes the resolution kernel, whose band derivatives have
+    both signs. With lean_syncs, a pass of the data loss with '3xtf32' does not wait for the GPU."""
+    fit = _lean_fit('views', torch.float32, device='cuda')
+    twin = _lean_fit('views', torch.float64, device='cuda')
+    twin.T, twin.W, twin.eps, twin.eps_sd = (x.double() for x in (fit.T, fit.W, fit.eps, fit.eps_sd))
+    M = fit.M
+    free = [i for i in range(M.n_global) if float(M.ub[i]) > float(M.lb[i])]
+    idx = [i for i in free if not (M.res_sl[0] <= i < M.res_sl[1])]
+
+    def outputs(f):
+        f.use_memo = False
+        out = {'loss': torch.tensor(f.data_loss())}
+        cache = f._state(f.g)
+        with torch.no_grad():
+            G, F = zip(*[f.ray_system(s, cache) for s in f.chunks()])
+        out['G'], out['F'] = torch.cat(G), torch.cat(F)
+        out['global_grad'] = f.global_grad(idx)
+        out['system_grad'], out['system_F'] = f.global_system(free)
+        return {k: v.double() for k, v in out.items()}
+    ref = outputs(twin)
+    f32 = outputs(fit)
+    M.band_precision = '3xtf32'
+    x3 = outputs(fit)
+    assert not torch.equal(x3['G'], f32['G'])                     # the option changed the band products
+    for key in ref:
+        scale = float(ref[key].abs().max())
+        e32, e3 = (float((x[key] - ref[key]).abs().max()) / scale for x in (f32, x3))
+        assert e3 <= BAND_ERROR_RATIO * e32, (key, '3xtf32', e3, 'float32', e32)
+    fit.lean_syncs = True
+    cache = fit._state(fit.g)
+    loss = fit.data_loss()                      # this pass works out the plan and compiles the windowed sum
+    fit.data_loss()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode('error')
+    try:
+        with torch.no_grad():
+            tot = 0.0
+            for s in fit.chunks():
+                m = fit.mean(s, cache=cache)[0]
+                tot += fit._chunk_total(fit.deviance_terms(s, m, fit.T_chunk(s)).sum(dtype=torch.float64))
+    finally:
+        torch.cuda.set_sync_debug_mode('default')
+    assert abs(float(tot) - loss) <= BAND_FIT_RTOL * abs(loss)
