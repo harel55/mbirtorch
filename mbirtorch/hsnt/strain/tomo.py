@@ -80,6 +80,8 @@ PRIOR_SCALING_POWER = 0.25      # prior_scaling='fisher': each material's strain
                                 # less bias and more noise; 0.5 and 1 let too much noise through; 2026-10-25)
 TRACTION_ALIGN_COS = 0.97        # traction_model='aligned': a face keeps its traction condition where the surface normal
                                 # lies within this cosine (about 14 degrees) of the face's axis
+CUTCELL_SUB = 8                 # traction_model='cutcell': sub-points per voxel edge for the plane cut (volume and faces)
+CUTCELL_BISECT = 40             # traction_model='cutcell': bisection steps for the plane offset that matches a voxel's fill
 TRACTION_OFFSET = 0.5           # traction_sd='grid': the traction's standard deviation is this many voxels (a face's
                                 # distance from the true surface) times the strain smoothness prior's standard deviation
 ANDERSON_DEPTH = 5              # AndersonMixing: the past iterations it combines
@@ -678,7 +680,9 @@ class TomoFit:
         # voxel with an empty neighbour) or 'normal' (the normal from the volume fraction's gradient, and the traction
         # carried from the voxel centre to the surface, placed by the voxel's fill fraction) or 'aligned' ('axis' on the
         # faces whose surface normal is within TRACTION_ALIGN_COS of their axis, none elsewhere) or 'planefit' ('normal'
-        # with the normal from local plane fits to the sample's exposed voxel faces, as in MONSTR); traction_sd None (the
+        # with the normal from local plane fits to the sample's exposed voxel faces, as in MONSTR) or 'cutcell' (the stress
+        # flux through the open parts of each boundary voxel's faces must sum to zero, since the free surface carries
+        # none; a plane cut by the plane-fit normal and the voxel's fill fraction gives the open parts); traction_sd None (the
         # equilibrium prior's), 'grid' (TRACTION_OFFSET x smooth_sd: the error of a face off the true surface) or a
         # number. Use 'grid' or 'normal' when the surfaces are not on the voxel faces (curved or oblique faces).
         self.traction_model, self.traction_sd = 'axis', None
@@ -1405,8 +1409,10 @@ class TomoFit:
         side) whose eight surrounding voxels all hold it."""
         inside = self.material_voxels()
         self._eq_inside = inside                                                    # for the traction-free faces
-        if getattr(self, 'traction_model', 'axis') == 'planefit':
+        if getattr(self, 'traction_model', 'axis') in ('planefit', 'cutcell'):
             self._refresh_plane_fit_normal(inside.any(-1))                          # here, outside torch.func transforms
+        if getattr(self, 'traction_model', 'axis') == 'cutcell':
+            self._refresh_cutcell_areas(inside)
         m = inside.clone()
         if getattr(self, 'eq_stencil', 'central') == 'corner':
             for shift in ((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1)):
@@ -1456,7 +1462,9 @@ class TomoFit:
         div = self._divergence(E, mask).reshape(*E.shape[:3], -1)
         if not self.traction:
             return div
-        t = self._traction_normal(E) if getattr(self, 'traction_model', 'axis') in ('normal', 'planefit') else self._traction(E)
+        model = getattr(self, 'traction_model', 'axis')
+        t = self._traction_normal(E) if model in ('normal', 'planefit') else self._traction_cutcell(E) if model == 'cutcell' \
+            else self._traction(E)
         return torch.cat([div, self._traction_scale() * t.reshape(*E.shape[:3], -1)], -1)
 
     def _traction_scale(self):
@@ -1523,6 +1531,86 @@ class TomoFit:
                 ds.append(acc)
             t = torch.stack([sum((s[idx[i][j]] + d * ds[idx[i][j]]) * nrm[..., j] for j in range(3)) for i in range(3)], -1)
             out.append(t * bnd[..., None])
+        return torch.stack(out, -2)
+
+    @torch.no_grad()
+    def _refresh_cutcell_areas(self, inside):
+        """Store each material's open face areas for traction_model='cutcell', a list over materials of (n, n, n, 3): the
+        open share of each voxel's + face along x, y and z. A boundary voxel (with a plane-fit normal n) is cut by the
+        plane normal to n whose inside part holds the voxel's fill fraction (_fill_normal), and a face's open area is the
+        share of its points on the inside. A face between two cut voxels takes the mean of their estimates. A face
+        between two uncut voxels of the material, or against another material (bonded), is fully open, and any other
+        face is closed. Call it outside torch.func transforms."""
+        occupied = inside.any(-1)
+        if getattr(self, '_plane_fit_cache', None) is None:
+            self._refresh_plane_fit_normal(occupied)
+        nn = self._plane_fit_cache[1]
+        dev, dt = nn.device, nn.dtype
+        g = (torch.arange(CUTCELL_SUB, device=dev, dtype=dt) + 0.5) / CUTCELL_SUB - 0.5
+        P = torch.stack(torch.meshgrid(g, g, g, indexing='ij'), -1).reshape(-1, 3)     # (x, y, z) offsets in a voxel
+        q = torch.stack(torch.meshgrid(g, g, indexing='ij'), -1).reshape(-1, 2)
+        axes = (1, 0, 2)                                                              # volume axes of x, y, z
+        out = []
+        for r in range(inside.shape[-1]):
+            ins = inside[..., r]
+            fill = self._fill_normal(r, ins)[1].to(dt)
+            cut = ins & (nn.abs().sum(-1) > 0)
+            N = nn[cut]; F = fill[cut]
+            proj = P @ N.T                                                            # (points, cut voxels)
+            lo = torch.full_like(F, -1.0); hi = torch.full_like(F, 1.0)
+            for _ in range(CUTCELL_BISECT):                                           # offset d with share(p . n <= d) = fill
+                mid = 0.5 * (lo + hi)
+                low = (proj <= mid).to(dt).mean(0) < F
+                lo = torch.where(low, mid, lo); hi = torch.where(low, hi, mid)
+            d = 0.5 * (lo + hi)
+            areas = []
+            for j, ax in enumerate(axes):
+                o = [k for k in range(3) if k != j]
+                est = []
+                for sgn in (1.0, -1.0):                                               # the voxel's + and - face estimates
+                    Q = torch.zeros(len(q), 3, device=dev, dtype=dt)
+                    Q[:, j] = 0.5 * sgn; Q[:, o[0]] = q[:, 0]; Q[:, o[1]] = q[:, 1]
+                    a = torch.full(ins.shape, float('nan'), device=dev, dtype=dt)
+                    a[cut] = ((Q @ N.T) <= d[None]).to(dt).mean(0)
+                    est.append(a)
+                own, nbr = est[0], torch.roll(est[1], -1, ax)                         # the + neighbour's - face estimate
+                both = torch.stack([own, nbr]).nanmean(0)
+                other = occupied & ~ins                                               # voxels of another material
+                open_pair = (ins & torch.roll(ins | other, -1, ax)) | (other & torch.roll(ins, -1, ax))
+                areas.append(torch.where(torch.isnan(both), open_pair.to(dt), both))
+            out.append(torch.stack(areas, -1))
+        self._cutcell_areas = out
+
+    def _traction_cutcell(self, E):
+        """The cut-cell (weak-form) equilibrium residual / Young's modulus on the boundary voxels of _traction_normal,
+        (n, n, n, R, 3): for each voxel, the sum over its six faces of the face's open area (_refresh_cutcell_areas)
+        times the stress flux through it. The face's stress is the mean of the two voxels' where the neighbour holds the
+        material, and the voxel's own otherwise. The free surface carries no flux, so the sum is zero for a body in
+        equilibrium whose surface is free of traction."""
+        inside = self._eq_inside
+        occupied = inside.any(-1)
+        if getattr(self, '_cutcell_areas', None) is None:
+            self._refresh_cutcell_areas(inside)
+        idx = ((0, 3, 5), (3, 1, 4), (5, 4, 2))                                       # stress rows in COMPONENTS order
+        axes = (1, 0, 2)                                                              # volume axes of x, y, z
+        out = []
+        for r, (Em, nu) in enumerate(self.elastic):
+            ins = inside[..., r]
+            bnd = torch.zeros_like(ins)
+            for ax in range(3):
+                bnd |= ins & ~(torch.roll(occupied, 1, ax) & torch.roll(occupied, -1, ax))
+            s = self._stress(E[..., r, :], nu)
+            A = self._cutcell_areas[r].to(E.dtype)
+            res = [0.0, 0.0, 0.0]
+            for j, ax in enumerate(axes):
+                for sgn in (1, -1):
+                    area = A[..., j] if sgn > 0 else torch.roll(A[..., j], 1, ax)
+                    mn = torch.roll(ins, -sgn, ax)
+                    for i in range(3):
+                        c = s[idx[i][j]]
+                        face = torch.where(mn, 0.5 * (c + torch.roll(c, -sgn, ax)), c)
+                        res[i] = res[i] + sgn * area * face
+            out.append(torch.stack(res, -1) * bnd[..., None])
         return torch.stack(out, -2)
 
     def _divergence(self, E, mask):

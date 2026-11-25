@@ -208,6 +208,47 @@ def test_traction_planefit_flat_face():
     assert float(tf._traction_normal(E)[3, 3, 3, 0].abs().max()) < 1e-9
 
 
+def test_traction_cutcell_oblique_face():
+    """traction_model='cutcell' on an oblique flat free face: a uniform stress along the face (in equilibrium and free of
+    traction) leaves a small residual on the face's voxels, far below the axis model's traction, and a uniform pressure
+    (which loads the face) does not."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n, nu, sub = 16, 0.3, 6
+    nrm = torch.tensor([1.0, 2.0, 0.5], dtype=torch.float64); nrm = nrm / nrm.norm()
+    t = torch.tensor([2.0, -1.0, 0.0], dtype=torch.float64); t = t / t.norm()          # along the face
+    g = (torch.arange(sub, dtype=torch.float64) + 0.5) / sub - 0.5
+    off = torch.stack(torch.meshgrid(g, g, g, indexing='ij'), -1).reshape(-1, 3)
+    iy, ix, iz = torch.meshgrid(*(torch.arange(n, dtype=torch.float64),) * 3, indexing='ij')   # volume axes (y, x, z)
+    centre = torch.stack([ix, iy, iz], -1) - (n - 1) / 2
+    fill = (((centre[..., None, :] + off) @ nrm) <= 0).double().mean(-1)
+    box = torch.zeros(n, n, n, dtype=torch.bool); box[2:-2, 2:-2, 2:-2] = True
+    ins = (fill > 0.5) & box
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.elastic = 1, 6, [(1.0, nu)]
+    tf._eq_inside = ins[..., None]
+    tf.V = (fill * box)[..., None]
+    tf.traction_model = 'cutcell'
+    tf._refresh_plane_fit_normal(ins)
+    tf._refresh_cutcell_areas(ins[..., None])
+    face = ins & ~torch.roll(ins, -1, 1) & (centre.abs().amax(-1) < n / 2 - 4)           # oblique face, away from the box
+
+    def strain(S):                                     # isotropic, Young's modulus 1, COMPONENTS order
+        e = (1 + nu) * S - nu * torch.trace(S) * torch.eye(3, dtype=torch.float64)
+        E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64)
+        E[..., 0, :] = torch.stack([e[0, 0], e[1, 1], e[2, 2], e[0, 1], e[1, 2], e[0, 2]])
+        return E
+
+    E = strain(torch.outer(t, t))
+    cut = tf._traction_cutcell(E)[..., 0, :][face].norm(dim=-1)
+    axis = tf._traction(E)[..., 0, :, :][face].norm(dim=(-2, -1))
+    assert int(face.sum()) > 10
+    assert float(cut.mean()) < 0.1 * float(axis.mean())
+    press = tf._traction_cutcell(strain(torch.eye(3, dtype=torch.float64)))[..., 0, :][face].norm(dim=-1)
+    assert float(press.mean()) > 5 * float(cut.mean())
+
+
 def test_refresh_mask():
     """TomoFit.refresh_mask replaces a frozen material mask that overlaps the current volume fractions' mask poorly, and
     keeps one that agrees."""
