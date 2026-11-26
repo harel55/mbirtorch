@@ -647,6 +647,9 @@ class TomoFit:
         # and inclusion edges; as density_prior='qggmrf' for the volume fractions; the default)
         assert strain_prior in ('quadratic', 'qggmrf'), strain_prior
         self.strain_prior = strain_prior
+        # the strain q-GGMRF's exponent q and threshold T (in units of smooth_sd); a smaller q or T lets the strain jump
+        # more easily. Set them after construction to change them.
+        self.strain_q, self.strain_T = QGGMRF_Q, QGGMRF_T
         # prior_scaling: 'fisher' (the default; each material's strain ridge and smoothness prior
         # scaled by its data's information about its strain relative to the best-measured material's, to the power
         # prior_scaling_power, so a weakly measured material is not overruled by the priors; measured at the first
@@ -1264,16 +1267,17 @@ class TomoFit:
         self.prior_scale = new.to(E.dtype)
 
     @staticmethod
-    def _qggmrf_rho(delta, sx):
-        """The q-GGMRF penalty of neighbour differences delta at scale sx (the value _strain_prior_value sums)."""
-        return TomoFit._qggmrf_rho_floored(delta.abs().clamp_min(QGGMRF_T * sx * QGGMRF_FLOOR_REL), sx)
+    def _qggmrf_rho(delta, sx, q=QGGMRF_Q, T=QGGMRF_T):
+        """The q-GGMRF penalty of neighbour differences delta at scale sx, exponent q and threshold T (the value
+        _strain_prior_value sums)."""
+        return TomoFit._qggmrf_rho_floored(delta.abs().clamp_min(T * sx * QGGMRF_FLOOR_REL), sx, q, T)
 
     @staticmethod
-    def _qggmrf_rho_floored(a, sx):
-        """The q-GGMRF penalty at scale sx of absolute differences a that are already at or above the floor. The
-        function holds no clamp, so its derivatives at the floor do not depend on how torch differentiates a clamp at
-        its boundary. Use it to differentiate the penalty."""
-        ds = (a / (QGGMRF_T * sx)) ** (QGGMRF_Q - QGGMRF_P)
+    def _qggmrf_rho_floored(a, sx, q=QGGMRF_Q, T=QGGMRF_T):
+        """The q-GGMRF penalty at scale sx, exponent q and threshold T of absolute differences a that are already at or
+        above the floor. The function holds no clamp, so its derivatives at the floor do not depend on how torch
+        differentiates a clamp at its boundary. Use it to differentiate the penalty."""
+        ds = (a / (T * sx)) ** (q - QGGMRF_P)
         return a ** QGGMRF_P / (QGGMRF_P * sx ** QGGMRF_P) * ds / (1 + ds)
 
     def _strain_wts(self, E, curvature=False):
@@ -1284,18 +1288,19 @@ class TomoFit:
         if getattr(self, 'strain_prior', 'quadratic') == 'quadratic' or self.smooth_sd is None:
             return None
         sx = float(self.smooth_sd)
+        q, T = getattr(self, 'strain_q', QGGMRF_Q), getattr(self, 'strain_T', QGGMRF_T)
         if not curvature:
             from mbirtorch.qggmrf import b_tilde_by_definition
-            return [self._smooth_vs() * 2 * b_tilde_by_definition(self._sdiff(E, d), sx, QGGMRF_P, QGGMRF_Q, QGGMRF_T)
+            return [self._smooth_vs() * 2 * b_tilde_by_definition(self._sdiff(E, d), sx, QGGMRF_P, q, T)
                     for d in range(3)]
         out = []
         for d in range(3):
             with torch.enable_grad():
                 # rho is even, so rho''(d) = rho''(|d|); the floor keeps zero differences at the quadratic curvature
-                x = self._sdiff(E, d).detach().double().abs().clamp_min(QGGMRF_T * sx * QGGMRF_FLOOR_REL).requires_grad_(True)
+                x = self._sdiff(E, d).detach().double().abs().clamp_min(T * sx * QGGMRF_FLOOR_REL).requires_grad_(True)
                 # x is already floored. A second clamp at the same floor would make the derivatives at the floor
                 # depend on torch's choice of gradient at the clamp's boundary.
-                g = torch.autograd.grad(self._qggmrf_rho_floored(x, sx).sum(), x, create_graph=True)[0]
+                g = torch.autograd.grad(self._qggmrf_rho_floored(x, sx, q, T).sum(), x, create_graph=True)[0]
                 h = torch.autograd.grad(g.sum(), x)[0]
             out.append(self._smooth_vs() * h.clamp_min(0).to(E.dtype))
         return out
@@ -1328,7 +1333,8 @@ class TomoFit:
             return 0.5 * self.smooth_E * float(tot)
         sx = float(self.smooth_sd); tot = 0.0
         for d in range(3):
-            tot += float(per(self._qggmrf_rho(self._sdiff(E, d).double(), sx)))
+            tot += float(per(self._qggmrf_rho(self._sdiff(E, d).double(), sx, getattr(self, 'strain_q', QGGMRF_Q),
+                                              getattr(self, 'strain_T', QGGMRF_T))))
         return self._smooth_vs() * tot
 
     def _dens_wts(self, V):

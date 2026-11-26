@@ -291,6 +291,31 @@ def test_qggmrf_strain_prior_gradient():
     assert q < 0.5 * tf._strain_prior_value(E)
 
 
+def test_qggmrf_strain_prior_shape():
+    """The strain q-GGMRF with its exponent q and threshold T changed (strain_q, strain_T): the gradient still matches
+    finite differences of the value, and a smaller q penalizes a jump less."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 6
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.voxel_scale, tf.smooth_sd = 1, 6, 1.0, 8e-4
+    tf.smooth_E = 1.0 / tf.smooth_sd ** 2
+    g = torch.Generator().manual_seed(2)
+    E = 3e-4 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64)
+    E[3:] += 2e-3
+    tf.E, tf.strain_prior = E, 'qggmrf'
+    tf.strain_q, tf.strain_T = 1.05, 0.5
+    grad = tf.strain_lap(E, tf._strain_wts(E))
+    i = (2, 1, 3, 0, 4); h = 1e-9
+    Ep, Em = E.clone(), E.clone(); Ep[i] += h; Em[i] -= h
+    fd = (tf._strain_prior_value(Ep) - tf._strain_prior_value(Em)) / (2 * h)
+    assert abs(fd - float(grad[i])) < 1e-4 * max(abs(fd), 1.0)
+    low = tf._strain_prior_value(E)
+    tf.strain_q = 1.2
+    assert low < tf._strain_prior_value(E)
+
+
 def test_qggmrf_strain_prior_curvature():
     """The curvature weights give the q-GGMRF strain prior's exact Hessian (finite differences of its gradient), and they
     equal the surrogate weights where the differences are small."""
