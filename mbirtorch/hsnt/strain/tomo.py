@@ -1516,10 +1516,13 @@ class TomoFit:
             both = (hf & hb)[..., None]
             d = torch.where(both, 0.5 * (fwd - bwd), torch.where(hf[..., None], fwd - nn, torch.where(hb[..., None], nn - bwd, 0.0)))
             J[..., :, i] = d
-        P = torch.eye(3, dtype=nn.dtype, device=nn.device) - nn[..., :, None] * nn[..., None, :]
-        Jt = P @ J @ P
+        Jb, nb = J[has].double().cpu(), nn[has].double().cpu()                           # the boundary voxels only, on the CPU
+        P = torch.eye(3, dtype=torch.float64) - nb[:, :, None] * nb[:, None, :]          # (a batched GPU eigensolver failed
+        Jt = P @ Jb @ P                                                                  # on the whole grid, q1367)
         ev = torch.linalg.eigvalsh(0.5 * (Jt + Jt.transpose(-1, -2)))
-        return ev.abs().sum(-1) * has                                                    # the third eigenvalue is ~0 (along n)
+        out = torch.zeros(nn.shape[:3], dtype=nn.dtype, device=nn.device)
+        out[has] = ev.abs().sum(-1).to(nn.dtype).to(nn.device)                           # the third eigenvalue is ~0 (along n)
+        return out
 
     @torch.no_grad()
     def _refresh_traction_sd(self, inside):
