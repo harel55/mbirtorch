@@ -82,6 +82,11 @@ TRACTION_ALIGN_COS = 0.97        # traction_model='aligned': a face keeps its tr
                                 # lies within this cosine (about 14 degrees) of the face's axis
 CUTCELL_SUB = 8                 # traction_model='cutcell': sub-points per voxel edge for the plane cut (volume and faces)
 CUTCELL_BISECT = 40             # traction_model='cutcell': bisection steps for the plane offset that matches a voxel's fill
+TRACTION_FLAT_REL = 0.06        # traction_sd='curvature': the traction's standard deviation on a flat face, as a fraction
+                                # of the stress RMS on the material's surface voxels (the plane-fit traction of the weld
+                                # phantom's true strain is 0.065 of it on its flat faces; smooth test fields 0.02-0.05)
+TRACTION_CURV_REL = 0.45        # traction_sd='curvature': the standard deviation's growth with the surface's curvature
+                                # (|k1| + |k2|, per voxel), as the same fraction (cylinder and torus test shapes, 2026-11-26)
 TRACTION_OFFSET = 0.5           # traction_sd='grid': the traction's standard deviation is this many voxels (a face's
                                 # distance from the true surface) times the strain smoothness prior's standard deviation
 ANDERSON_DEPTH = 5              # AndersonMixing: the past iterations it combines
@@ -687,7 +692,10 @@ class TomoFit:
         # flux through the open parts of each boundary voxel's faces must sum to zero, since the free surface carries
         # none; a plane cut by the plane-fit normal and the voxel's fill fraction gives the open parts); traction_sd None (the
         # equilibrium prior's), 'grid' (TRACTION_OFFSET x smooth_sd: the error of a face off the true surface) or a
-        # number. Use 'grid' or 'normal' when the surfaces are not on the voxel faces (curved or oblique faces).
+        # number, or 'curvature' (per surface voxel: the stress RMS on the material's surface voxels times TRACTION_FLAT_REL
+        # plus TRACTION_CURV_REL times the surface's curvature there, never below the equilibrium prior's; with the
+        # 'normal', 'planefit' and 'cutcell' models). Use 'grid' or 'normal' when the surfaces are not on the voxel faces
+        # (curved or oblique faces).
         self.traction_model, self.traction_sd = 'axis', None
         self._wts = None
         # hold_strain=True keeps the strain where it is (the volume steps move the density only), e.g. for the first
@@ -1419,6 +1427,8 @@ class TomoFit:
             self._refresh_plane_fit_normal(inside.any(-1))                          # here, outside torch.func transforms
         if getattr(self, 'traction_model', 'axis') == 'cutcell':
             self._refresh_cutcell_areas(inside)
+        if getattr(self, 'traction_sd', None) == 'curvature' and getattr(self, 'traction', False):
+            self._refresh_traction_sd(inside)
         m = inside.clone()
         if getattr(self, 'eq_stencil', 'central') == 'corner':
             for shift in ((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1)):
@@ -1471,17 +1481,66 @@ class TomoFit:
         model = getattr(self, 'traction_model', 'axis')
         t = self._traction_normal(E) if model in ('normal', 'planefit') else self._traction_cutcell(E) if model == 'cutcell' \
             else self._traction(E)
-        return torch.cat([div, self._traction_scale() * t.reshape(*E.shape[:3], -1)], -1)
+        sc = self._traction_scale()
+        if torch.is_tensor(sc):                                                     # per voxel and material
+            t = t * sc.reshape(sc.shape + (1,) * (t.dim() - sc.dim())).to(t.dtype)
+            sc = 1.0
+        return torch.cat([div, sc * t.reshape(*E.shape[:3], -1)], -1)
 
     def _traction_scale(self):
         """The traction residual's weight relative to the divergence's: the equilibrium prior's standard deviation over
-        the traction's (traction_sd)."""
+        the traction's (traction_sd). With traction_sd='curvature' it is a tensor (n, n, n, R)."""
         sd = getattr(self, 'traction_sd', None)
         if sd is None:
             return 1.0
+        if sd == 'curvature':
+            if getattr(self, '_traction_sd_map', None) is None:
+                self._refresh_traction_sd(self._eq_inside)
+            return self.eq_sd / self._traction_sd_map
         if sd == 'grid':
             sd = TRACTION_OFFSET * self.smooth_sd
         return self.eq_sd / float(sd)
+
+    @torch.no_grad()
+    def _surface_curvature(self, occupied):
+        """(n, n, n): the sample surface's curvature |k1| + |k2| (per voxel) at its boundary voxels, from the differences
+        of the plane-fit normals between neighbouring boundary voxels, and zero elsewhere."""
+        if getattr(self, '_plane_fit_cache', None) is None:
+            self._refresh_plane_fit_normal(occupied)
+        nn = self._plane_fit_cache[1]
+        has = nn.abs().sum(-1) > 0
+        J = torch.zeros(nn.shape[:3] + (3, 3), dtype=nn.dtype, device=nn.device)        # J[..., j, i] = dn_j / dx_i
+        for i, ax in enumerate((1, 0, 2)):                                               # volume axes of x, y, z
+            fwd, bwd = torch.roll(nn, -1, ax), torch.roll(nn, 1, ax)
+            hf, hb = torch.roll(has, -1, ax), torch.roll(has, 1, ax)
+            both = (hf & hb)[..., None]
+            d = torch.where(both, 0.5 * (fwd - bwd), torch.where(hf[..., None], fwd - nn, torch.where(hb[..., None], nn - bwd, 0.0)))
+            J[..., :, i] = d
+        P = torch.eye(3, dtype=nn.dtype, device=nn.device) - nn[..., :, None] * nn[..., None, :]
+        Jt = P @ J @ P
+        ev = torch.linalg.eigvalsh(0.5 * (Jt + Jt.transpose(-1, -2)))
+        return ev.abs().sum(-1) * has                                                    # the third eigenvalue is ~0 (along n)
+
+    @torch.no_grad()
+    def _refresh_traction_sd(self, inside):
+        """Store traction_sd='curvature''s standard deviation per voxel and material, (n, n, n, R): the stress RMS / Young's
+        modulus on the material's boundary voxels at the current strain, times TRACTION_FLAT_REL + TRACTION_CURV_REL x the
+        surface curvature, and at least the equilibrium prior's standard deviation. Call it outside torch.func transforms."""
+        occupied = inside.any(-1)
+        kappa = self._surface_curvature(occupied).to(self.E.dtype)
+        sd = torch.full(inside.shape, float(self.eq_sd), dtype=self.E.dtype, device=self.E.device)
+        E = self._elastic(self.E.detach())
+        for r, (Em, nu) in enumerate(self.elastic):
+            ins = inside[..., r]
+            bnd = torch.zeros_like(ins)
+            for ax in range(3):
+                bnd |= ins & ~(torch.roll(occupied, 1, ax) & torch.roll(occupied, -1, ax))
+            if not bool(bnd.any()):
+                continue
+            S = torch.stack(self._stress(E[..., r, :], nu), -1)
+            rms = float((S[bnd] ** 2).sum(-1).mean().sqrt())
+            sd[..., r] = torch.clamp(rms * (TRACTION_FLAT_REL + TRACTION_CURV_REL * kappa), min=float(self.eq_sd))
+        self._traction_sd_map = sd
 
     def _fill_normal(self, r, ins):
         """(n, n, n, 3): material r's outward surface normal (x, y, z), minus the gradient of its fill fraction (its

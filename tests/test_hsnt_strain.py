@@ -249,6 +249,38 @@ def test_traction_cutcell_oblique_face():
     assert float(press.mean()) > 5 * float(cut.mean())
 
 
+def test_traction_sd_curvature():
+    """traction_sd='curvature': the surface curvature from the plane-fit normals is near 2 / R on a voxelized sphere and
+    near 0 on a cube's faces, and the traction's standard deviation on a flat face is the surface stress RMS times
+    TRACTION_FLAT_REL."""
+    import numpy as np
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit, TRACTION_FLAT_REL
+
+    n, R = 32, 11.0
+    g = torch.arange(n, dtype=torch.float64) - (n - 1) / 2
+    yy, xx, zz = torch.meshgrid(g, g, g, indexing='ij')
+    tf = object.__new__(TomoFit)
+    tf.V = torch.zeros(n, n, n, 1, dtype=torch.float64)
+    sph = (xx ** 2 + yy ** 2 + zz ** 2) <= R ** 2
+    tf._refresh_plane_fit_normal(sph)
+    k = tf._surface_curvature(sph)
+    has = tf._plane_fit_cache[1].abs().sum(-1) > 0
+    assert abs(float(np.median(k[has].numpy())) - 2 / R) < 0.35 * 2 / R
+    cube = (xx.abs() <= 9) & (yy.abs() <= 9) & (zz.abs() <= 9)
+    tf._plane_fit_cache = None
+    tf._refresh_plane_fit_normal(cube)
+    k = tf._surface_curvature(cube)
+    assert float(k[n // 2, n // 2 + 9, n // 2]) < 1e-9                  # the middle of the face x = 9 (volume axes y, x, z)
+    tf.R, tf.C, tf.elastic, tf.eq_sd, tf.D = 1, 6, [(1.0, 0.3)], 1e-5, None
+    E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64); E[..., 0, 0] = 1e-3
+    tf.E = E
+    tf._refresh_traction_sd(cube[..., None])
+    s = torch.stack(TomoFit._stress(E[..., 0, :], 0.3), -1)
+    rms = float(s[n // 2, n // 2 + 9, n // 2].norm())
+    assert abs(float(tf._traction_sd_map[n // 2, n // 2 + 9, n // 2, 0]) - TRACTION_FLAT_REL * rms) < 1e-9
+
+
 def test_refresh_mask():
     """TomoFit.refresh_mask replaces a frozen material mask that overlaps the current volume fractions' mask poorly, and
     keeps one that agrees."""
