@@ -82,6 +82,8 @@ TRACTION_ALIGN_COS = 0.97        # traction_model='aligned': a face keeps its tr
                                 # lies within this cosine (about 14 degrees) of the face's axis
 CUTCELL_SUB = 8                 # traction_model='cutcell': sub-points per voxel edge for the plane cut (volume and faces)
 CUTCELL_BISECT = 40             # traction_model='cutcell': bisection steps for the plane offset that matches a voxel's fill
+HARD_EQ_CG_ITERS = 2000         # hard_equilibrium: conjugate-gradient iterations of each projection's (L L^T) solve
+HARD_EQ_TOL = 1e-10             # ... and their tolerance on the residual norm, relative to the first
 TRACTION_FLAT_REL = 0.06        # traction_sd='curvature': the traction's standard deviation on a flat face, as a fraction
                                 # of the stress RMS on the material's surface voxels (the plane-fit traction of the weld
                                 # phantom's true strain is 0.065 of it on its flat faces; smooth test fields 0.02-0.05)
@@ -697,6 +699,11 @@ class TomoFit:
         # 'normal', 'planefit' and 'cutcell' models). Use 'grid' or 'normal' when the surfaces are not on the voxel faces
         # (curved or oblique faces).
         self.traction_model, self.traction_sd = 'axis', None
+        # hard_equilibrium=True keeps the strain exactly in equilibrium (and, with traction, free of traction on the free
+        # faces): each volume step's strain update is projected onto the null space of the equilibrium residual. Use it
+        # when the data leave strain components undetermined that the soft equilibrium prior cannot pin. Set it after
+        # construction; it needs elastic constants and no d0 field.
+        self.hard_equilibrium = False
         self._wts = None
         # hold_strain=True keeps the strain where it is (the volume steps move the density only), e.g. for the first
         # iterations, so the spectrum and the density settle before the strain is fitted
@@ -1487,6 +1494,31 @@ class TomoFit:
             sc = 1.0
         return torch.cat([div, sc * t.reshape(*E.shape[:3], -1)], -1)
 
+    def _eq_residual_rms(self, E, mask):
+        """The RMS of the equilibrium residual (_eq_residual) at strain E."""
+        return float(self._eq_residual(self._elastic(E), mask).pow(2).mean().sqrt())
+
+    def _project_equilibrium(self, X, mask):
+        """X less the least change that makes its equilibrium residual zero, X - L^T (L L^T)^-1 L X, with L the
+        equilibrium residual operator (_eq_residual: the divergence on mask and, with traction, the free faces'
+        traction). L is linear in the strain, and L L^T is inverted by conjugate gradients (HARD_EQ_CG_ITERS,
+        HARD_EQ_TOL). It needs no d0 field."""
+        if getattr(self, 'D', None) is not None:
+            raise ValueError('hard_equilibrium does not support a d0 field')
+        X = X.detach()
+        L = lambda Y: self._eq_residual(Y, mask)
+        _, vjp = torch.func.vjp(L, torch.zeros_like(X))
+        Lt = lambda y: vjp(y)[0]
+        b = L(X); y = torch.zeros_like(b); res = b.clone(); d = res.clone()
+        rr = float((res * res).sum()); rr0 = rr
+        for _ in range(HARD_EQ_CG_ITERS):
+            if rr <= HARD_EQ_TOL ** 2 * rr0 or rr0 == 0.0:
+                break
+            q = L(Lt(d)); al = rr / max(float((d * q).sum()), 1e-300)
+            y += al * d; res -= al * q; rr_new = float((res * res).sum()); d = res + (rr_new / rr) * d; rr = rr_new
+        self.last_projection = dict(residual_before=math.sqrt(rr0), residual_after=math.sqrt(max(rr, 0.0)))
+        return X - Lt(y)
+
     def _traction_scale(self):
         """The traction residual's weight relative to the divergence's: the equilibrium prior's standard deviation over
         the traction's (traction_sd). With traction_sd='curvature' it is a tensor (n, n, n, R)."""
@@ -1850,6 +1882,11 @@ class TomoFit:
             l0 = self.loss(mask=mask)
             lean = self.lean_passes
 
+            if getattr(self, 'hard_equilibrium', False) and self.elastic is not None:
+                if self._eq_residual_rms(E, mask) > HARD_EQ_TOL:          # the current strain, once (then it stays)
+                    E = self._project_equilibrium(E, mask); self.E = E
+                xE = self._project_equilibrium(xE, mask)                    # the update, so every trial stays in it
+
             def at(alpha, beta=0.0):
                 Vn, En = V + alpha * xV, E + alpha * xE
                 if beta:
@@ -1890,6 +1927,8 @@ class TomoFit:
                 # the plane of the Gauss-Newton step x and the previous step p: the loss at p, p/2 and x + p gives the
                 # quadratic's slope and curvature along p and its cross term; its minimizer is tried as well
                 pV, pE = prev[0] * free, proj_E(prev[1] * fE)
+                if getattr(self, 'hard_equilibrium', False) and self.elastic is not None:
+                    pE = self._project_equilibrium(pE, mask)
                 tried[(0.0, 1.0)] = at(0.0, 1.0); keep_best(tried)
                 tried[(0.0, 0.5)] = at(0.0, 0.5); keep_best(tried)
                 tried[(1.0, 1.0)] = at(1.0, 1.0); keep_best(tried)

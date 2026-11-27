@@ -281,6 +281,27 @@ def test_traction_sd_curvature():
     assert abs(float(tf._traction_sd_map[n // 2, n // 2 + 9, n // 2, 0]) - TRACTION_FLAT_REL * rms) < 1e-9
 
 
+def test_project_equilibrium():
+    """hard_equilibrium's projection (TomoFit._project_equilibrium) makes the equilibrium and traction residual of a
+    random strain zero, gives the same field when applied twice, and changes a field already in equilibrium not at all."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 10
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.elastic, tf.eq_stencil, tf.D = 1, 6, [(1.0, 0.3)], 'corner', None
+    tf.traction, tf.traction_model, tf.traction_sd = True, 'planefit', None
+    ins = torch.zeros(n, n, n, dtype=torch.bool); ins[2:8, 2:8, 3:7] = True
+    tf.V = ins.to(torch.float64)[..., None]
+    tf.mask_freeze, tf._mask = True, ins[..., None]
+    mask = tf._eq_mask()
+    g = torch.Generator().manual_seed(3)
+    X = 1e-3 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64) * ins[..., None, None]
+    P = tf._project_equilibrium(X, mask)
+    assert tf._eq_residual_rms(P, mask) < 1e-9 * tf._eq_residual_rms(X, mask)
+    torch.testing.assert_close(tf._project_equilibrium(P, mask), P, rtol=0, atol=1e-12)
+
+
 def test_refresh_mask():
     """TomoFit.refresh_mask replaces a frozen material mask that overlaps the current volume fractions' mask poorly, and
     keeps one that agrees."""
