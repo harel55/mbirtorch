@@ -1205,7 +1205,7 @@ class TomoFit:
         zV, zE = prec(rV, rE); dV, dE = zV.clone(), zE.clone()
         rz = float((rV * zV).sum() + (rE * zE).sum()); rz0 = max(rz, 1e-300)
         for _ in range(iters):
-            if rz <= 0:
+            if not rz > 0:                       # also NaN
                 break
             hV, hE = H(dV, dE)
             a = rz / max(float((dV * hV).sum() + (dE * hE).sum()), 1e-300)
@@ -1871,6 +1871,8 @@ class TomoFit:
             dV, dE = zV.clone(), zE.clone()
             rz = float((rV * zV).sum() + (rE * zE).sum())
             for _ in range(self.cg_iters):
+                if not rz > 0:                   # converged exactly (or NaN): the next update would divide by zero (q1377)
+                    break
                 hV, hE = H(dV, dE)
                 hV = hV + lam_ * dV_ * dV; hE = hE + lam_ * dE_ * dE
                 a = rz / max(float((dV * hV).sum() + (dE * hE).sum()), 1e-30)
