@@ -71,7 +71,8 @@ def element_strains(u):
     """Total strain sym(grad u) at each element's 8 Gauss points, (8, n, n, n, 6), from corner displacements u
     (n+1, n+1, n+1, 3) in (x, y, z) components."""
     n = u.shape[0] - 1
-    gr = torch.nn.functional.conv3d(u.permute(3, 0, 1, 2)[None], _grad_kernel(u.device, u.dtype))[0]
+    with torch.backends.cudnn.flags(enabled=False):            # cuDNN's float64 3-D kernels failed to load on the cluster (q1400)
+        gr = torch.nn.functional.conv3d(u.permute(3, 0, 1, 2)[None], _grad_kernel(u.device, u.dtype))[0]
     gr = gr.reshape(8, 3, 3, n, n, n).permute(0, 3, 4, 5, 1, 2)      # (8, n, n, n, volume axis, component)
     dx, dy, dz = gr[..., AXIS_OF[0], :], gr[..., AXIS_OF[1], :], gr[..., AXIS_OF[2], :]
     return torch.stack([dx[..., 0], dy[..., 1], dz[..., 2], 0.5 * (dy[..., 0] + dx[..., 1]),
