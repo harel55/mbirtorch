@@ -302,6 +302,30 @@ def test_project_equilibrium():
     torch.testing.assert_close(tf._project_equilibrium(P, mask), P, rtol=0, atol=1e-12)
 
 
+def test_eq_stencil_both_sees_oblique_patterns():
+    """eq_stencil='both' adds the central stencil's residual to the corner stencil's: an oblique strain pattern near
+    the voxel scale, which the corner stencil barely sees, gets a much larger equilibrium residual."""
+    import math
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 16
+    tf = object.__new__(TomoFit)
+    tf.R, tf.C, tf.elastic, tf.D, tf.traction = 1, 6, [(1.0, 0.3)], None, False
+    ins = torch.ones(n, n, n, 1, dtype=torch.bool)
+    tf.mask_freeze, tf._mask = True, ins
+    tf.V = ins.to(torch.float64)
+    i = torch.arange(n, dtype=torch.float64)
+    yy, xx, zz = torch.meshgrid(i, i, i, indexing='ij')
+    wave = torch.cos(2 * math.pi * 0.4 * (xx + yy + zz))                    # k = (0.4, 0.4, 0.4) cycles per voxel
+    E = torch.zeros(n, n, n, 1, 6, dtype=torch.float64); E[..., 0, 0] = 1e-3 * wave
+    res = {}
+    for st in ('corner', 'both'):
+        tf.eq_stencil = st
+        res[st] = float(tf._eq_residual(E, tf._eq_mask()).norm())
+    assert res['both'] > 3 * res['corner']
+
+
 def test_refresh_mask():
     """TomoFit.refresh_mask replaces a frozen material mask that overlaps the current volume fractions' mask poorly, and
     keeps one that agrees."""

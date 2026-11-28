@@ -609,9 +609,10 @@ class TomoFit:
         which cannot see a strain that alternates from voxel to voxel) or 'corner' (the default; at the voxel corners, from the
         differences between the voxels on either side, averaged over the four pairs around the corner: it sees
         patterns that alternate along one axis; patterns alternating along two or three axes stay invisible, as the
-        hourglass modes of one-point finite elements)."""
+        hourglass modes of one-point finite elements) or 'both' (the two stencils' residuals together: the corner
+        stencil barely sees oblique patterns near the voxel scale, which the central one sees; 2026-11-28)."""
         self.fit = fit
-        assert eq_stencil in ('central', 'corner'), eq_stencil
+        assert eq_stencil in ('central', 'corner', 'both'), eq_stencil
         self.eq_stencil = eq_stencil
         self.v_max = VOLUME_FRACTION_MAX if fraction else float('inf')
         # normalize=True (implied by fraction=True): each volume step ends with normalize_fractions, which fixes the
@@ -1441,8 +1442,17 @@ class TomoFit:
             self._refresh_cutcell_areas(inside)
         if getattr(self, 'traction_sd', None) == 'curvature' and getattr(self, 'traction', False):
             self._refresh_traction_sd(inside)
+        stencil = getattr(self, 'eq_stencil', 'central')
+        if stencil == 'both':                                                       # a mask per stencil
+            return torch.stack([self._stencil_mask(inside, 'central'), self._stencil_mask(inside, 'corner')])
+        return self._stencil_mask(inside, stencil)
+
+    @staticmethod
+    def _stencil_mask(inside, stencil):
+        """(n, n, n, R): where the equilibrium prior applies with stencil 'central' (voxels whose six neighbours hold
+        the material) or 'corner' (corners whose eight surrounding voxels hold it)."""
         m = inside.clone()
-        if getattr(self, 'eq_stencil', 'central') == 'corner':
+        if stencil == 'corner':
             for shift in ((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1), (0, 1, 1), (1, 1, 1)):
                 m &= torch.roll(inside, tuple(-v for v in shift), (0, 1, 2))
             for d in range(3):
@@ -1487,7 +1497,11 @@ class TomoFit:
     def _eq_residual(self, E, mask):
         """The equilibrium prior's residual: div(sigma) / Young's modulus on the interior, and with traction=True the
         face tractions, flattened per voxel."""
-        div = self._divergence(E, mask).reshape(*E.shape[:3], -1)
+        if getattr(self, 'eq_stencil', 'central') == 'both':
+            div = torch.cat([self._divergence(E, mask[0], 'central').reshape(*E.shape[:3], -1),
+                             self._divergence(E, mask[1], 'corner').reshape(*E.shape[:3], -1)], -1)
+        else:
+            div = self._divergence(E, mask).reshape(*E.shape[:3], -1)
         if not self.traction:
             return div
         model = getattr(self, 'traction_model', 'axis')
@@ -1718,11 +1732,11 @@ class TomoFit:
             out.append(torch.stack(res, -1) * bnd[..., None])
         return torch.stack(out, -2)
 
-    def _divergence(self, E, mask):
-        """div(sigma) / Young's modulus on the mask, (n, n, n, R, 3), by eq_stencil; volume axes (y, x, z), E in
-        COMPONENTS order."""
+    def _divergence(self, E, mask, stencil=None):
+        """div(sigma) / Young's modulus on the mask, (n, n, n, R, 3), by stencil ('central' or 'corner'; eq_stencil by
+        default); volume axes (y, x, z), E in COMPONENTS order."""
         out = []
-        if getattr(self, 'eq_stencil', 'central') == 'corner':
+        if (stencil or getattr(self, 'eq_stencil', 'central')) == 'corner':
             def D(a, ax):                       # at the corner on the high side of each voxel (see __init__)
                 f = torch.roll(a, -1, ax) - a
                 o1, o2 = (d for d in range(3) if d != ax)
@@ -2054,6 +2068,13 @@ class TomoFit:
         n_in = int(self.material_voxels().sum()) * (1 + self.C)
         return math.sqrt(max(quad, 0.0) / max(n_in, 1))
 
+    def _div_flat(self, Y, mask):
+        """The divergence residual(s) of eq_stencil on one mask for every stencil, flattened per voxel: with 'both',
+        the central and the corner stencils' residuals together."""
+        if getattr(self, 'eq_stencil', 'central') == 'both':
+            return torch.cat([self._divergence(Y, mask, st).reshape(*Y.shape[:3], -1) for st in ('central', 'corner')], -1)
+        return self._divergence(Y, mask).reshape(*Y.shape[:3], -1)
+
     def _prior_symbol(self):
         """(n, n, n, R, C, C) complex: the Fourier symbol of the strain priors' Hessian (the weak ridge, the smoothness
         prior, and the equilibrium prior with its mask taken as everywhere, where its operator is periodic), from its
@@ -2061,7 +2082,7 @@ class TomoFit:
         R, C, V = self.R, self.C, self.V
         n = V.shape[0]; c = (n // 2,) * 3
         full = torch.ones(n, n, n, R, dtype=torch.bool, device=V.device)
-        div = lambda Y: self._divergence(Y, full).reshape(*Y.shape[:3], -1)
+        div = lambda Y: self._div_flat(Y, full)
         out = torch.zeros(n, n, n, R, C, C, dtype=torch.complex128, device=V.device)
         for r in range(R):
             for k in range(C):
@@ -2141,7 +2162,7 @@ class TomoFit:
         R, C, V = self.R, self.C, self.V
         n = V.shape[0]; c = (n // 2,) * 3
         full = torch.ones(n, n, n, R, dtype=torch.bool, device=V.device)
-        div = lambda Y: self._divergence(Y, full).reshape(*Y.shape[:3], -1)
+        div = lambda Y: self._div_flat(Y, full)
 
         def build(dtype):
             out = torch.zeros(n, n, n // 2 + 1, R, C, C, dtype=dtype, device=V.device)
