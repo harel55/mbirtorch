@@ -44,36 +44,35 @@ def _gauss_points():
     return [(p, q, r) for p in g for q in g for r in g]
 
 
-_GRAD_KERNELS = {}
+_GRAD_COEFS = {}
+_CORNERS = [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1)]
 
 
-def _grad_kernel(device, dtype):
-    """The conv3d kernel (72, 3, 2, 2, 2) that maps corner displacements to du_c/d(axis a) at each Gauss point g,
-    output channel (g, a, c)."""
+def _grad_coefs(device, dtype):
+    """(8 Gauss points, 3 volume axes, 8 corners): the weight of each corner's value in the derivative along each axis
+    at each Gauss point (trilinear element, unit voxel)."""
     key = (str(device), dtype)
-    if key not in _GRAD_KERNELS:
-        k = torch.zeros(8, 3, 3, 3, 2, 2, 2, dtype=torch.float64)
+    if key not in _GRAD_COEFS:
+        k = torch.zeros(8, 3, 8, dtype=torch.float64)
         for g, pt in enumerate(_gauss_points()):
-            for corner in [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1)]:
+            for j, corner in enumerate(_CORNERS):
                 for ax in range(3):
                     wgt = 1.0
                     for o in range(3):
                         if o != ax:
                             wgt *= pt[o] if corner[o] else 1 - pt[o]
-                    sgn = 1.0 if corner[ax] else -1.0
-                    for comp in range(3):
-                        k[g, ax, comp, comp][corner] = sgn * wgt
-        _GRAD_KERNELS[key] = k.reshape(72, 3, 2, 2, 2).to(device=device, dtype=dtype)
-    return _GRAD_KERNELS[key]
+                    k[g, ax, j] = wgt if corner[ax] else -wgt
+        _GRAD_COEFS[key] = k.to(device=device, dtype=dtype)
+    return _GRAD_COEFS[key]
 
 
 def element_strains(u):
     """Total strain sym(grad u) at each element's 8 Gauss points, (8, n, n, n, 6), from corner displacements u
-    (n+1, n+1, n+1, 3) in (x, y, z) components."""
+    (n+1, n+1, n+1, 3) in (x, y, z) components. One einsum over the 8 corner slices (no cuDNN, whose float64 3-D kernels
+    failed to load on the cluster, q1400/q1401)."""
     n = u.shape[0] - 1
-    with torch.backends.cudnn.flags(enabled=False):            # cuDNN's float64 3-D kernels failed to load on the cluster (q1400)
-        gr = torch.nn.functional.conv3d(u.permute(3, 0, 1, 2)[None], _grad_kernel(u.device, u.dtype))[0]
-    gr = gr.reshape(8, 3, 3, n, n, n).permute(0, 3, 4, 5, 1, 2)      # (8, n, n, n, volume axis, component)
+    cs = torch.stack([u[a:a + n, b:b + n, c:c + n] for (a, b, c) in _CORNERS])      # (8 corners, n, n, n, 3)
+    gr = torch.einsum('gak,kxyzc->gxyzac', _grad_coefs(u.device, u.dtype), cs)        # (8, n, n, n, axis, component)
     dx, dy, dz = gr[..., AXIS_OF[0], :], gr[..., AXIS_OF[1], :], gr[..., AXIS_OF[2], :]
     return torch.stack([dx[..., 0], dy[..., 1], dz[..., 2], 0.5 * (dy[..., 0] + dx[..., 1]),
                         0.5 * (dz[..., 1] + dy[..., 2]), 0.5 * (dz[..., 0] + dx[..., 2])], -1)
