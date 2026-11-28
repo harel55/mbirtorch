@@ -82,6 +82,10 @@ TRACTION_ALIGN_COS = 0.97        # traction_model='aligned': a face keeps its tr
                                 # lies within this cosine (about 14 degrees) of the face's axis
 CUTCELL_SUB = 8                 # traction_model='cutcell': sub-points per voxel edge for the plane cut (volume and faces)
 CUTCELL_BISECT = 40             # traction_model='cutcell': bisection steps for the plane offset that matches a voxel's fill
+EIGEN_CG_ITERS = 20             # eigenstrain_step: conjugate-gradient iterations of each Gauss-Newton step
+EIGEN_RIDGE_SD = 1e-2           # eigenstrain_step: the eigenstrain coefficients' weak ridge (strain units); it only fixes
+                                # the eigenstrains that cause no stress (compatible ones), which the data cannot see
+EIGEN_LINE_ALPHAS = (1.0, 0.5)  # eigenstrain_step: the step lengths tried before the parabola's minimizer
 CURVATURE_MODES = 24            # strain_curvature_modes: the smallest eigenpairs returned
 CURVATURE_LANCZOS_STEPS = 400   # ... from this many Lanczos steps (full reorthogonalization)
 CURVATURE_POWER_STEPS = 40      # ... after this many power steps for the largest eigenvalue (the spectral shift)
@@ -2502,6 +2506,86 @@ class TomoFit:
                 moved.append(d)
         self._sync_strain()                                  # only the strain changed (all of sync without lean_passes)
         return moved
+
+    @torch.no_grad()
+    def eigenstrain_step(self, spacing):
+        """One Gauss-Newton step of the strain parametrized by an eigenstrain on a grid `spacing` voxels apart
+        (eigenstrain.CoarseBasis): the strain is the elastic response of the sample to that eigenstrain
+        (eigenstrain.EigenstrainMap, finite elements on the voxels, the stiffness weighted by the volume fraction over
+        its median), so it is in equilibrium and free of traction on the free surfaces by construction. The volume
+        fractions stay where they are (alternate with volume_step under hold_strain). The data term and a weak ridge on
+        the coefficients (EIGEN_RIDGE_SD) are minimized; the strain priors are not used. One material only. Returns the
+        Newton decrement per coefficient (deviance units) and the objective's decrease."""
+        from .eigenstrain import EigenstrainMap, CoarseBasis
+        if self.R != 1 or self.elastic is None:
+            raise ValueError('eigenstrain_step needs one material with elastic constants')
+        fit, R = self.fit, self.R
+        V = self.V
+        own = self.material_voxels()[..., 0]
+        v = V.detach()[..., 0]
+        typ = v[own].median() if bool(own.any()) else torch.ones((), device=v.device, dtype=v.dtype)
+        w = (v / typ.clamp_min(torch.finfo(v.dtype).tiny)).clamp(0, 1) * own
+        key = (hash(own.cpu().numpy().tobytes()), int(spacing))
+        state = getattr(self, '_eigen', None)
+        if state is None or state['key'] != key:                  # a new map when the mask or the spacing changes
+            basis = CoarseBasis(v.shape[0], spacing, device=v.device)
+            emap = EigenstrainMap(w.double(), float(self.elastic[0][1]))
+            c = state['c'] if (state is not None and state['c'].shape == basis.shape()) else \
+                torch.zeros(basis.shape(), device=v.device, dtype=torch.float64)
+            state = self._eigen = dict(key=key, basis=basis, map=emap, c=c)
+        basis, emap = state['basis'], state['map']
+        J = lambda c: emap.apply(basis.apply(c))[..., None, :].to(self.E.dtype)
+        Jt = lambda g: basis.adjoint(emap.adjoint(g[..., 0, :].double()))
+        ridge = float(self.voxel_scale ** 3 * 0.5 / EIGEN_RIDGE_SD ** 2) if hasattr(self, 'voxel_scale') else 0.5 / EIGEN_RIDGE_SD ** 2
+        self.refresh_spread()
+        fit.refresh_open_beam()
+        self._sync_if_needed()
+        cache = fit._state(fit.g)
+        nc = 3 * R if self.anisotropic else 2 * R
+        G = torch.zeros(fit.P, nc, device=fit.device, dtype=torch.float64)
+        F = torch.zeros(fit.P, nc, nc, device=fit.device, dtype=torch.float64)
+        devs = []
+        for sl in fit.chunks():
+            G[sl], F[sl] = fit.ray_system(sl, cache, deviance=devs)
+        fit.remember_data_loss(all_sum_float(float(sum(devs)), fit.device))
+        G, F = G.float(), F.float()
+        gT = G[:, 2 * R:] if self.anisotropic else None
+        bU = self._back(G[:, :R], G[:, R:2 * R], gT)[1]
+        c = state['c']
+        g_c = Jt(V[..., None] * bU) + 2 * ridge * c
+
+        def H(d):
+            x = J(d)
+            z = self._fwd(torch.zeros_like(V), V[..., None] * x, trace=self.anisotropic)
+            y = torch.einsum('pab,pb->pa', F, torch.cat(z, 1).float())
+            hU = self._back(y[:, :R], y[:, R:2 * R], y[:, 2 * R:] if self.anisotropic else None)[1]
+            return Jt(V[..., None] * hU) + 2 * ridge * d
+
+        x = torch.zeros_like(c); r = -g_c; dd = r.clone(); rr = float((r * r).sum()); rr0 = rr
+        for _ in range(EIGEN_CG_ITERS):
+            if not rr > 0 or rr <= 1e-12 * rr0:
+                break
+            q = H(dd); a = rr / float((dd * q).sum())
+            x = x + a * dd; r = r - a * q; rn = float((r * r).sum()); dd = r + (rn / rr) * dd; rr = rn
+        dec = float(-(g_c * x).sum())
+        obj = lambda cc: float(self.data_loss(V, J(cc))) + ridge * float((cc * cc).sum())
+        l0 = obj(c)                                               # at the current coefficients (the first step leaves the warm-up's strain)
+        tried = {al: obj(c + al * x) for al in EIGEN_LINE_ALPHAS}
+        l1, lh = tried[1.0], tried[0.5]
+        cc_ = 2.0 * (l1 - 2.0 * lh + l0); b_ = (l1 - l0) - cc_
+        if cc_ > 0:
+            a_star = min(max(-b_ / (2 * cc_), 0.05), 2.0)
+            if all(abs(a_star - k) > 1e-3 for k in tried):
+                tried[a_star] = obj(c + a_star * x)
+        alpha, l_best = min(tried.items(), key=lambda kv: kv[1])
+        self.last_eigen = dict(alpha=alpha, decrement=dec, cg_residual=math.sqrt(max(rr, 0) / max(rr0, 1e-300)),
+                               elastic_iters=dict(emap.last_iters))
+        if l_best < l0:
+            state['c'] = c + alpha * x
+            self.E = J(state['c']).contiguous()
+            self.sync()
+            return math.sqrt(max(dec, 0.0) / c.numel()), l0 - l_best
+        return 0.0, 0.0
 
     @torch.no_grad()
     def strain_curvature_modes(self, k=CURVATURE_MODES, steps=CURVATURE_LANCZOS_STEPS, equilibrium=True):
