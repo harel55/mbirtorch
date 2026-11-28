@@ -33,7 +33,8 @@ from ._dist import all_sum, all_sum_float, broadcast_objects, rank
 
 STRAIN_PRIOR_SD = 1e-2          # standard deviation of the weak strain prior
 STRAIN_SMOOTH_SD = 3e-4         # standard deviation of the strain difference between neighbouring voxels
-DIFFERENCE_STENCILS = {1: (-1.0, 1.0), 2: (1.0, -2.0, 1.0)}   # the smoothness prior's differences along an axis, by order
+DIFFERENCE_STENCILS = {1: (-1.0, 1.0), 2: (1.0, -2.0, 1.0), 3: (-1.0, 3.0, -3.0, 1.0),   # the smoothness prior's differences
+                       4: (1.0, -4.0, 6.0, -4.0, 1.0)}   # along an axis, by order (3 and 4: near the voxel scale only)
 STRAIN_SMOOTH2_SD = 3.8e-4      # standard deviation of the strain's second difference (smooth_order=2), at voxel_scale 1: the
                                 # Ni-Cu-Al spheres' strength with the first-order prior's noise and less bias (2026-10-25)
 JOINT_CG_ITERS = 60             # conjugate-gradient iterations of the joint (volumes + global) step

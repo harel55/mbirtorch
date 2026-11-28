@@ -368,6 +368,28 @@ def test_qggmrf_strain_prior_gradient():
     assert q < 0.5 * tf._strain_prior_value(E)
 
 
+def test_strain_prior_high_order_gradient():
+    """The strain smoothness prior on third and fourth differences (smooth_order 3, 4): its gradient (strain_lap) matches
+    finite differences of its value."""
+    import torch
+    from mbirtorch.hsnt.strain.tomo import TomoFit
+
+    n = 8
+    for order in (3, 4):
+        tf = object.__new__(TomoFit)
+        tf.R, tf.C, tf.voxel_scale, tf.smooth_sd, tf.smooth_order = 1, 6, 1.0, 8e-4, order
+        tf.smooth_E = 1.0 / tf.smooth_sd ** 2
+        tf.strain_prior = 'quadratic'
+        g = torch.Generator().manual_seed(order)
+        E = 3e-4 * torch.randn(n, n, n, 1, 6, generator=g, dtype=torch.float64)
+        tf.E = E
+        grad = tf.strain_lap(E, tf._strain_wts(E))
+        i = (3, 2, 4, 0, 1); h = 1e-9
+        Ep, Em = E.clone(), E.clone(); Ep[i] += h; Em[i] -= h
+        fd = (tf._strain_prior_value(Ep) - tf._strain_prior_value(Em)) / (2 * h)
+        assert abs(fd - float(grad[i])) < 1e-4 * max(abs(fd), 1.0)
+
+
 def test_qggmrf_strain_prior_shape():
     """The strain q-GGMRF with its exponent q and threshold T changed (strain_q, strain_T): the gradient still matches
     finite differences of the value, and a smaller q penalizes a jump less."""
