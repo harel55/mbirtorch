@@ -1235,7 +1235,8 @@ class TomoFit:
         strain_sd. last_probe_cost records the probes' time, solves and peak GPU memory."""
         V, E = self.V, self.E
         n_un = self._uncertainty_probes
-        k = max(EVIDENCE_PROBES if evidence else 0, n_un)
+        n_ev = int(getattr(self, 'evidence_probes', EVIDENCE_PROBES))     # the evidence's probes (a setting)
+        k = max(n_ev if evidence else 0, n_un)
         gen = torch.Generator(device=E.device).manual_seed(PROBE_SEED + getattr(self, '_volume_steps', 0))
         tr = torch.zeros(self.R, dtype=torch.float64, device=E.device)
         b = int(getattr(self, 'uncertainty_block', 1))
@@ -1255,7 +1256,7 @@ class TomoFit:
         sign = lambda shape: (torch.randint(0, 2, shape, generator=gen, device=E.device) * 2 - 1).to(E.dtype)
         res = []
         for p in range(k):
-            ev, un = evidence and p < EVIDENCE_PROBES, bool(n_un) and p < n_un
+            ev, un = evidence and p < n_ev, bool(n_un) and p < n_un
             if ev:
                 z = proj_E(sign(E.shape) * fE)
                 yV, yE = self._cg_solve(H, prec, zeroV, z, iters); solves += 1
@@ -1269,7 +1270,7 @@ class TomoFit:
                     res.append(self.last_cg_residual)
                 var += zc * coarse(yE)
         if evidence:
-            self.evidence_update(tr / EVIDENCE_PROBES, L, fE); self._last_evidence_step = getattr(self, '_volume_steps', 0)
+            self.evidence_update(tr / n_ev, L, fE); self._last_evidence_step = getattr(self, '_volume_steps', 0)
         if n_un:
             self.strain_sd = (var / n_un).clamp_min(0).sqrt(); self._uncertainty_probes = 0
         self.last_probe_cost = dict(seconds=time.time() - t0, solves=solves, cg_iters=iters, residual=float(np.mean(res)) if res else None,
