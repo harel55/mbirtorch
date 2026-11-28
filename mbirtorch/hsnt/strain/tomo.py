@@ -82,6 +82,11 @@ TRACTION_ALIGN_COS = 0.97        # traction_model='aligned': a face keeps its tr
                                 # lies within this cosine (about 14 degrees) of the face's axis
 CUTCELL_SUB = 8                 # traction_model='cutcell': sub-points per voxel edge for the plane cut (volume and faces)
 CUTCELL_BISECT = 40             # traction_model='cutcell': bisection steps for the plane offset that matches a voxel's fill
+CURVATURE_MODES = 24            # strain_curvature_modes: the smallest eigenpairs returned
+CURVATURE_LANCZOS_STEPS = 400   # ... from this many Lanczos steps (full reorthogonalization)
+CURVATURE_POWER_STEPS = 40      # ... after this many power steps for the largest eigenvalue (the spectral shift)
+CURVATURE_SHIFT_MARGIN = 1.05   # ... the shift, as a multiple of that largest eigenvalue
+CURVATURE_SEED = 20261128       # ... the random start vectors (reproducible)
 HARD_EQ_CG_ITERS = 2000         # hard_equilibrium: conjugate-gradient iterations of each projection's (L L^T) solve
 HARD_EQ_TOL = 1e-10             # ... and their tolerance on the residual norm, relative to the first
 TRACTION_FLAT_REL = 0.06        # traction_sd='curvature': the traction's standard deviation on a flat face, as a fraction
@@ -2476,6 +2481,69 @@ class TomoFit:
                 moved.append(d)
         self._sync_strain()                                  # only the strain changed (all of sync without lean_passes)
         return moved
+
+    @torch.no_grad()
+    def strain_curvature_modes(self, k=CURVATURE_MODES, steps=CURVATURE_LANCZOS_STEPS, equilibrium=True):
+        """The k smallest eigenvalues and eigenvectors of the strain block of the fit's Gauss-Newton curvature at the
+        current state, without the smoothness prior and the ridge: the data's information about the strain (volume
+        fractions held) plus, with equilibrium=True, the equilibrium and traction prior. Use it to find the strain
+        patterns that the data and the physics leave undetermined (eigenvalues near 0). Returns (eigenvalues (k,),
+        eigenvectors (k, n, n, n, R, C), largest eigenvalue). The unknowns are the strains of each material's own voxels.
+        Lanczos with full reorthogonalization on (shift - H), the shift just above H's largest eigenvalue."""
+        self.refresh_spread()
+        self.fit.refresh_open_beam()
+        self._sync_if_needed()
+        fit, R = self.fit, self.R
+        cache = fit._state(fit.g)
+        nc = 3 * R if self.anisotropic else 2 * R
+        F = torch.zeros(fit.P, nc, nc, device=fit.device, dtype=torch.float64)
+        for sl in fit.chunks():
+            F[sl] = fit.ray_system(sl, cache, deviance=[])[1]
+        F = F.float()
+        V = self.V
+        own = self.material_voxels()[..., None].expand_as(self.E).to(self.E.dtype)
+        mask = self._eq_mask() if (equilibrium and self.elastic is not None) else None
+        r_ = (lambda Y: self._eq_residual(Y, mask)) if mask is not None else None
+
+        def H(x):
+            z = self._fwd(torch.zeros_like(V), V[..., None] * x, trace=self.anisotropic)
+            y = torch.einsum('pab,pb->pa', F, torch.cat(z, 1).float())
+            bU = self._back(y[:, :R], y[:, R:2 * R], y[:, 2 * R:] if self.anisotropic else None)[1]
+            h = V[..., None] * bU
+            if r_ is not None:
+                with torch.enable_grad():
+                    h = h + self.eq_w * torch.func.vjp(r_, x)[1](r_(x))[0]
+            return (h * own).to(x.dtype)
+
+        g = torch.Generator(device=self.E.device).manual_seed(CURVATURE_SEED)
+        unit = lambda x: x / x.norm().clamp_min(1e-300)
+        x = unit(torch.randn(self.E.shape, generator=g, device=self.E.device, dtype=torch.float64) * own)
+        for _ in range(CURVATURE_POWER_STEPS):                    # the largest eigenvalue, for the shift
+            x = unit(H(x))
+        lam_max = float((x * H(x)).sum())
+        shift = CURVATURE_SHIFT_MARGIN * lam_max
+        Q = [unit(torch.randn(self.E.shape, generator=g, device=self.E.device, dtype=torch.float64) * own)]
+        alpha, beta = [], []
+        for j in range(steps):                                    # Lanczos on B = shift - H
+            w = shift * Q[j] - H(Q[j])
+            a = float((w * Q[j]).sum()); alpha.append(a)
+            w = w - a * Q[j] - (beta[-1] * Q[j - 1] if j else 0.0)
+            for q in Q:                                           # full reorthogonalization (twice is enough)
+                w = w - float((w * q).sum()) * q
+            for q in Q:
+                w = w - float((w * q).sum()) * q
+            b = float(w.norm())
+            if b < 1e-12 * shift or j == steps - 1:
+                break
+            beta.append(b); Q.append(w / b)
+        m = len(alpha)
+        T = torch.diag(torch.tensor(alpha, dtype=torch.float64)) + torch.diag(torch.tensor(beta[:m - 1], dtype=torch.float64), 1) \
+            + torch.diag(torch.tensor(beta[:m - 1], dtype=torch.float64), -1)
+        ev, U = torch.linalg.eigh(T)
+        top = torch.argsort(ev, descending=True)[:k]               # B's largest = H's smallest
+        vecs = torch.stack([sum(float(U[i, t]) * Q[i] for i in range(m)) for t in top.tolist()])
+        lams = torch.stack([(v * H(v)).sum() / (v * v).sum() for v in vecs])   # Rayleigh quotients
+        return lams.cpu(), vecs.cpu(), lam_max
 
     def support_mask(self):
         """(n, n, n, R, 1): where each material's strain is free (its 3 x 3 x 3 mean density above SUPPORT_REL of the
